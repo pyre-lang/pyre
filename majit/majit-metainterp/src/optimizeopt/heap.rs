@@ -77,30 +77,6 @@ fn same_ptr_info(ctx: &OptContext, left: &Operand, right: &Operand) -> bool {
     })
 }
 
-/// heap.py AbstractCachedEntry._cannot_alias_via_constants
-///
-/// Two constant pointers are two addresses fixed at trace time, so unless they
-/// are the same constant they name different objects. Lives beside
-/// [`same_ptr_info`] rather than on `CachedField` / `ArrayCachedItem` because,
-/// like its upstream counterpart on the base class, it reads nothing about
-/// what is cached and so is shared by fields and array items.
-///
-/// Upstream asks only whether both sides are `ConstPtrInfo`, since
-/// `same_info` has already returned MUST_ALIAS for the equal case by then;
-/// comparing the two constants here answers the same question without
-/// depending on that ordering.
-fn cannot_alias_via_constants(ctx: &mut OptContext, left: &Operand, right: &Operand) -> bool {
-    fn const_ref(ctx: &mut OptContext, op: &Operand) -> Option<majit_ir::GcRef> {
-        match ctx.with_resolved_operand(op, |b| b.const_value()) {
-            Some(Value::Ref(gcref)) => Some(gcref),
-            _ => None,
-        }
-    }
-    let left = const_ref(ctx, left);
-    let right = const_ref(ctx, right);
-    matches!((left, right), (Some(a), Some(b)) if a != b)
-}
-
 #[inline]
 fn make_nonnull_box(ctx: &mut OptContext, arg: &Operand) {
     if let Some(box_ref) = ctx.resolve_operand_operand_opt(arg) {
@@ -2347,19 +2323,25 @@ impl OptHeapState {
                     // MUST_ALIAS: lazy_set targets the same struct → return rhs
                     must_alias_cached = Some(lazy_op.arg(1));
                 } else {
-                    // heap.py possible_aliasing_two_infos:
+                    // heap.py AbstractCachedEntry.possible_aliasing_two_infos:
                     //     if opinfo1.same_info(opinfo2): return MUST_ALIAS
-                    //     if self._cannot_alias_via_constants(...): return CANNOT_ALIAS
-                    //     if cf._cannot_alias_via_classes_or_lengths(...): return CANNOT_ALIAS
-                    //     if cf._cannot_alias_via_content(...): return CANNOT_ALIAS
+                    //     if _cannot_alias_via_classes_or_lengths: return CANNOT_ALIAS
+                    //     if _cannot_alias_via_content: return CANNOT_ALIAS
                     //     return UNKNOWN_ALIAS
-                    let cannot_alias = cannot_alias_via_constants(ctx, lazy_struct, &obj_box)
-                        || CachedField::_cannot_alias_via_classes_or_lengths(
+                    // Two different ConstPtrInfos fail same_info, fail
+                    // classes_or_lengths (same / unknown class), and fail
+                    // content (ConstPtrInfo is not AbstractStructPtrInfo)
+                    // → UNKNOWN_ALIAS. getfield_from_cache then
+                    // force_lazy_set → invalidate (drops every cached_infos
+                    // entry of this descr, including the other ConstPtr)
+                    // → GETFIELD miss. possible_aliasing's "XXX constants?"
+                    // leaves two different constants as UNKNOWN_ALIAS.
+                    let cannot_alias =
+                        CachedField::_cannot_alias_via_classes_or_lengths(
                             lazy_struct,
                             &obj_box,
                             ctx,
-                        )
-                        || CachedField::_cannot_alias_via_content(lazy_struct, &obj_box, ctx);
+                        ) || CachedField::_cannot_alias_via_content(lazy_struct, &obj_box, ctx);
                     if !cannot_alias {
                         // UNKNOWN_ALIAS → force_lazy_set, return None (cache miss)
                         force_lazy = true;
@@ -2367,8 +2349,9 @@ impl OptHeapState {
                     // CANNOT_ALIAS: fall through to _getfield below (heap.py)
                 }
             }
-            // heap.py:117-120: always check cache entries after alias analysis.
-            // RPython falls through here even when lazy_set exists (CANNOT_ALIAS).
+            // heap.py getfield_from_cache: always check cache entries after
+            // alias analysis. RPython falls through here even when lazy_set
+            // exists (CANNOT_ALIAS).
             if must_alias_cached.is_none()
                 && !force_lazy
                 && let Some(entry) = cf._getfield(&obj_box, &descr, field_idx, ctx)
@@ -3006,14 +2989,17 @@ impl OptHeapState {
                         ctx.make_equal_to(&b_old, &b_cached);
                         return OptimizationResult::Remove;
                     }
-                    // heap.py possible_aliasing_two_infos
-                    let cannot_alias = cannot_alias_via_constants(ctx, lazy_struct, &array_ref)
-                        || ArrayCachedItem::_cannot_alias_via_classes_or_lengths(
-                            lazy_struct,
-                            &array_ref,
-                            ctx,
-                        )
-                        || ArrayCachedItem::_cannot_alias_via_content(lazy_struct, &array_ref, ctx);
+                    // heap.py AbstractCachedEntry.possible_aliasing_two_infos
+                    // (same_info / classes_or_lengths / content only).
+                    let cannot_alias = ArrayCachedItem::_cannot_alias_via_classes_or_lengths(
+                        lazy_struct,
+                        &array_ref,
+                        ctx,
+                    ) || ArrayCachedItem::_cannot_alias_via_content(
+                        lazy_struct,
+                        &array_ref,
+                        ctx,
+                    );
                     if !cannot_alias {
                         // UNKNOWN_ALIAS → force_lazy_set
                         force_lazy_arr = true;
@@ -9238,29 +9224,54 @@ mod tests {
         );
     }
 
-    /// heap.py AbstractCachedEntry._cannot_alias_via_constants — two
-    /// different constant pointers name two different objects, while a
-    /// non-constant operand on either side leaves the question open.
+    /// heap.py AbstractCachedEntry.getfield_from_cache /
+    /// possible_aliasing_two_infos: a pending SETFIELD on ConstPtr A
+    /// does not prove that ConstPtr B is a different object, so the
+    /// GETFIELD of B is a cache miss after force_lazy_set + invalidate.
+    /// Replaces `test_cannot_alias_via_constants`, which pinned the
+    /// opposite CSE.
     #[test]
-    fn test_cannot_alias_via_constants() {
-        use crate::optimizeopt::OptContext;
-
-        let mut ctx = OptContext::with_inputarg_types(64, &[Type::Ref]);
-        let first = Operand::const_from_value(majit_ir::Value::Ref(majit_ir::GcRef(0x1000)));
-        let second = Operand::const_from_value(majit_ir::Value::Ref(majit_ir::GcRef(0x2000)));
-        let unknown = ctx.inputargs[0].clone();
-
-        assert!(
-            super::cannot_alias_via_constants(&mut ctx, &first, &second),
-            "two different constant pointers cannot alias"
-        );
-        assert!(
-            !super::cannot_alias_via_constants(&mut ctx, &first, &first),
-            "the same constant pointer is the same object, not a disproof"
-        );
-        assert!(
-            !super::cannot_alias_via_constants(&mut ctx, &first, &unknown),
-            "a non-constant operand leaves aliasing unknown"
+    fn test_getfield_two_constptr_bases_force_lazy_set() {
+        let d = descr(0);
+        let cell_i = Operand::const_from_value(majit_ir::Value::Ref(majit_ir::GcRef(0x1000)));
+        let cell_acc = Operand::const_from_value(majit_ir::Value::Ref(majit_ir::GcRef(0x2000)));
+        let mut ops = vec![
+            Op::with_descr(OpCode::GetfieldGcI, &[cell_i.clone()], d.clone()),
+            Op::with_descr(OpCode::GetfieldGcI, &[cell_acc.clone()], d.clone()),
+            Op::with_descr(
+                OpCode::SetfieldGc,
+                &[cell_acc.clone(), rooted_inputarg_operand(Type::Int, 201)],
+                d.clone(),
+            ),
+            Op::with_descr(OpCode::GetfieldGcI, &[cell_i], d.clone()),
+            Op::new(OpCode::Jump, &[]),
+        ];
+        assign_positions(&mut ops);
+        let mut opt = Optimizer::new();
+        // DefaultCpu::bh_classof would deref the synthetic gcrefs;
+        // `get_known_class` only needs "class unknown" here so
+        // `_cannot_alias_via_classes_or_lengths` stays UNKNOWN.
+        opt.cpu = crate::cpu::cpu_from_bh_classof_fn(|_| 0);
+        opt.add_pass(Box::new(OptHeap::new()));
+        let mut types = vec![Type::Ref; 1024];
+        types[201] = Type::Int;
+        let (ops, snapshots) = super::super::seed_empty_guard_snapshots(&ops);
+        opt.trace_inputargs = trace_inputargs_from_ops(&ops, &types);
+        opt.snapshot_boxes = snapshots;
+        let result =
+            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::ConstMap::default(), 1024);
+        let opcodes: Vec<OpCode> = result.iter().map(|o| o.opcode).collect();
+        assert_eq!(
+            opcodes,
+            vec![
+                OpCode::GetfieldGcI,
+                OpCode::GetfieldGcI,
+                OpCode::SetfieldGc,
+                OpCode::GetfieldGcI,
+                OpCode::Jump,
+            ],
+            "possible_aliasing_two_infos UNKNOWN_ALIAS on two ConstPtrs \
+             must force_lazy_set and re-emit GETFIELD of the other constant"
         );
     }
 

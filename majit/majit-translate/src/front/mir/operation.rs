@@ -63,33 +63,8 @@ impl<'a> Lowering<'a> {
                 "bb{mir_bb}: struct-field ptr::add lost its index operand"
             ))
         })?;
-        let header = match traced.header {
-            TracedPtrAddHeader::EntriesItem { local } => {
-                let Some(var) = self.local_var.get(local).cloned().flatten() else {
-                    return Ok(false);
-                };
-                InteriorHeader::Local {
-                    local,
-                    var: var.one()?,
-                }
-            }
-            TracedPtrAddHeader::EntryPtr {
-                recv_local,
-                recv_ty,
-            } => {
-                let Some(var) = self.local_var.get(recv_local).cloned().flatten() else {
-                    return Ok(false);
-                };
-                let Some((field, ty)) = self.entries_field_descriptor(&recv_ty) else {
-                    return Ok(false);
-                };
-                InteriorHeader::Entries {
-                    recv_local,
-                    recv_var: var.one()?,
-                    field,
-                    ty,
-                }
-            }
+        let Some(header) = self.interior_header_from_traced(&traced) else {
+            return Ok(false);
         };
         let base = args.first().cloned().ok_or_else(|| {
             LowerError::Unsupported(format!(
@@ -107,6 +82,377 @@ impl<'a> Lowering<'a> {
         );
         self.alias_dest_to_arg0_inherit(dest_local, base, arg_locals);
         let bb_id = self.emit_bb(mir_bb);
+        let target_bb = self.block_id[target];
+        let link_args = self.edge_args(mir_bb, target)?;
+        self.graph.set_goto(bb_id, target_bb, link_args);
+        Ok(true)
+    }
+
+    fn interior_header_from_traced(&self, traced: &StructFieldPtrAdd) -> Option<InteriorHeader> {
+        match &traced.header {
+            TracedPtrAddHeader::EntriesItem { local } => {
+                let var = self.local_var.get(*local).cloned().flatten()?.one().ok()?;
+                Some(InteriorHeader::Local { local: *local, var })
+            }
+            TracedPtrAddHeader::EntryPtr {
+                recv_local,
+                recv_ty,
+            } => {
+                let var = self
+                    .local_var
+                    .get(*recv_local)
+                    .cloned()
+                    .flatten()?
+                    .one()
+                    .ok()?;
+                let (field, ty) = self.entries_field_descriptor(recv_ty)?;
+                Some(InteriorHeader::Entries {
+                    recv_local: *recv_local,
+                    recv_var: var,
+                    field,
+                    ty,
+                })
+            }
+        }
+    }
+
+    fn record_interior_field_alias(
+        &mut self,
+        dest_local: usize,
+        traced: StructFieldPtrAdd,
+        index_var: Variable,
+        header: InteriorHeader,
+    ) {
+        self.interior_field_alias.insert(
+            dest_local,
+            InteriorFieldAlias {
+                header,
+                index_local: traced.index_local,
+                index_var,
+                array_type_id: traced.array_type_id,
+            },
+        );
+    }
+
+    /// Gate A: escaped `&*p.add(i)` / `&mut *p.add(i)` of a GcArray struct
+    /// pointee is `PtrRepr.rtype_getitem`'s InteriorPtr arm (`rptr.py`):
+    /// `malloc` of `Ptr._interior_ptr_type_with_index` (`lltype.py`),
+    /// `setfield ptr`, `setfield index`. Kind is ref. No `ptr::add` Call.
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::front::mir) fn try_lower_interior_ptr_add(
+        &mut self,
+        mir_bb: usize,
+        reg: &RegularCall,
+        args: &[Variable],
+        arg_locals: &[Option<usize>],
+        first_arg_ty: Option<&TyRef>,
+        dest_local: usize,
+        target: usize,
+    ) -> Result<bool, LowerError> {
+        let Some(traced) = struct_reborrow_ptr_add_trace(
+            reg,
+            args.len(),
+            arg_locals.first().copied().flatten(),
+            first_arg_ty,
+            arg_locals.get(1).copied().flatten(),
+            dest_local,
+            self.body,
+            self.llbc,
+            self.tombstoned_leaves,
+        ) else {
+            return Ok(false);
+        };
+        let watched = match &traced.header {
+            TracedPtrAddHeader::EntriesItem { local } => [*local, traced.index_local],
+            TracedPtrAddHeader::EntryPtr { recv_local, .. } => [*recv_local, traced.index_local],
+        };
+        if locals_assigned_reachable(self.body, self.llbc, target, &watched) {
+            return Ok(false);
+        };
+        let index_var = args.get(1).cloned().ok_or_else(|| {
+            LowerError::Unsupported(format!(
+                "bb{mir_bb}: interior ptr::add lost its index operand"
+            ))
+        })?;
+        let Some(header) = self.interior_header_from_traced(&traced) else {
+            return Ok(false);
+        };
+        let Some(ip_ty) = interior_ptr_lltype(&traced.array_type_id) else {
+            return Ok(false);
+        };
+        let bb_id = self.emit_bb(mir_bb);
+        let alias = InteriorFieldAlias {
+            header,
+            index_local: traced.index_local,
+            index_var: index_var.clone(),
+            array_type_id: traced.array_type_id.clone(),
+        };
+        let array = self.interior_alias_array(&alias);
+        let v_array = self.interior_header_base(bb_id, &alias, array.as_ref())?;
+        let v_ip = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        v_ip.set_concretetype(Some(ip_ty));
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(v_ip.clone()),
+            kind: crate::model::malloc_opkind("Interior".to_string(), false),
+        });
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: None,
+            kind: OpKind::FieldWrite {
+                base: v_ip.clone(),
+                field: FieldDescriptor::new("ptr", Some("Interior".to_string())),
+                value: LinkArg::from(v_array),
+                ty: ValueType::Ref(None),
+            },
+        });
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: None,
+            kind: OpKind::FieldWrite {
+                base: v_ip.clone(),
+                field: FieldDescriptor::new("index", Some("Interior".to_string())),
+                value: LinkArg::from(index_var),
+                ty: ValueType::Int,
+            },
+        });
+        self.interior_field_alias.insert(dest_local, alias);
+        self.local_var[dest_local] = Some(LocalValue::One(v_ip));
+        let target_bb = self.block_id[target];
+        let link_args = self.edge_args(mir_bb, target)?;
+        self.graph.set_goto(bb_id, target_bb, link_args);
+        Ok(true)
+    }
+
+    /// `RDict::entry_ptr` is `entries_item_ptr(self.entries)` (`rptr.py`
+    /// `InteriorPtrRepr` of index 0). FUNC.RESULT is `'ref'`; the callee
+    /// is `direct_arrayitems` (`history.py` `getkind` of a raw `Ptr` is
+    /// `'int'`).
+    pub(in crate::front::mir) fn try_lower_entry_ptr_as_interior(
+        &mut self,
+        mir_bb: usize,
+        reg: &RegularCall,
+        args: &[Variable],
+        dest_local: usize,
+        dest_ty: &TyRef,
+        target: usize,
+    ) -> Result<bool, LowerError> {
+        let graph_leaf = self
+            .graph
+            .name
+            .rsplit("::")
+            .next()
+            .unwrap_or(self.graph.name.as_str());
+        let graph_bare = graph_leaf.split("__spec").next().unwrap_or(graph_leaf);
+        if graph_bare != "entry_ptr"
+            || !self.graph.name.split("::").any(|seg| seg == "rordereddict")
+        {
+            return Ok(false);
+        }
+        let path = regular_call_name_path(reg, self.llbc).unwrap_or_default();
+        let callee_leaf = path.rsplit("::").next().unwrap_or(path.as_str());
+        let callee_bare = callee_leaf.split("__spec").next().unwrap_or(callee_leaf);
+        if callee_bare != "entries_item_ptr" {
+            return Ok(false);
+        }
+        let Some(header) = args.first().cloned() else {
+            return Ok(false);
+        };
+        let Some(array_type_id) =
+            struct_pointee_array_type_id(dest_ty, self.llbc, self.tombstoned_leaves)
+        else {
+            return Ok(false);
+        };
+        let Some(ip_ty) = interior_ptr_lltype(&array_type_id) else {
+            return Ok(false);
+        };
+        // `FunctionDesc.cachedgraph` of `entries_item_ptr` still sees
+        // concrete `K, V` (`array_items_base`) when this call is inlined
+        // as InteriorPtr of index 0.
+        if let CallKind::Fun(FunId::Regular { id }) = &reg.kind {
+            if let Some(fd) = self.llbc.fn_by_id(*id) {
+                let _ = self.enqueue_spec(fd, &reg.generics);
+            }
+        }
+        let bb_id = self.emit_bb(mir_bb);
+        let index_var = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Signed);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(index_var.clone()),
+            kind: OpKind::ConstInt(0),
+        });
+        let v_ip = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        v_ip.set_concretetype(Some(ip_ty));
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(v_ip.clone()),
+            kind: crate::model::malloc_opkind("Interior".to_string(), false),
+        });
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: None,
+            kind: OpKind::FieldWrite {
+                base: v_ip.clone(),
+                field: FieldDescriptor::new("ptr", Some("Interior".to_string())),
+                value: LinkArg::from(header),
+                ty: ValueType::Ref(None),
+            },
+        });
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: None,
+            kind: OpKind::FieldWrite {
+                base: v_ip.clone(),
+                field: FieldDescriptor::new("index", Some("Interior".to_string())),
+                value: LinkArg::from(index_var),
+                ty: ValueType::Int,
+            },
+        });
+        self.local_var[dest_local] = Some(LocalValue::One(v_ip));
+        let target_bb = self.block_id[target];
+        let link_args = self.edge_args(mir_bb, target)?;
+        self.graph.set_goto(bb_id, target_bb, link_args);
+        Ok(true)
+    }
+
+    /// Gate B add: record the GcArray header and skip the `ptr::add` Call.
+    /// The matching `ptr::write` emits `setinteriorfield`s.
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::front::mir) fn try_lower_struct_write_ptr_add(
+        &mut self,
+        mir_bb: usize,
+        reg: &RegularCall,
+        args: &[Variable],
+        arg_locals: &[Option<usize>],
+        first_arg_ty: Option<&TyRef>,
+        dest_local: usize,
+        target: usize,
+    ) -> Result<bool, LowerError> {
+        let Some(traced) = struct_write_ptr_add_trace(
+            reg,
+            args.len(),
+            arg_locals.first().copied().flatten(),
+            first_arg_ty,
+            arg_locals.get(1).copied().flatten(),
+            dest_local,
+            self.body,
+            self.llbc,
+            self.tombstoned_leaves,
+        ) else {
+            return Ok(false);
+        };
+        let watched = match &traced.header {
+            TracedPtrAddHeader::EntriesItem { local } => [*local, traced.index_local],
+            TracedPtrAddHeader::EntryPtr { recv_local, .. } => [*recv_local, traced.index_local],
+        };
+        if locals_assigned_reachable(self.body, self.llbc, target, &watched) {
+            return Ok(false);
+        };
+        let index_var = args.get(1).cloned().ok_or_else(|| {
+            LowerError::Unsupported(format!(
+                "bb{mir_bb}: interior ptr::write add lost its index operand"
+            ))
+        })?;
+        let Some(header) = self.interior_header_from_traced(&traced) else {
+            return Ok(false);
+        };
+        let base = args.first().cloned().ok_or_else(|| {
+            LowerError::Unsupported(format!(
+                "bb{mir_bb}: interior ptr::write add lost its pointer operand"
+            ))
+        })?;
+        self.record_interior_field_alias(dest_local, traced, index_var, header);
+        self.alias_dest_to_arg0_inherit(dest_local, base, arg_locals);
+        let bb_id = self.emit_bb(mir_bb);
+        let target_bb = self.block_id[target];
+        let link_args = self.edge_args(mir_bb, target)?;
+        self.graph.set_goto(bb_id, target_bb, link_args);
+        Ok(true)
+    }
+
+    /// Gate B write: `core::ptr::write(p.add(i), S{..})` as one
+    /// `setinteriorfield` per field (`rordereddict.py`
+    /// `_ll_dict_setitem_lookup_done`).
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::front::mir) fn try_lower_interior_aggregate_ptr_write(
+        &mut self,
+        mir_bb: usize,
+        reg: &RegularCall,
+        arg_locals: &[Option<usize>],
+        arg_operands: &[Operand],
+        second_arg_ty: Option<&TyRef>,
+        dest_local: usize,
+        target: usize,
+    ) -> Result<bool, LowerError> {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return Ok(false);
+        };
+        let Some(fd) = self.llbc.fn_by_id(*id) else {
+            return Ok(false);
+        };
+        if !is_core_ptr_write_path(fd.item_meta.name_path().as_str()) {
+            return Ok(false);
+        }
+        let Some(addr_local) = arg_locals.first().copied().flatten() else {
+            return Ok(false);
+        };
+        if !self.interior_field_alias.contains_key(&addr_local) {
+            return Ok(false);
+        }
+        let Some(value_op) = arg_operands.get(1) else {
+            return Ok(false);
+        };
+        let Some((_kind, ops)) = follow_operand_to_aggregate(self.body, self.llbc, value_op) else {
+            return Ok(false);
+        };
+        let Some(value_ty) = second_arg_ty else {
+            return Ok(false);
+        };
+        let Some(node) = tyref_node(value_ty, self.llbc) else {
+            return Ok(false);
+        };
+        let Some(decl) = adt_node_def_id(node).and_then(|id| self.llbc.type_by_id(id)) else {
+            return Ok(false);
+        };
+        let Some(fields) = type_decl_struct_fields(decl, self.llbc) else {
+            return Ok(false);
+        };
+        if fields.is_empty() || fields.len() != ops.len() {
+            return Ok(false);
+        }
+        let Some(alias) = self.interior_field_alias.get(&addr_local).cloned() else {
+            return Ok(false);
+        };
+        let Some(owner_root) = alias
+            .array_type_id
+            .strip_prefix("GcArray<")
+            .and_then(|s| s.strip_suffix(">"))
+            .map(str::to_string)
+        else {
+            return Ok(false);
+        };
+        let bb_id = self.emit_bb(mir_bb);
+        for (i, field) in fields.iter().enumerate() {
+            let value = self.resolve_operand(mir_bb, ops[i].clone())?;
+            let fname = super::field_decl_name(i, field);
+            let item_ty = tyref_to_value_type_with(
+                &field.ty,
+                self.llbc,
+                self.tombstoned_leaves,
+                self.gc_struct_ids,
+                &self.raw_alloc_flavor_structs,
+            );
+            let descr =
+                FieldDescriptor::new(fname, Some(owner_root.clone())).with_base_is_deref(true);
+            self.emit_interior_field_write(
+                mir_bb,
+                bb_id,
+                addr_local,
+                descr,
+                LinkArg::from(value),
+                item_ty,
+            )?;
+        }
+        self.local_var[dest_local] = Some(LocalValue::One(self.emit_unit(bb_id)));
         let target_bb = self.block_id[target];
         let link_args = self.edge_args(mir_bb, target)?;
         self.graph.set_goto(bb_id, target_bb, link_args);
@@ -662,13 +1008,23 @@ impl<'a> Lowering<'a> {
         let PlaceKind::Local(local) = pre.kind else {
             return Ok(None);
         };
-        let Some(alias) = self.interior_field_alias.get(&(local as usize)).cloned() else {
-            return Ok(None);
-        };
+        let local = local as usize;
         let bb_id = self.emit_bb(mir_bb);
-        let array = self.interior_alias_array(&alias);
-        let base = self.interior_header_base(bb_id, &alias, array.as_ref())?;
-        let index = self.realias_operand(Some(alias.index_local), alias.index_var);
+        let (base, index, array_type_id, array) =
+            if let Some(alias) = self.interior_field_alias.get(&local).cloned() {
+                let array = self.interior_alias_array(&alias);
+                let base = self.interior_header_base(bb_id, &alias, array.as_ref())?;
+                let index = self.realias_operand(Some(alias.index_local), alias.index_var);
+                (base, index, alias.array_type_id, array)
+            } else if let Some((v_self, array_type_id)) = self.interior_ptr_binding(local) {
+                // `InteriorPtrRepr.getinteriorfieldargs` / `rtype_getattr`
+                // (`rptr.py`): getfield ptr, getfield index, then
+                // `getinteriorfield`. Decided by the `interior_ptr_type` hint.
+                let (base, index) = self.unpack_interior_ptr_args(bb_id, v_self);
+                (base, index, array_type_id, None)
+            } else {
+                return Ok(None);
+            };
         let owner_declared_gc = container_declared_gc(
             &inner.ty,
             self.llbc,
@@ -726,7 +1082,7 @@ impl<'a> Lowering<'a> {
                 index,
                 field,
                 item_ty,
-                array_type_id: Some(alias.array_type_id.clone()),
+                array_type_id: Some(array_type_id),
                 array,
             },
         });
@@ -739,6 +1095,47 @@ impl<'a> Lowering<'a> {
             return Ok(Some(signed));
         }
         Ok(Some(res))
+    }
+
+    fn interior_ptr_binding(&self, local: usize) -> Option<(Variable, String)> {
+        let var = self.local_var.get(local).cloned().flatten()?.one().ok()?;
+        let ct = var.concretetype()?;
+        let array_type_id = array_type_id_from_interior_lltype(&ct)?;
+        Some((var, array_type_id))
+    }
+
+    /// `InteriorPtrRepr.getinteriorfieldargs` (`rptr.py`): getfield ptr,
+    /// getfield index.
+    fn unpack_interior_ptr_args(
+        &mut self,
+        bb_id: BlockId,
+        v_self: Variable,
+    ) -> (Variable, Variable) {
+        let v_array = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(v_array.clone()),
+            kind: OpKind::FieldRead {
+                base: v_self.clone(),
+                field: FieldDescriptor::new("ptr", Some("Interior".to_string())),
+                ty: ValueType::Ref(None),
+                pure: false,
+            },
+        });
+        let v_index = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(v_index.clone()),
+            kind: OpKind::FieldRead {
+                base: v_self,
+                field: FieldDescriptor::new("index", Some("Interior".to_string())),
+                ty: ValueType::Int,
+                pure: false,
+            },
+        });
+        (v_array, v_index)
     }
 
     /// `(*add).field = value` for a recorded struct-field `ptr::add`.
@@ -756,14 +1153,21 @@ impl<'a> Lowering<'a> {
         value: LinkArg,
         item_ty: ValueType,
     ) -> Result<(), LowerError> {
-        let Some(alias) = self.interior_field_alias.get(&dest_local).cloned() else {
-            return Err(LowerError::Unsupported(format!(
-                "bb{mir_bb}: interior field write lost its ptr::add alias"
-            )));
-        };
-        let array = self.interior_alias_array(&alias);
-        let base = self.interior_header_base(bb_id, &alias, array.as_ref())?;
-        let index = self.realias_operand(Some(alias.index_local), alias.index_var);
+        let (base, index, array_type_id, array) =
+            if let Some(alias) = self.interior_field_alias.get(&dest_local).cloned() {
+                let array = self.interior_alias_array(&alias);
+                let base = self.interior_header_base(bb_id, &alias, array.as_ref())?;
+                let index = self.realias_operand(Some(alias.index_local), alias.index_var);
+                (base, index, alias.array_type_id, array)
+            } else if let Some((v_self, array_type_id)) = self.interior_ptr_binding(dest_local) {
+                // `InteriorPtrRepr.rtype_setattr` (`rptr.py`).
+                let (base, index) = self.unpack_interior_ptr_args(bb_id, v_self);
+                (base, index, array_type_id, None)
+            } else {
+                return Err(LowerError::Unsupported(format!(
+                    "bb{mir_bb}: interior field write lost its ptr::add alias"
+                )));
+            };
         let value_var = match &value {
             LinkArg::Value(var) => var.clone(),
             LinkArg::Const(_) => {
@@ -791,7 +1195,7 @@ impl<'a> Lowering<'a> {
                 field,
                 value: value_var,
                 item_ty,
-                array_type_id: Some(alias.array_type_id.clone()),
+                array_type_id: Some(array_type_id),
                 array,
             },
         });
@@ -2722,6 +3126,11 @@ impl<'a> Lowering<'a> {
                     {
                         return Ok((Some(op), res));
                     }
+                    if cast_kind_is_unsize(&op_json) {
+                        // Dest aliases this data word (`same_as`); keep the
+                        // constant vtable's TraitImpl id for Path B.
+                        self.record_unsize_vtable_impl(&op_json, &arg);
+                    }
                     // A transparent address-cast word is a GCREF pointer even
                     // though its place type is the inner `usize`. Reading it
                     // back (`roots[i].0 as *mut _`) must not emit
@@ -3592,6 +4001,11 @@ impl<'a> Lowering<'a> {
                     && let Some((op, res)) = self.object_array_unsize_newlist(dest_ty, &v)
                 {
                     return Ok((Some(op), res));
+                }
+                if cast_kind_is_unsize(&kind) {
+                    // Dest aliases this data word (`same_as`); keep the
+                    // constant vtable's TraitImpl id for Path B.
+                    self.record_unsize_vtable_impl(&kind, &v);
                 }
                 // A same-bank ptr→ptr cast keeps the i64 pointer carrier in
                 // place, so it would alias — but the pointee type it
@@ -6490,6 +6904,91 @@ impl<'a> Lowering<'a> {
         }
     }
 
+    /// Record a dest-only Unsize `VTable(TraitImpl { id }, _)` against the
+    /// data-word Variable the dest aliases.
+    fn record_unsize_vtable_impl(&mut self, cast: &serde_json::Value, data_word: &Variable) {
+        if let Some(impl_id) = unsize_cast_vtable_impl_id(cast, self.llbc) {
+            self.unsize_vtable_impl.insert(data_word.id(), impl_id);
+        }
+    }
+
+    /// TraitImpl id recorded for `recv`, following block-input copies.
+    fn unsize_impl_id_of(&self, recv: &Variable) -> Option<u64> {
+        let mut id = recv.id();
+        let mut seen = std::collections::HashSet::new();
+        loop {
+            if let Some(&impl_id) = self.unsize_vtable_impl.get(&id) {
+                return Some(impl_id);
+            }
+            if !seen.insert(id) || seen.len() > 64 {
+                return None;
+            }
+            match self.input_copied_from.get(&id).copied() {
+                Some(next) => id = next,
+                None => return None,
+            }
+        }
+    }
+
+    /// Direct `Call` of the Unsize-named impl method (or the trait default
+    /// the impl inherits). Same `OpKind::Call` [`trait_method_on_known_receiver`]
+    /// feeds the concrete-receiver path.
+    ///
+    /// `rpbc.py FunctionReprBase.call`: a Constant funcptr is a direct_call;
+    /// an Unsize vtable is a constant.
+    pub(in crate::front::mir) fn unsize_constant_vtable_direct_call(
+        &self,
+        reg: &RegularCall,
+        args: &[Variable],
+        result_ty: ValueType,
+    ) -> Option<OpKind> {
+        let recv = args.first()?;
+        let impl_id = self.unsize_impl_id_of(recv)?;
+        let CallKind::Trait(payload) = &reg.kind else {
+            return None;
+        };
+        let method_idx = payload.as_array()?.get(1)?.as_u64()?;
+        let (fn_id, segments) = impl_method_call_segments(self.llbc, impl_id, method_idx)?;
+        Some(OpKind::Call {
+            target: CallTarget::function_path(segments).with_fun_decl_id(fn_id),
+            args: crate::model::call_args(args.to_vec()),
+            result_ty,
+        })
+    }
+
+    /// `ClassRepr.getclsfield`: the method slot is a field read off the
+    /// vtable word. Path B's Trait-on-dyn call has no MIR `Field[Adt({vtable}),
+    /// slot]` operand, so this synthesizes the same `FieldRead` Path A's
+    /// `resolve_operand` of that projection already emits.
+    pub(in crate::front::mir) fn emit_vtable_method_slot_read(
+        &mut self,
+        mir_bb: usize,
+        receiver: &Variable,
+        trait_decl_path: &str,
+        method_name: &str,
+    ) -> Variable {
+        let vtable_path = format!("{trait_decl_path}::{{vtable}}");
+        let owner_root =
+            tombstoned_owner_spelling(&vtable_path, "{vtable}", self.tombstoned_leaves);
+        let owner_id = majit_ir::descr::StructId::from_canonical(&owner_root);
+        let funcptr = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        let bb_id = self.emit_bb(mir_bb);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(funcptr.clone()),
+            kind: OpKind::FieldRead {
+                base: receiver.clone(),
+                field: FieldDescriptor::new(format!("method_{method_name}"), Some(owner_root))
+                    .with_owner_id(Some(owner_id))
+                    .with_base_is_deref(true),
+                ty: ValueType::Int,
+                pure: true,
+            },
+        });
+        funcptr
+    }
+
     /// Fat-pointer DATA word of `recv`, or `None` when `recv` is not a
     /// fat field (direct ZST `&self` uses [`Self::emit_zst_self_address`]).
     pub(in crate::front::mir) fn dyn_receiver_data_word(
@@ -7907,7 +8406,8 @@ impl<'a> Lowering<'a> {
                     overlaid
                 };
                 if let Some(dest) = interior_dest
-                    && self.interior_field_alias.contains_key(&dest)
+                    && (self.interior_field_alias.contains_key(&dest)
+                        || self.interior_ptr_binding(dest).is_some())
                 {
                     let field = FieldDescriptor::new(field_name.clone(), Some(owner_root.clone()))
                         .with_owner_id(owner_id)

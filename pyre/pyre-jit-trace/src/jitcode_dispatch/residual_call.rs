@@ -59,6 +59,29 @@ static TAKE_LAST_EXEC_CTX_FNADDR: std::sync::LazyLock<i64> = std::sync::LazyLock
     )
 });
 
+/// `descroperation.py get_and_call_function`. The trampoline is the
+/// `getfunctionptr` word-ABI target (`__majit_call_target_*`).
+static GET_AND_CALL_FUNCTION_FNADDR: std::sync::LazyLock<i64> = std::sync::LazyLock::new(|| {
+    walker_published_fnaddr(
+        &["pyre_interpreter::baseobjspace::get_and_call_function"],
+        pyre_interpreter::residual_word_addr!(
+            4,
+            pyre_interpreter::__majit_call_target_get_and_call_function
+        ) as i64,
+    )
+});
+
+/// `_pure_issubtype` / `w_type_issubtype` (`typeobject.py`). Pure MRO
+/// membership; a rewind repeats the same test.
+static W_TYPE_ISSUBTYPE_FNADDRS: std::sync::LazyLock<std::collections::HashSet<i64>> =
+    std::sync::LazyLock::new(|| {
+        fnaddr_set(|name| name.ends_with("::w_type_issubtype") || name.contains("pure_issubtype"))
+    });
+
+pub(crate) fn is_pure_mro_issubtype_residual(fnaddr: i64) -> bool {
+    W_TYPE_ISSUBTYPE_FNADDRS.contains(&fnaddr)
+}
+
 /// Residuals whose registered path names a `bigint` helper: their Ref slots
 /// carry `*mut BigInt` payloads, not `PyObject`s.
 static BIGINT_FNADDRS: std::sync::LazyLock<std::collections::HashSet<i64>> =
@@ -1226,10 +1249,10 @@ fn capture_root_vable_stack_image<Sym: WalkSym>(
                 .first(),
             "innermost frame has no parent"
         );
-        // `call_pc` is the CALL's jitcode pc. `resume_pc` is `MIFrame.pc`
-        // (`setup_resume_at_op`, the pc half of `read_jitcode_pos_pc`).
-        // `call_jitcode_pc` stays the Rewind arm: a bridge root leaves it unset.
-        // A live inline still resolves `CallFallthrough` through that arm.
+        // `resume_pc` is `MIFrame.pc` (`setup_resume_at_op`, the pc half of
+        // `read_jitcode_pos_pc`). `call_jitcode_pc` stays the Rewind arm: a
+        // bridge root leaves it unset. A live inline still resolves
+        // `CallFallthrough` through that arm.
         if parent.call_jitcode_pc.is_none()
             && let Some(resume_pc) = parent.resume_pc
         {
@@ -5430,19 +5453,27 @@ impl Drop for SavedVableRoot {
 /// Concrete result attached when the call is recorded.
 /// `direct_call_may_force` / `history.record_nospec` uses it for a forces
 /// call; `execute_and_record_varargs` uses the same value for
-/// `CALL_*` / `CALL_LOOPINVARIANT_*` / `CALL_PURE_*`. `Err` records the
-/// call with no value (`execute_varargs` still records, then skips
-/// `record_result_of_call_pure`). A Ref re-reads the rooted slot when the
-/// caller has one. Void has no result box.
+/// `CALL_*` / `CALL_LOOPINVARIANT_*` / `CALL_PURE_*`.
+///
+/// `executor.py _do_call`: a raising `bh_call_*` still returns a word
+/// (`0` / `NULL` / `ZEROF`) after `execute_raised`. `History._make_op`
+/// boxes that word. `execute_varargs` / `do_residual_call` then
+/// `make_result_of_lastop` before `handle_possible_exception`, so the
+/// dest is in `get_list_of_active_boxes` at the exception guard. A Ref
+/// re-reads the rooted slot when the caller has one. Void has no result
+/// box.
 fn may_force_call_value(
     call_descr: &dyn majit_ir::descr::CallDescr,
     exec_result: Result<i64, i64>,
     rooted_ref: Option<i64>,
 ) -> Option<majit_ir::Value> {
-    let Ok(result_i64) = exec_result else {
+    if call_descr.result_type() == majit_ir::Type::Void {
         return None;
+    }
+    let result_i64 = match exec_result {
+        Ok(v) => rooted_ref.unwrap_or(v),
+        Err(_) => 0,
     };
-    let result_i64 = rooted_ref.unwrap_or(result_i64);
     match call_descr.result_type() {
         majit_ir::Type::Int => Some(majit_ir::Value::Int(result_i64)),
         majit_ir::Type::Ref => Some(majit_ir::Value::Ref(majit_ir::GcRef(result_i64 as usize))),
@@ -8630,6 +8661,8 @@ pub(crate) fn write_residual_call_result_to_dst<Sym: WalkSym>(
     dst_bank: char,
     result: OpRef,
 ) -> Result<(), DispatchError> {
+    // pyjitpl.py make_result_of_lastop: the bank follows resultbox.type.
+    super::ensure_resultbox_type_for_bank(ctx, pc, dst_bank, result)?;
     // concrete_of_opref shadow write: route the shadow write through `concrete_of_opref`
     // so a CallPure* descr whose argboxes are all constant (do_residual_call
     // path that lands a constant result via the executor.execute_varargs
@@ -9007,7 +9040,11 @@ fn journal_walker_dict_store_subscr<Sym: WalkSym>(
                 return None;
             }
             let key_text = pyre_object::unicodeobject::w_str_get_value_opt(key)?;
-            pyre_object::w_module_dict_getitem_str(dict, key_text).unwrap_or(std::ptr::null_mut())
+            pyre_object::w_module_dict_getitem_str(
+                dict,
+                pyre_object::unicodeobject::prebuilt_str_storage(key_text),
+            )
+            .unwrap_or(std::ptr::null_mut())
         } else if pyre_object::w_dict_is_empty_strategy(dict) {
             std::ptr::null_mut()
         } else {
@@ -10205,7 +10242,15 @@ pub(crate) fn record_ordinary_residual_after_execute<Sym: WalkSym>(
     let rewrite_first = list_write_barrier && list_wb_records_before_invalidate(ctx, funcptr);
     // `box_value` temporaries end with the predicate. A `Value::Ref` copied
     // here would not be a root across the record below.
-    let pure = call_opcode.is_call_pure() && value.is_some();
+    // `MIFrame.execute_varargs`: `if pure and not last_exc_value and op`.
+    // A raising `bh_call_*` still boxes a dummy word (`executor.py _do_call`),
+    // so `value` is `Some`; `record_result_of_call_pure` must not fold it.
+    let last_exc_set = ctx.last_exc_value().is_some()
+        || matches!(
+            ctx.last_exc_value_concrete(),
+            ConcreteValue::Ref(p) if !p.is_null()
+        );
+    let pure = call_opcode.is_call_pure() && value.is_some() && !last_exc_set;
     let args_known = pure
         && allboxes
             .iter()
@@ -10361,12 +10406,12 @@ fn finish_dispatch_residual_call<Sym: WalkSym>(
     let namespace_write_journaled =
         journal_walker_namespace_write(ctx, ei.runtime_helper, r_args, op_pc).is_some();
 
-    // `posted`: the hook already invalidated and, when the result has a
-    // value, wrote the dst. The Ok arm refreshes that box after
+    // `posted`: the hook already invalidated and wrote the dst
+    // (`execute_varargs` `make_result_of_lastop` before
+    // `handle_possible_exception`). The Ok arm refreshes that box after
     // `vable_after_residual_call`, so the success path writes the dst once
-    // more from that refresh. An `Err` result has no const; writing Null
-    // inside the hook would clear the pre-call shadow
-    // `build_single_frame_miframe` still reads when the portal escapes.
+    // more from that refresh. A raising call still has a result box
+    // (`_do_call` 0/NULL/ZEROF); dest is that box, not a pre-call color.
     let mut hook_state = ResidualHookState {
         ran: false,
         recorded: OpRef::NONE,
@@ -10416,9 +10461,7 @@ fn finish_dispatch_residual_call<Sym: WalkSym>(
             hook_state.ran = true;
             hook_state.recorded = rec;
             hook_state.is_list_wb = wb;
-            if value.is_some() {
-                write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, rec)?;
-            }
+            write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, rec)?;
             Ok(rec)
         };
         match try_execute_residual_call_via_executor_inner(
@@ -10550,11 +10593,62 @@ fn finish_dispatch_residual_call<Sym: WalkSym>(
     })
 }
 
+/// Snapshot a residual-call guard.  The shared `dispatch_bytecode`
+/// residual sits out of line: `snapshot_pc` is the `goto L_shared`.
+/// `containing_py_pc` of the shared call is the last opcode, so a
+/// capture at that call would publish RETURN's `last_instr`.  Capture at
+/// the goto with `after_residual_call=false` so `resume_marker(goto)` is
+/// a can_decode startpoint, and keep the `setfield_vable` last_instr
+/// (this opcode) instead of `py_pc - 1`.
+fn capture_residual_guard_at<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    snapshot_pc: usize,
+    residual_call_catch_resume: bool,
+) -> Result<(), DispatchError> {
+    if residual_call_catch_resume {
+        walker_capture_snapshot_for_last_guard_scoped(
+            ctx,
+            snapshot_pc,
+            GuardCaptureScope {
+                residual_call_catch_resume: true,
+                ..GuardCaptureScope::default()
+            },
+        )
+    } else {
+        walker_capture_snapshot_for_last_guard(ctx, snapshot_pc)
+    }
+}
+
 pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     code: &[u8],
     op: &DecodedOp,
     ctx: &mut WalkContext<'_, '_, Sym>,
     dst_bank: char,
+) -> Result<(DispatchOutcome, usize), DispatchError> {
+    dispatch_residual_call_iRd_kind_at(code, op, ctx, dst_bank, op.pc, op.next_pc)
+}
+
+/// Same as [`dispatch_residual_call_iRd_kind`], with the instruction's
+/// jitcode pc named separately from the residual's own bytes.
+///
+/// Flatten facts `dispatch_bytecode`'s one `if self.debugdata` copy
+/// out of line (`goto L_shared` + residual + `switch last_instr`).
+/// `containing_py_pc` of the residual would name whichever opcode's
+/// floor owns that shared block, so `LiveLastInstrGuard`, the
+/// ABORT_ESCAPE blackhole, and GuardNotForced / GuardNoException
+/// snapshots must take the `goto`'s pc — the in-loop copy's
+/// coordinate (`pyopcode.py dispatch_bytecode`).  A per-instruction
+/// trailing `-live-` after that goto overflows
+/// `exception_metadata_jitstress.run` (`u16` `code_len`), so the
+/// shared-waj capture uses `after_residual_call=false` and keeps the
+/// `setfield_vable` last_instr instead of `py_pc - 1`.
+pub(crate) fn dispatch_residual_call_iRd_kind_at<Sym: WalkSym>(
+    code: &[u8],
+    op: &DecodedOp,
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    dst_bank: char,
+    snapshot_pc: usize,
+    resume_after: usize,
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
     // execute_varargs (pyjitpl.py) opens every residual call
     // with metainterp.clear_exception(), so a caught exception's
@@ -10656,6 +10750,20 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         return Ok((DispatchOutcome::Continue, op.next_pc));
     }
 
+    // `descroperation.py get_and_call_function` Function fast path is
+    // `funccall(w_obj, *args_w)`. Residual because `look_inside_graph`
+    // sees the `args_w` loop; `_index` is that call with no extra args.
+    if ctx.is_authoritative_executor
+        && dst_bank == 'r'
+        && let Some(majit_ir::Value::Int(funcaddr)) = ctx.trace_ctx.box_value(funcptr)
+        && funcaddr == *GET_AND_CALL_FUNCTION_FNADDR
+        && let Some((result, _)) =
+            try_walker_inline_index_from_get_and_call(ctx, op, code, &r_args, dst)?
+    {
+        write_residual_call_result_to_dst(ctx, op.pc, dst, dst_bank, result)?;
+        return Ok((DispatchOutcome::Continue, op.next_pc));
+    }
+
     // Offer the specific pop fold before generic builtin inlining. Now that
     // `list.pop` has a `__majit_wrap_*` gateway, the generic path finds its
     // jitcode and otherwise descends into the wrapper until `w_list_pop_end`'s
@@ -10673,26 +10781,14 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         return continue_after_no_driver_finishframe(ctx, op.next_pc, op.pc);
     }
 
-    // `isinstance(x, C)` for a class whose metaclass is exactly `type`: the
-    // answer is `issubtype`'s elidable MRO test on two promoted types
-    // (typeobject.py), so pin both and bake it instead of leaving the opaque
-    // `bh_call_fn(isinstance_builtin, NULL, x, C)` residual.  Read-only like
-    // the `len` fold, so no sub-walk restriction; a tuple or union classinfo, a
-    // custom `__instancecheck__`, and an unversioned type fall through to the
-    // generic residual (SAFE).
+    // `ABCMeta.__instancecheck__` is Python.  Enter it before the wrapper
+    // descent: an `Err` from that descent aborts the trace.  Ordinary
+    // `type.__instancecheck__` declines here and the wrapper descent records
+    // `W_TypeObject.issubtype` (`_pure_issubtype`).
     if ctx.is_authoritative_executor
         && dst_bank == 'r'
         && ei.runtime_helper == majit_ir::RuntimeHelperKind::CallFn
     {
-        if spec_gate(SpecFold::BuiltinIsinstance, || {
-            try_walker_specialize_builtin_isinstance(ctx, code, op, &r_args, dst)
-        })?
-        .is_some()
-        {
-            return Ok((DispatchOutcome::Continue, op.next_pc));
-        }
-        // `ABCMeta.__instancecheck__` is Python.  Enter it before the wrapper
-        // descent: an `Err` from that descent aborts the trace.
         if let Some(inlined) =
             try_walker_inline_isinstance_dunder(ctx, op, code, &r_args, dst, dst_bank)?
         {
@@ -10719,19 +10815,44 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         return Ok((DispatchOutcome::Continue, op.next_pc));
     }
 
+    // Offer the `s.add` substitution before generic builtin inlining, the
+    // same seam as `try_walker_orthodox_list_pop`. `set.add` now has a
+    // `__majit_wrap_*` gateway (`interp2app` / `BuiltinCode.func`), so the
+    // generic path finds its jitcode and otherwise descends the wrapper.
+    // An abort-reachable helper pc inside that wrapper (`capture_resumedata`
+    // / `bhimpl_abort`) collapses to the CALL entry and consumes the CALL;
+    // the declared fold then never fires. `Elided` is done here;
+    // `Subst` still uses the generic residual tail below.
+    let mut early_set_add: Option<SetAddMethodSpec> = None;
+    let set_add_offered_before_wrap = ctx.is_authoritative_executor
+        && dst_bank == 'r'
+        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::CallFn;
+    if set_add_offered_before_wrap {
+        match spec_gate(SpecFold::SetAddMethod, || {
+            try_walker_specialize_set_add_method(ctx, code, op, &r_args, dst)
+        })? {
+            Some(SetAddMethodSpec::Elided) => {
+                return Ok((DispatchOutcome::Continue, op.next_pc));
+            }
+            other => early_set_add = other,
+        }
+    }
+
     // BuiltinCode.func is an indirect PBC target exactly like RPython's
     // gateway wrappers.  Enter its generated JitCode before considering the
     // user-function-only full-body walk below.
-    if let Some(inlined) = try_walker_inline_builtin_call(
-        ctx,
-        op,
-        code,
-        1,
-        &r_args,
-        foldable_runtime_helper,
-        dst_bank,
-        dst,
-    )? {
+    if !matches!(&early_set_add, Some(SetAddMethodSpec::Subst(_)))
+        && let Some(inlined) = try_walker_inline_builtin_call(
+            ctx,
+            op,
+            code,
+            1,
+            &r_args,
+            foldable_runtime_helper,
+            dst_bank,
+            dst,
+        )?
+    {
         return Ok(inlined);
     }
 
@@ -10764,7 +10885,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         residual_callee_is_walk_self_recursive(ctx, &[funcptr, callable], foldable_runtime_helper)
             && residual_callable_has_closure_or_cells(ctx, callable)
     });
-    if !skip_cell_self_rec {
+    if !matches!(&early_set_add, Some(SetAddMethodSpec::Subst(_))) && !skip_cell_self_rec {
         if let Some(inlined) = try_walker_inline_user_call(
             ctx,
             op,
@@ -11012,23 +11133,27 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         return Ok((outcome, op.next_pc));
     }
 
-    if ctx.is_authoritative_executor && dst_bank == 'i' && r_args.len() == 1 {
+    if ctx.is_authoritative_executor
+        && r_args.len() == 1
+        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::Truth
+    {
         // A TO_BOOL / POP_JUMP truth residual walks
         // `opcode_ops::truth_value` (`is_true`). That elides the may-force
         // call whose force/exc guards mis-resume the kept short-circuit
         // stack (`(i % 7) and ...`, and the boxed bool a COMPARE_OP leaves
-        // for `if a == b:`).
-        if foldable_runtime_helper == majit_ir::RuntimeHelperKind::Truth {
-            if let Some(outcome) = try_walker_orthodox_truth(ctx, op.pc, r_args[0], dst, dst_bank)?
-            {
-                return Ok((outcome, op.next_pc));
-            }
-            // `is_true_lookup` is `dont_look_inside`. An overriding Python
-            // `__bool__` is inlined here, the way `len` inlines `__len__`,
-            // instead of recording the lookup as RandomEffects.
-            if let Some(routed) = try_walker_inline_truth_bool(ctx, op, code, &r_args, dst)? {
-                return Ok(routed);
-            }
+        // for `if a == b:`). TO_BOOL's `newbool` half is
+        // `residual_call_ir_r` (`try_walker_newbool_from_truth_int`).
+        if let Some(outcome) = try_walker_orthodox_truth(ctx, op.pc, r_args[0], dst, dst_bank)? {
+            return Ok((outcome, op.next_pc));
+        }
+        // `is_true_lookup` is `dont_look_inside`. An overriding Python
+        // `__bool__` is inlined here, the way `len` inlines `__len__`,
+        // instead of recording the lookup as RandomEffects. The inline
+        // writes the raw truth int, so only the POP_JUMP (`'i'`) residual.
+        if dst_bank == 'i'
+            && let Some(routed) = try_walker_inline_truth_bool(ctx, op, code, &r_args, dst)?
+        {
+            return Ok(routed);
         }
     }
 
@@ -11279,11 +11404,11 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     // parity suite folding function-entry helper appends on both backends.
     // Inside an inlined callee the same descent runs only when
     // `walker_inline_guard_resumes_in_callee` holds.  `w_list_append_inner`
-    // is a transparent helper: a complete parent chain numbers the paused
-    // Python CALL (`in_a_call`) plus the helper section at the guard
-    // (`capture_resumedata`). A shorter parent chain still collapses onto
-    // `entry_py_pc` / `outer_active_boxes` and stays on the residual, whose
-    // resume is past the call.
+    // is a transparent helper: `walker_capture_transparent_helper_snapshot`
+    // appends a helper section and the paused Python CALL sits at `next_pc`
+    // dest-cleared (`compute_inline_caller_frame`). A shorter parent chain
+    // still collapses onto `entry_py_pc` / `outer_active_boxes` and stays on
+    // the residual, whose resume is past the call.
     // #171 ORTHODOX descent: descend the real `w_list_append` body,
     // recording its array ops native.
     // A recognition or body-sub-walk decline falls through to the generic
@@ -11376,20 +11501,6 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         .is_some()
     {
         return Ok((DispatchOutcome::Continue, op.next_pc));
-    }
-
-    // An exact `range(...)` constructor call becomes a virtual W_Range whose
-    // four wrapped-int fields can fold directly into GET_ITER virtualization.
-    // Non-canonical callables and arguments fall through to the residual.
-    if ctx.is_authoritative_executor
-        && dst_bank == 'r'
-        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::CallFn
-    {
-        if let Some(outcome) = spec_gate(SpecFold::BuiltinRange, || {
-            try_walker_specialize_builtin_range(ctx, code, op, &r_args, dst)
-        })? {
-            return Ok((outcome, op.next_pc));
-        }
     }
 
     // Zero-argument `locals()` / `vars()` / `dir()` on the walk's own portal
@@ -11599,8 +11710,9 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
 
     // `s.add(x)` on an exact `set`: swap the generic `bh_call_fn` target for
     // the direct `set_add` store the SET_ADD accumulator opcode records
-    // (`try_walker_specialize_set_add_method`).  This is a substitution, not a
-    // fold — the call is still a MayForce residual, still guarded and still
+    // (`try_walker_specialize_set_add_method`).  Recognition ran before the
+    // wrap-gateway descent above.  This is a substitution, not a fold — the
+    // call is still a MayForce residual, still guarded and still
     // concrete-executed by the shared tail below, so the force/exception
     // guards, the heapcache invalidation and the `None` writeback are the ones
     // the generic path already emits.  A decline leaves every binding
@@ -11632,21 +11744,12 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     // insert and does not run `__hash__`, so it is not tagged `SetAddMethod`
     // and must not be concrete-executed as `jit_set_add_method`.  `spec_gate`
     // still counts that `Some` as the same row.
-    let direct_subst = if ctx.is_authoritative_executor
-        && dst_bank == 'r'
-        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::CallFn
-    {
-        match spec_gate(SpecFold::SetAddMethod, || {
-            try_walker_specialize_set_add_method(ctx, code, op, &r_args, dst)
-        })? {
-            Some(SetAddMethodSpec::Elided) => {
-                return Ok((DispatchOutcome::Continue, op.next_pc));
-            }
-            Some(SetAddMethodSpec::Subst(subst)) => Some(subst),
-            None => spec_gate(SpecFold::BareSuperCall, || {
-                try_walker_specialize_bare_super_call(ctx, code, op, &r_args)
-            })?,
-        }
+    let direct_subst = if let Some(SetAddMethodSpec::Subst(subst)) = early_set_add {
+        Some(subst)
+    } else if set_add_offered_before_wrap {
+        spec_gate(SpecFold::BareSuperCall, || {
+            try_walker_specialize_bare_super_call(ctx, code, op, &r_args)
+        })?
     } else {
         None
     };
@@ -11742,8 +11845,8 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         // `vrefs_after_residual_call`, then `direct_call_may_force`.
         let recorded_residual = finish_dispatch_residual_call(
             ctx,
-            op.pc,
-            op.next_pc,
+            snapshot_pc,
+            resume_after,
             "dispatch_residual_call_iRd_kind",
             call_opcode,
             can_raise,
@@ -11771,12 +11874,15 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         // emitted.
         // #73: maintain the `-live-` AFTER anchor.  A
         // residual-call guard reads its resume point at `self.pc` (the
-        // `-live-` trailing the call, `pyjitpl.py`).  `op.next_pc` is
-        // the first byte after the residual_call opcode, which the
-        // `[funcptr, Call, -live-]` layout (jitcode.rs) makes the
-        // trailing `-live-` byte.  Set it for the rest of this step,
-        // including `GUARD_NO_EXCEPTION` when `!emit_guard_not_forced`.
-        ctx.live_after_jit_pc = op.next_pc;
+        // `-live-` trailing the call, `pyjitpl.py`).  `resume_after` is the
+        // first byte after the residual_call opcode, which the
+        // `[funcptr, Call, -live-]` layout (jitcode.rs) makes the trailing
+        // `-live-` byte; for the shared `dispatch_bytecode` residual, which is
+        // out of line, it is the in-loop coordinate after `goto L_shared`
+        // (a capture at `op.pc` would publish `last_instr` from the last
+        // opcode's floor).  Set it for the rest of this step, including
+        // `GUARD_NO_EXCEPTION` when `!emit_guard_not_forced`.
+        ctx.live_after_jit_pc = resume_after;
         if emit_guard_not_forced {
             ctx.trace_ctx.record_guard(OpCode::GuardNotForced, &[]);
             walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
@@ -11792,7 +11898,14 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         // `COND_CALL_GC_WB` cannot raise (`resoperation.py`).
         if can_raise && !is_list_wb {
             if resid_raised {
-                walker_record_guard_exception(ctx, op.pc)?;
+                walker_record_guard_exception_scoped(
+                    ctx,
+                    snapshot_pc,
+                    GuardCaptureScope {
+                        residual_call_catch_resume: true,
+                        ..GuardCaptureScope::default()
+                    },
+                )?;
                 // `handle_possible_exception` routes
                 // the raising branch through `finishframe_exception()`
                 // immediately after emitting `GUARD_EXCEPTION`, so the
@@ -11818,15 +11931,9 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
                 // the CALL pc is actually covered by the code's exception table
                 // (checked in `walker_capture_snapshot_for_last_guard_impl`);
                 // an uncovered residual keeps the generic fallthrough resume.
-                // See the scope field's doc.
-                walker_capture_snapshot_for_last_guard_scoped(
-                    ctx,
-                    op.pc,
-                    GuardCaptureScope {
-                        residual_call_catch_resume: true,
-                        ..GuardCaptureScope::default()
-                    },
-                )?;
+                // See the scope field's doc.  Shared waj captures at the
+                // `goto`, whose py_pc is this opcode, not the residual.
+                capture_residual_guard_at(ctx, snapshot_pc, true)?;
             }
         }
 
@@ -11924,6 +12031,20 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
         original_call_descr.arg_types(),
         None,
     );
+
+    // TO_BOOL `newbool` (`bh_to_bool_fn` / `baseobjspace.py newbool`):
+    // `residual_call_ir_r` of a raw truth Int. The preceding `truth_fn`
+    // residual is `residual_call_r_i` (`try_walker_orthodox_truth`).
+    if ctx.is_authoritative_executor
+        && dst_bank == 'r'
+        && i_args.len() == 1
+        && r_args.is_empty()
+        && runtime_helper_kind == majit_ir::RuntimeHelperKind::Truth
+    {
+        if let Some(outcome) = try_walker_newbool_from_truth_int(ctx, op.pc, i_args[0], dst)? {
+            return Ok((outcome, op.next_pc));
+        }
+    }
 
     if ctx.is_authoritative_executor && dst_bank == 'r' && i_args.len() == 1 && r_args.len() == 1 {
         let func_addr = match ctx.trace_ctx.box_value(funcptr) {
@@ -13722,7 +13843,9 @@ fn dispatch_conditional_call_value_ir<Sym: WalkSym>(
             let concrete = concrete_from_box_value(ctx.trace_ctx.box_value(first));
             match dst_bank {
                 'i' => write_int_reg(ctx, op.pc, dst, first, concrete)?,
-                'r' => write_ref_reg(ctx, op.pc, dst, first, concrete)?,
+                'r' => {
+                    write_ref_reg(ctx, op.pc, dst, first, concrete)?;
+                }
                 _ => unreachable!("cond_call_value dst bank is i or r"),
             }
             return Ok((DispatchOutcome::Continue, op.next_pc));
@@ -13839,7 +13962,9 @@ fn dispatch_conditional_call_value_ir<Sym: WalkSym>(
     };
     match dst_bank {
         'i' => write_int_reg(ctx, op.pc, dst, result, concrete)?,
-        'r' => write_ref_reg(ctx, op.pc, dst, result, concrete)?,
+        'r' => {
+            write_ref_reg(ctx, op.pc, dst, result, concrete)?;
+        }
         _ => unreachable!("cond_call_value dst bank is i or r"),
     }
     if let Some(out) = cond_record_handle_exception(ctx, op, &ei)? {

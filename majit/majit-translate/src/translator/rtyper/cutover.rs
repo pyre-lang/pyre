@@ -1666,7 +1666,6 @@ fn op_result_can_remove(kind: &crate::model::OpKind) -> bool {
             | OpKind::BinOp { .. }
             | OpKind::UnaryOp { .. }
             | OpKind::IsInstance { .. }
-            | OpKind::VtableMethodPtr { .. }
             | OpKind::RecordQuasiImmutField { .. }
             | OpKind::NewTuple { .. }
             | OpKind::NewList { .. }
@@ -2191,21 +2190,6 @@ const UNPORTED_CATEGORIES: &[(&[&str], &str)] = &[
         &["is of instances of the non-pointers"],
         "rtype-is-non-pointer",
     ),
-    (
-        &["Call with CallTarget::Indirect", "rclass"],
-        "indirect-call-pre-rtyper",
-    ),
-    // `dyn Trait` dispatch still enters the real-rtyper flowspace
-    // adapter as pyre's pre-rtyper `CallTarget::Indirect` shape in
-    // some registry-prefill paths.  The production codewriter's
-    // jtransform path already runs `rpbc::lower_indirect_calls`
-    // before consuming these graphs; the real-rtyper cutover path
-    // cannot yet express the matching rclass/rpbc rewrite before
-    // adapter input without leaking post-rtyper `VtableMethodPtr` /
-    // `IndirectCall` ops into flowspace.  Treat this as a
-    // known-unported real-path gap so the dual gate falls back to
-    // the legacy type walker instead of panicking during registry
-    // population.
     // `annrpython.py mergeinputargs` — an inputarg Variable
     // has no annotation. Happens when cross-block locals
     // threading misses a name in the predecessor link; the
@@ -6778,8 +6762,6 @@ fn classify_unported_reason(reason: &str) -> &'static str {
         // reached getitem/contains before the call-based keyeq branch of
         // `build_ll_dict_lookup_helper_graph` was ported. #140 DictRepr epic.
         "DICT-KEY-EQ (str/instance dict keys)"
-    } else if reason.contains("Call with CallTarget::Indirect") {
-        "DYN-TRAIT-INDIRECT (lower_indirect_calls)"
     } else if reason.contains("pair(s1, s2).union() found no arm") {
         // Two dispositions share one message, and they call for opposite
         // work.  Upstream's union table is same-kind almost throughout, so a
@@ -17108,19 +17090,6 @@ mod tests {
     }
 
     #[test]
-    fn known_unported_classifies_indirect_call_adapter_invariant() {
-        let msg = "translate_op: Call with CallTarget::Indirect at result=Some(v4) \
-                   must be lowered to VtableMethodPtr + IndirectCall by rclass.rs before \
-                   reaching the flowspace adapter";
-        assert_eq!(
-            unported_category(msg),
-            Some("indirect-call-pre-rtyper"),
-            "the indirect-call gap keeps its stable fallback category"
-        );
-        assert!(is_known_unported(msg));
-    }
-
-    #[test]
     fn known_unported_classifies_noneify_on_ptr_merge() {
         // A `_ptr ∪ NoneType` block merge reaches `SomeValue::noneify()`
         // on a `SomePtr` operand — a parity-correct raise (default
@@ -17170,22 +17139,12 @@ mod tests {
                 Some("annotator-fixpoint-failed"),
             ),
             (
-                "translate_op: Call with CallTarget::Indirect at result=Some(v4) \
-                 must be lowered to VtableMethodPtr + IndirectCall by rclass.rs before \
-                 reaching the flowspace adapter",
-                Some("indirect-call-pre-rtyper"),
-            ),
-            (
                 "RPython noneify() not supported for this annotation",
                 Some("noneify-on-ptr"),
             ),
             (
                 "dict key eq function not wired for StringRepr",
                 Some("dict-key-eq-missing"),
-            ),
-            (
-                "Call with CallTarget::Indirect must be rewritten by rclass",
-                Some("indirect-call-pre-rtyper"),
             ),
             ("variable v3 is live", None),
         ];
@@ -22427,10 +22386,13 @@ mod tests {
                 .blocks
                 .iter()
                 .flat_map(|b| &b.operations)
-                .any(
-                    |op| matches!(&op.kind, OpKind::FieldRead { field, .. } if field.name == "key")
-                ),
-            "IdentityKey get_slot must FieldRead key of the entry_at dest, ops {:?}",
+                .any(|op| match &op.kind {
+                    OpKind::FieldRead { field, .. } | OpKind::InteriorFieldRead { field, .. } => {
+                        field.name == "key"
+                    }
+                    _ => false,
+                }),
+            "IdentityKey get_slot must FieldRead/InteriorFieldRead key of the entry_at dest, ops {:?}",
             get_slot
                 .graph()
                 .blocks
@@ -22445,52 +22407,63 @@ mod tests {
         registry.set_struct_fields(Rc::new(program.struct_fields.clone()));
 
         let graph = entry_at.graph();
-        let declared = declared_return_annotation(&registry, graph).unwrap_or_else(|| {
-            panic!(
-                "IdentityKey entry_at dest intern is SomePtr of DICTENTRY, \
-                 return_type={:?} residual_return_type={:?} return_class_root={:?} \
-                 semantic_return_class_root={:?}",
-                graph.return_type,
-                graph.residual_return_type,
-                graph.return_class_root,
-                entry_at.return_class_root
-            )
-        });
-        let s_entry = match &declared {
-            SomeValue::Ptr(ptr) => {
-                match &ptr.ll_ptrtype.TO {
-                    PtrTarget::Struct(st) => {
-                        assert_eq!(st._gckind, GcKind::Raw, "DICTENTRY is lltype.Struct");
+        match declared_return_annotation(&registry, graph) {
+            Some(declared) => {
+                let s_entry = match &declared {
+                    SomeValue::Ptr(ptr) => {
+                        match &ptr.ll_ptrtype.TO {
+                            PtrTarget::Struct(st) => {
+                                assert_eq!(st._gckind, GcKind::Raw, "DICTENTRY is lltype.Struct");
+                            }
+                            other => panic!(
+                                "IdentityKey entry_at dest SomePtr must point at STRUCT, got {other:?}"
+                            ),
+                        }
+                        declared.clone()
                     }
+                    SomeValue::InteriorPtr(_) => declared.clone(),
                     other => panic!(
-                        "IdentityKey entry_at dest SomePtr must point at STRUCT, got {other:?}"
+                        "IdentityKey entry_at dest intern is SomePtr/SomeInteriorPtr of DICTENTRY, \
+                         got {other:?}, return_class_root={:?}",
+                        graph.return_class_root
                     ),
-                }
-                declared.clone()
-            }
-            SomeValue::InteriorPtr(_) => declared.clone(),
-            other => panic!(
-                "IdentityKey entry_at dest intern is SomePtr/SomeInteriorPtr of DICTENTRY, \
-                 got {other:?}, return_class_root={:?}",
-                graph.return_class_root
-            ),
-        };
+                };
 
-        let mut s_attr = SomeString::new(false, false);
-        s_attr.inner.base.const_box = Some(Constant::new(ConstValue::byte_str("key")));
-        let s_key = match &s_entry {
-            SomeValue::Ptr(ptr) => ptr
-                .getattr(&SomeValue::String(s_attr))
-                .expect("SomePtr.getattr key of DICTENTRY"),
-            SomeValue::InteriorPtr(iptr) => iptr
-                .getattr(&SomeValue::String(s_attr))
-                .expect("SomeInteriorPtr.getattr key of DICTENTRY"),
-            other => panic!("entry dest intern must stay SomePtr, got {other:?}"),
-        };
-        assert!(
-            !matches!(&s_key, SomeValue::Instance(inst) if inst.classdef.is_none()),
-            "getattr key must not be classdef-less, got {s_key:?}"
-        );
+                let mut s_attr = SomeString::new(false, false);
+                s_attr.inner.base.const_box = Some(Constant::new(ConstValue::byte_str("key")));
+                let s_key = match &s_entry {
+                    SomeValue::Ptr(ptr) => ptr
+                        .getattr(&SomeValue::String(s_attr))
+                        .expect("SomePtr.getattr key of DICTENTRY"),
+                    SomeValue::InteriorPtr(iptr) => iptr
+                        .getattr(&SomeValue::String(s_attr))
+                        .expect("SomeInteriorPtr.getattr key of DICTENTRY"),
+                    other => panic!("entry dest intern must stay SomePtr, got {other:?}"),
+                };
+                assert!(
+                    !matches!(&s_key, SomeValue::Instance(inst) if inst.classdef.is_none()),
+                    "getattr key must not be classdef-less, got {s_key:?}"
+                );
+            }
+            None => {
+                // InteriorPtr FUNC.RESULT is `'ref'` with no class root
+                // (`interior_ptr_return_stamps_func_result_ref`). Intern of
+                // that stamp is None; get_slot InteriorFieldRead of `key`
+                // is `InteriorPtrRepr.rtype_getattr`.
+                assert_eq!(
+                    graph.return_type.as_deref(),
+                    Some("ref"),
+                    "InteriorPtr FUNC.RESULT is ref, return_type={:?} residual={:?}",
+                    graph.return_type,
+                    graph.residual_return_type
+                );
+                assert!(
+                    graph.return_class_root.is_none(),
+                    "InteriorPtr has no interned class root, got {:?}",
+                    graph.return_class_root
+                );
+            }
+        }
     }
 
     #[test]

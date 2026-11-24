@@ -18,7 +18,7 @@ use super::*;
 /// `can_decode_live_vars` rejects (`resume.py` `jitcodes[jitcode_pos]`).
 /// Inline callees already name their body through [`InlineCalleeConsts`]; a
 /// top-level per-function walk stamps [`WalkSession::recording_jitcode_index`].
-fn walked_snapshot_jitcode<Sym: WalkSym>(
+pub(crate) fn walked_snapshot_jitcode<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
 ) -> Option<crate::state::JitCode> {
     let index = if let Some(consts) = ctx.inline_callee_consts {
@@ -54,10 +54,58 @@ fn walked_snapshot_jitcode<Sym: WalkSym>(
 /// may have no first-insn pivot, so retain the bytecode-local identity as the
 /// authoritative fallback rather than rewinding to the call.
 fn trailing_live_marker(payload: &crate::PyJitCode, call_pc: usize) -> Option<usize> {
-    let call = crate::jitcode_runtime::decode_op_at(payload.jitcode.code.as_slice(), call_pc)?;
-    let marker =
-        crate::jitcode_runtime::decode_op_at(payload.jitcode.code.as_slice(), call.next_pc)?;
+    let call = op_at(payload, call_pc)?;
+    let marker = op_at(payload, call.next_pc)?;
     (marker.opname == "live").then_some(marker.pc)
+}
+
+/// Instruction at `pc`: the cached list when `pc` is an op start, else
+/// `decode_op_at`. `preceding_live_marker` subtracts `SIZE_LIVE_OP`, and
+/// that byte is an op start only when the previous instruction is a `-live-`.
+fn op_at(payload: &crate::PyJitCode, pc: usize) -> Option<crate::jitcode_runtime::DecodedOp> {
+    payload
+        .decoded_op_at(pc)
+        .cloned()
+        .or_else(|| crate::jitcode_runtime::decode_op_at(payload.jitcode.code.as_slice(), pc))
+}
+
+/// After-pops `-live-` of the residual whose trailing `-live-` is `jit_pc`
+/// (`jtransform.py handle_residual_call`).
+///
+/// `GUARD_NOT_FORCED` / `GUARD_NO_EXCEPTION` capture at that trailing
+/// marker (`get_list_of_active_boxes(after_residual_call=True)`). Leftover
+/// dest colors still name the CALL GET dests; fallthrough pcdep maps those
+/// colors onto locals. Encode must hide them the same way as after-pops.
+pub(crate) fn after_pops_of_trailing_live(
+    payload: &crate::PyJitCode,
+    jit_pc: usize,
+) -> Option<usize> {
+    if let Some(slot) = payload.op_marker_facts_at(jit_pc) {
+        return *slot
+            .after_pops_of_trailing_live
+            .get_or_init(|| after_pops_of_trailing_live_uncached(payload, jit_pc));
+    }
+    after_pops_of_trailing_live_uncached(payload, jit_pc)
+}
+
+fn after_pops_of_trailing_live_uncached(
+    payload: &crate::PyJitCode,
+    jit_pc: usize,
+) -> Option<usize> {
+    if !payload
+        .jitcode
+        .can_decode_live_vars(jit_pc, crate::state::op_live())
+    {
+        return None;
+    }
+    payload
+        .decoded_ops()
+        .iter()
+        .find(|op| {
+            op.opname.starts_with("residual_call")
+                && trailing_live_marker(payload, op.pc) == Some(jit_pc)
+        })
+        .and_then(|op| preceding_live_marker(payload, op.pc))
 }
 
 /// The `-live-` directly before `op_pc`: the liveness a plain guard reads
@@ -66,7 +114,7 @@ fn trailing_live_marker(payload: &crate::PyJitCode, call_pc: usize) -> Option<us
 pub(crate) fn preceding_live_marker(payload: &crate::PyJitCode, op_pc: usize) -> Option<usize> {
     const SIZE_LIVE_OP: usize = majit_jitcode::liveness::OFFSET_SIZE + 1;
     let pc = op_pc.checked_sub(SIZE_LIVE_OP)?;
-    let marker = crate::jitcode_runtime::decode_op_at(payload.jitcode.code.as_slice(), pc)?;
+    let marker = op_at(payload, pc)?;
     (marker.opname == "live"
         && marker.next_pc == op_pc
         && payload
@@ -75,9 +123,523 @@ pub(crate) fn preceding_live_marker(payload: &crate::PyJitCode, op_pc: usize) ->
     .then_some(pc)
 }
 
+fn residual_call_follows(
+    payload: &crate::PyJitCode,
+    op: &crate::jitcode_runtime::DecodedOp,
+) -> bool {
+    op_at(payload, op.next_pc).is_some_and(|next| next.opname.starts_with("residual_call"))
+}
+
+/// Ops `handle_regular_call` may emit between the after-pops `-live-` and
+/// the residual (`jtransform.py`). COMPARE wraps the call in
+/// `catch_exception`; LOAD_ATTR plants a `ref_guard_value` on the receiver.
+/// The after-pops `-live-` is re-keyed to fallthrough, so a containing-py
+/// change here is still this opcode's residual, not the next opcode's body.
+fn is_after_pops_to_residual_tail(opname: &str) -> bool {
+    opname == "live"
+        || opname == "catch_exception"
+        || opname.contains("guard")
+        || opname.starts_with("residual_call")
+}
+
+/// First `residual_call` still belonging to the opcode that owns `start`.
+///
+/// Walks past GET pops. An after-pops `-live-` re-keyed to the call's
+/// fallthrough (`py_exact_by_jit_pc`) would otherwise look like a
+/// containing-py change and stop the walk before the residual
+/// (`leftover_residual_call_list_r` / [`after_pops_live_marker_in_opcode`]).
+pub(crate) fn residual_call_in_opcode(
+    payload: &crate::PyJitCode,
+    start: usize,
+) -> Option<crate::jitcode_runtime::DecodedOp> {
+    let ops = payload.decoded_ops();
+    match ops.binary_search_by_key(&start, |op| op.pc) {
+        Ok(start_i) => residual_call_in_opcode_ops(payload, ops, start_i),
+        Err(_) => residual_call_in_opcode_decode(payload, start),
+    }
+}
+
+fn residual_call_in_opcode_ops(
+    payload: &crate::PyJitCode,
+    ops: &[crate::jitcode_runtime::DecodedOp],
+    start_i: usize,
+) -> Option<crate::jitcode_runtime::DecodedOp> {
+    let start_op = &ops[start_i];
+    if start_op.opname == "live" && residual_call_follows(payload, start_op) {
+        return op_at(payload, start_op.next_pc);
+    }
+    let start_py = crate::py_coord::opcode_owner_py_pc_for_payload(payload, start_op.pc);
+    for op in &ops[start_i..] {
+        if op.opname.starts_with("residual_call") {
+            return Some(op.clone());
+        }
+        if op.next_pc <= op.pc {
+            break;
+        }
+        let next_py = crate::py_coord::opcode_owner_py_pc_for_payload(payload, op.next_pc);
+        if next_py != start_py {
+            // After-pops `-live-` re-keyed to fallthrough: still this CALL.
+            if let Some(next_op) = op_at(payload, op.next_pc)
+                && is_after_pops_to_residual_tail(next_op.opname)
+            {
+                continue;
+            }
+            break;
+        }
+    }
+    None
+}
+
+fn residual_call_in_opcode_decode(
+    payload: &crate::PyJitCode,
+    start: usize,
+) -> Option<crate::jitcode_runtime::DecodedOp> {
+    let code = payload.jitcode.code.as_slice();
+    if let Some(op) = crate::jitcode_runtime::decode_op_at(code, start)
+        && op.opname == "live"
+        && residual_call_follows(payload, &op)
+    {
+        return crate::jitcode_runtime::decode_op_at(code, op.next_pc);
+    }
+    let start_py = crate::py_coord::opcode_owner_py_pc_for_payload(payload, start);
+    let mut pc = start;
+    while pc < code.len() {
+        let op = crate::jitcode_runtime::decode_op_at(code, pc)?;
+        if op.opname.starts_with("residual_call") {
+            return Some(op);
+        }
+        if op.next_pc <= pc {
+            break;
+        }
+        let next_py = crate::py_coord::opcode_owner_py_pc_for_payload(payload, op.next_pc);
+        if next_py != start_py {
+            if let Some(next_op) = crate::jitcode_runtime::decode_op_at(code, op.next_pc)
+                && is_after_pops_to_residual_tail(next_op.opname)
+            {
+                pc = op.next_pc;
+                continue;
+            }
+            break;
+        }
+        pc = op.next_pc;
+    }
+    None
+}
+
+/// After-pops `-live-` of the Python opcode that owns `jit_pc`
+/// (`jtransform.py` `handle_regular_call`).
+///
+/// `preceding_live_marker(jit_pc)` hits when `jit_pc` is the residual
+/// itself. A collapsed helper is often entered at the opcode-start twin
+/// (`resume_marker_for_jitcode_pc`); that coordinate has no adjacent
+/// pre-call `-live-`, so scan this opcode for `residual_call` and take
+/// the `-live-` immediately before it.
+pub(crate) fn after_pops_live_marker_in_opcode(
+    payload: &crate::PyJitCode,
+    jit_pc: usize,
+) -> Option<usize> {
+    if let Some(slot) = payload.op_marker_facts_at(jit_pc) {
+        return *slot
+            .after_pops_live_marker_in_opcode
+            .get_or_init(|| after_pops_live_marker_in_opcode_uncached(payload, jit_pc));
+    }
+    after_pops_live_marker_in_opcode_uncached(payload, jit_pc)
+}
+
+fn after_pops_live_marker_in_opcode_uncached(
+    payload: &crate::PyJitCode,
+    jit_pc: usize,
+) -> Option<usize> {
+    // Adjacent residual / inline / assembler: the after-pops `-live-` is
+    // the previous instruction. An opcode-entry `-live-` must not take
+    // the previous opcode's trailing marker (`SIZE_LIVE_OP` adjacency).
+    if let Some(op) = op_at(payload, jit_pc)
+        && (op.opname.starts_with("residual_call")
+            || op.opname.starts_with("inline_call")
+            || op.opname.starts_with("call_assembler"))
+        && let Some(marker) = preceding_live_marker(payload, jit_pc)
+    {
+        let start = payload
+            .resume_marker_for_jitcode_pc(jit_pc)
+            .unwrap_or(jit_pc);
+        // Opcode-start is the pre-pop twin. Treating it as after-pops
+        // hides dests at the wrong depth and blackhole re-GETs NULL
+        // slots (`UNPACK_SEQUENCE` / `IMPORT_NAME` / `STORE_FAST`).
+        if marker != start {
+            return Some(marker);
+        }
+    }
+    let start = payload
+        .resume_marker_for_jitcode_pc(jit_pc)
+        .unwrap_or(jit_pc);
+    // Opcode-entry start can miss a residual that sits after a re-keyed
+    // after-pops `-live-` plus `catch_exception` / a promote guard. The
+    // resume pc itself is already that marker; search from there too.
+    let residual = residual_call_in_opcode(payload, start).or_else(|| {
+        (start != jit_pc)
+            .then(|| residual_call_in_opcode(payload, jit_pc))
+            .flatten()
+    });
+    if let Some(residual) = residual {
+        // Opcode-start is the pre-pop twin (`residual_without_after_pops`).
+        // After-pops `-live-` is itself a startpoint, so `start` can equal
+        // that marker; GET pops immediately before it still make it
+        // after-pops (`jtransform.py` `handle_regular_call`).
+        let marker = preceding_live_marker(payload, residual.pc)
+            .or_else(|| last_live_before(payload, start.min(residual.pc), residual.pc));
+        if let Some(marker) = marker
+            && (marker != start || pops_immediately_precede_live(payload, marker))
+        {
+            return Some(marker);
+        }
+    }
+    // Inlined COMPARE / BINARY: `emit_popvalue_ref` still plants the
+    // after-pops `-live-` (`jtransform.py handle_regular_call`) but the
+    // body is not a residual. Opcode-start GET pops then this marker.
+    after_pops_live_following_get_pops(payload, start).or_else(|| {
+        (start != jit_pc)
+            .then(|| after_pops_live_following_get_pops(payload, jit_pc))
+            .flatten()
+    })
+}
+
+/// Last `-live-` strictly before `end` in `[start, end)`. COMPARE wraps
+/// the residual in `catch_exception`, so the after-pops marker is not
+/// `SIZE_LIVE_OP`-adjacent (`after_pops_live_survives_catch_exception_and_promote_guard`).
+fn last_live_before(payload: &crate::PyJitCode, start: usize, end: usize) -> Option<usize> {
+    let prefix = payload.decoded_ops_before(end);
+    if let Ok(i) = prefix.binary_search_by_key(&start, |op| op.pc) {
+        return prefix[i..]
+            .iter()
+            .filter(|op| op.opname == "live")
+            .last()
+            .map(|op| op.pc);
+    }
+    let code = payload.jitcode.code.as_slice();
+    let mut pc = start;
+    let mut last = None;
+    while pc < end {
+        let op = crate::jitcode_runtime::decode_op_at(code, pc)?;
+        if op.opname == "live" {
+            last = Some(op.pc);
+        }
+        if op.next_pc <= pc {
+            break;
+        }
+        pc = op.next_pc;
+    }
+    last
+}
+
+fn pop_dests_nonempty(payload: &crate::PyJitCode, py: usize) -> bool {
+    payload
+        .metadata
+        .pop_slot_color_by_py_pc
+        .get(py)
+        .is_some_and(|v| !v.is_empty())
+}
+
+/// Whether `next` is the body that follows after-pops `-live-`
+/// (`jtransform.py` `handle_regular_call` residual / inline, COMPARE
+/// `catch_exception` wrap, `do_fixed_list_setitem` `setarrayitem_vable`).
+fn after_pops_body_opname(opname: &str) -> bool {
+    opname.starts_with("setarrayitem_vable")
+        || opname.starts_with("residual_call")
+        || opname.starts_with("inline_call")
+        || opname.starts_with("call_assembler")
+        || opname.starts_with("catch_exception")
+}
+
+/// `emit_popvalue_ref` is GET then SET-None immediately before after-pops
+/// `-live-`. A lone GET is `LOAD_FAST`; a SET without GET is
+/// `do_fixed_list_setitem` of the previous opcode.
+fn pops_immediately_precede_live(payload: &crate::PyJitCode, live_pc: usize) -> bool {
+    let ops = payload.decoded_ops_before(live_pc);
+    let mut seen_get = false;
+    let mut expect_get_after_set = false;
+    for op in ops.iter().rev() {
+        if op.opname.starts_with("setarrayitem_vable") {
+            expect_get_after_set = true;
+            continue;
+        }
+        if op.opname.starts_with("getarrayitem_vable") {
+            if !expect_get_after_set {
+                return false;
+            }
+            seen_get = true;
+            expect_get_after_set = false;
+            continue;
+        }
+        break;
+    }
+    seen_get && !expect_get_after_set
+}
+
+/// Python pc of the `emit_popvalue_ref` GET pops immediately before `jit_pc`.
+///
+/// After-pops `-live-` is re-keyed to fallthrough in `py_exact_by_jit_pc`,
+/// and that next opcode also has dests (`STORE_FAST` / `COMPARE_OP` after
+/// `IMPORT_NAME`). Exact-py dest_owner would then scan from the later
+/// opcode and miss the GET pops. Walk back through the after-pops body
+/// (`setarrayitem_vable` / residual / `catch_exception`) onto those GETs
+/// and stop at the opcode-start `-live-` (next is GET) so a later
+/// opcode-start does not steal the previous pop (`LOAD_FAST` entry).
+fn preceding_get_pop_dest_py(payload: &crate::PyJitCode, jit_pc: usize) -> Option<usize> {
+    if let Some(op) = op_at(payload, jit_pc)
+        && op.opname == "live"
+    {
+        let through =
+            op_at(payload, op.next_pc).is_some_and(|next| after_pops_body_opname(next.opname));
+        // Opcode-start whose body is a residual (`IMPORT_FROM` peeks TOS)
+        // looks like after-pops (next is `residual_call`) but has no GET
+        // pops of its own. Walking would steal the previous opcode's dests.
+        if !through || !pops_immediately_precede_live(payload, jit_pc) {
+            return None;
+        }
+    }
+    let ops = payload.decoded_ops_before(jit_pc);
+    let mut seen_get = false;
+    let mut get_py = None;
+    for op in ops.iter().rev() {
+        if op.opname.starts_with("getarrayitem_vable") {
+            seen_get = true;
+            get_py = Some(crate::py_coord::opcode_owner_py_pc_for_payload(
+                payload, op.pc,
+            ));
+            continue;
+        }
+        if op.opname.starts_with("setarrayitem_vable") {
+            continue;
+        }
+        if op.opname.starts_with("residual_call")
+            || op.opname.starts_with("inline_call")
+            || op.opname.starts_with("call_assembler")
+        {
+            if op.next_pc <= jit_pc {
+                break;
+            }
+            continue;
+        }
+        if op.opname.starts_with("catch_exception") {
+            continue;
+        }
+        if op.opname == "live" {
+            let through =
+                op_at(payload, op.next_pc).is_some_and(|next| after_pops_body_opname(next.opname));
+            if through {
+                continue;
+            }
+            break;
+        }
+        if seen_get {
+            continue;
+        }
+        break;
+    }
+    get_py.filter(|&py| seen_get && pop_dests_nonempty(payload, py))
+}
+
+/// Python pc whose `emit_popvalue_ref` dests belong to `jit_pc`.
+///
+/// After-pops `-live-` is often re-keyed to fallthrough in
+/// `py_exact_by_jit_pc` (`jtransform.py` `handle_regular_call`), so
+/// [`opcode_owner_py_pc_for_payload`] at that marker (and at a
+/// `setarrayitem_vable` interior with `py_pc=-1`) misses
+/// `pop_slot_color_by_py_pc[STORE_FAST]`. The GET pops immediately
+/// before `jit_pc` still name the popping opcode when fallthrough also
+/// has dests. Containing then floor still name it at opcode-start.
+/// Do not walk an earlier opcode: that would steal dests of a previous
+/// pop for `LOAD_FAST` entry.
+fn dest_owner_py_pc(payload: &crate::PyJitCode, jit_pc: usize) -> Option<usize> {
+    if let Some(slot) = payload.op_marker_facts_at(jit_pc) {
+        return *slot
+            .dest_owner_py_pc
+            .get_or_init(|| dest_owner_py_pc_uncached(payload, jit_pc));
+    }
+    dest_owner_py_pc_uncached(payload, jit_pc)
+}
+
+fn dest_owner_py_pc_uncached(payload: &crate::PyJitCode, jit_pc: usize) -> Option<usize> {
+    if let Some(py) = preceding_get_pop_dest_py(payload, jit_pc) {
+        return Some(py);
+    }
+    let owner = crate::py_coord::opcode_owner_py_pc_for_payload(payload, jit_pc);
+    if pop_dests_nonempty(payload, owner) {
+        return Some(owner);
+    }
+    None
+}
+
+/// First decodable JitCode offset of `dest_py` (`py_exact_by_jit_pc`).
+///
+/// Opcode-start `-live-` opens that run. Scanning from an interior
+/// non-decode pc, or from the after-pops live itself, never sees the
+/// GET pops (`STORE_FAST` `setarrayitem_vable` body).
+fn first_decodable_pc_of_py(payload: &crate::PyJitCode, dest_py: usize) -> Option<usize> {
+    payload
+        .metadata
+        .py_exact_by_jit_pc
+        .iter()
+        .find_map(|&(off, py)| {
+            if py as usize != dest_py {
+                return None;
+            }
+            let off = off as usize;
+            let op = op_at(payload, off)?;
+            // After-pops `-live-` re-keyed to fallthrough is the first
+            // exact key of the *next* opcode. Opcode-start is the live
+            // whose next is not the after-pops body.
+            if op.opname == "live" {
+                let through = op_at(payload, op.next_pc)
+                    .is_some_and(|next| after_pops_body_opname(next.opname));
+                if through {
+                    return None;
+                }
+            }
+            Some(off)
+        })
+}
+
+/// GET dest colors of the opcode whose `emit_popvalue_ref` owns `jit_pc`.
+pub(crate) fn dest_slot_colors_at_jit_pc(
+    payload: &crate::PyJitCode,
+    jit_pc: usize,
+) -> &[(u16, u16)] {
+    dest_owner_py_pc(payload, jit_pc)
+        .and_then(|py| payload.metadata.pop_slot_color_by_py_pc.get(py))
+        .map(|v| v.as_slice())
+        .unwrap_or(&[])
+}
+
+/// After-pops `-live-` that follows `emit_popvalue_ref` GET/SET-None
+/// pairs when the opcode has no residual (`COMPARE_OP` / `BINARY_OP`
+/// specialized in the codewriter, `STORE_FAST` `do_fixed_list_setitem`).
+fn after_pops_live_following_get_pops(payload: &crate::PyJitCode, start: usize) -> Option<usize> {
+    // `emit_popvalue_ref` publishes dest colors (`pop_slot_color_by_py_pc`).
+    // LOAD_FAST is also GET then SET then the next opcode's `-live-`;
+    // treating that live as after-pops collapses the helper onto the next
+    // opcode (`locals_proxy_extra_key_hot` `probe_callee_extra`).
+    let dest_py = dest_owner_py_pc(payload, start)?;
+    if dest_slot_colors_at_jit_pc(payload, start).is_empty() {
+        return None;
+    }
+    let pc = first_decodable_pc_of_py(payload, dest_py).unwrap_or(start);
+    let ops = payload.decoded_ops();
+    match ops.binary_search_by_key(&pc, |op| op.pc) {
+        Ok(i) => after_pops_live_following_get_pops_ops(payload, ops, i, dest_py),
+        Err(_) => after_pops_live_following_get_pops_decode(payload, pc, dest_py),
+    }
+}
+
+fn after_pops_live_following_get_pops_ops(
+    payload: &crate::PyJitCode,
+    ops: &[crate::jitcode_runtime::DecodedOp],
+    start_i: usize,
+    dest_py: usize,
+) -> Option<usize> {
+    let mut seen_get = false;
+    for op in &ops[start_i..] {
+        if op.opname.starts_with("getarrayitem_vable") {
+            seen_get = true;
+        } else if op.opname == "live" && seen_get {
+            return Some(op.pc);
+        } else if op.opname.starts_with("residual_call")
+            || op.opname.starts_with("inline_call")
+            || op.opname.starts_with("call_assembler")
+        {
+            return None;
+        }
+        if op.next_pc <= op.pc {
+            break;
+        }
+        let next_py = crate::py_coord::opcode_owner_py_pc_for_payload(payload, op.next_pc);
+        if next_py != dest_py {
+            if let Some(next_op) = op_at(payload, op.next_pc)
+                && next_op.opname == "live"
+                && seen_get
+            {
+                return Some(next_op.pc);
+            }
+            break;
+        }
+    }
+    None
+}
+
+fn after_pops_live_following_get_pops_decode(
+    payload: &crate::PyJitCode,
+    mut pc: usize,
+    dest_py: usize,
+) -> Option<usize> {
+    let code = payload.jitcode.code.as_slice();
+    if crate::jitcode_runtime::decode_op_at(code, pc).is_none() {
+        return None;
+    }
+    let mut seen_get = false;
+    while pc < code.len() {
+        let op = crate::jitcode_runtime::decode_op_at(code, pc)?;
+        if op.opname.starts_with("getarrayitem_vable") {
+            seen_get = true;
+        } else if op.opname == "live" && seen_get {
+            return Some(op.pc);
+        } else if op.opname.starts_with("residual_call")
+            || op.opname.starts_with("inline_call")
+            || op.opname.starts_with("call_assembler")
+        {
+            return None;
+        }
+        if op.next_pc <= pc {
+            break;
+        }
+        let next_py = crate::py_coord::opcode_owner_py_pc_for_payload(payload, op.next_pc);
+        if next_py != dest_py {
+            if let Some(next_op) = crate::jitcode_runtime::decode_op_at(code, op.next_pc)
+                && next_op.opname == "live"
+                && seen_get
+            {
+                return Some(next_op.pc);
+            }
+            break;
+        }
+        pc = op.next_pc;
+    }
+    None
+}
+
+/// When a guard is captured at or after the after-pops `-live-`, resume
+/// there rather than at the opcode-start twin.
+///
+/// `resume_marker_for_jitcode_pc` is the containing Python opcode's
+/// leading `-live-` (`orgpc`). `emit_popvalue_ref` has already written
+/// NULL into the dest slots, so blackhole re-running those GETs from
+/// opcode-start is `call on null callable` / `comparison on null operand`.
+/// `get_list_of_active_boxes` at the after-pops `-live-` numbers the GET
+/// dests (`jtransform.py` `handle_regular_call`, `pc = self.pc - SIZE_LIVE_OP`).
+pub(crate) fn resume_pc_past_call_pops(
+    payload: &crate::PyJitCode,
+    op_pc: usize,
+    chosen: i32,
+) -> i32 {
+    let Some(after_pops) = after_pops_live_marker_in_opcode(payload, op_pc).or_else(|| {
+        (chosen >= 0)
+            .then(|| after_pops_live_marker_in_opcode(payload, chosen as usize))
+            .flatten()
+    }) else {
+        return chosen;
+    };
+    let chosen_u = if chosen >= 0 { chosen as usize } else { op_pc };
+    if op_pc >= after_pops || chosen_u >= after_pops {
+        after_pops as i32
+    } else {
+        chosen
+    }
+}
+
 /// The last `-live-` at or before `op_pc`.
 fn live_marker_at_or_before(payload: &crate::PyJitCode, op_pc: usize) -> Option<usize> {
-    crate::jitcode_runtime::decoded_ops(payload.jitcode.code.as_slice())
+    payload
+        .decoded_ops()
+        .iter()
         .take_while(|op| op.pc <= op_pc)
         .filter(|op| op.opname == "live")
         .last()
@@ -86,7 +648,9 @@ fn live_marker_at_or_before(payload: &crate::PyJitCode, op_pc: usize) -> Option<
 
 /// Whether a `jit_merge_point` sits in `[op_pc, marker)`.
 fn merge_point_between(payload: &crate::PyJitCode, op_pc: usize, marker: usize) -> bool {
-    crate::jitcode_runtime::decoded_ops(payload.jitcode.code.as_slice())
+    payload
+        .decoded_ops()
+        .iter()
         .skip_while(|op| op.pc < op_pc)
         .take_while(|op| op.pc < marker)
         .any(|op| op.opname == "jit_merge_point")
@@ -109,18 +673,30 @@ fn merge_point_between(payload: &crate::PyJitCode, op_pc: usize, marker: usize) 
 pub(crate) fn plain_guard_resume_jitcode_pc(payload: &crate::PyJitCode, op_pc: usize) -> i32 {
     let op_live = crate::state::op_live();
     if payload.jitcode.can_decode_live_vars(op_pc, op_live) {
-        op_pc as i32
-    } else {
-        preceding_live_marker(payload, op_pc)
-            .or_else(|| payload.resume_marker_for_jitcode_pc(op_pc))
-            .map(|m| {
-                jit_merge_point_pc_in_containing_floor(payload, op_pc)
-                    .filter(|&merge_pc| m < merge_pc && merge_pc < op_pc)
-                    .and_then(|merge_pc| resume_pc_past_merge_point(payload, merge_pc))
-                    .unwrap_or(m) as i32
-            })
-            .unwrap_or(op_pc as i32)
+        return op_pc as i32;
     }
+    let from_adjacent_or_twin = preceding_live_marker(payload, op_pc)
+        .or_else(|| payload.resume_marker_for_jitcode_pc(op_pc))
+        .map(|m| {
+            jit_merge_point_pc_in_containing_floor(payload, op_pc)
+                .filter(|&merge_pc| m < merge_pc && merge_pc < op_pc)
+                .and_then(|merge_pc| resume_pc_past_merge_point(payload, merge_pc))
+                .unwrap_or(m)
+        });
+    if let Some(marker) = from_adjacent_or_twin
+        && payload.jitcode.can_decode_live_vars(marker, op_live)
+    {
+        return marker as i32;
+    }
+    // Quasi-immut `getfield` / `catch_exception` sit between the last `-live-`
+    // and this instruction, so SIZE_LIVE_OP adjacency fails. A helper body
+    // has no opcode-start twin. `get_list_of_active_boxes` still reads
+    // `self.pc` of the paused frame (`pyjitpl.py generate_guard(resumepc=orgpc)`);
+    // `last_live_before` is that marker when the live is not adjacent.
+    last_live_before(payload, 0, op_pc)
+        .filter(|&marker| payload.jitcode.can_decode_live_vars(marker, op_live))
+        .map(|marker| marker as i32)
+        .unwrap_or(op_pc as i32)
 }
 
 /// Select the resume marker for an after-residual-call guard.  The bytecode's
@@ -428,10 +1004,8 @@ pub(super) fn resume_pc_past_merge_point(
     payload: &crate::PyJitCode,
     merge_pc: usize,
 ) -> Option<usize> {
-    trailing_live_marker(payload, merge_pc).or_else(|| {
-        crate::jitcode_runtime::decode_op_at(payload.jitcode.code.as_slice(), merge_pc)
-            .map(|op| op.next_pc)
-    })
+    trailing_live_marker(payload, merge_pc)
+        .or_else(|| op_at(payload, merge_pc).map(|op| op.next_pc))
 }
 
 /// Resume pc for a synthesized per-opcode cut: op2 `-live-` after a
@@ -518,15 +1092,30 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_scoped<Sym: WalkSym>(
     op_pc: usize,
     scope: GuardCaptureScope,
 ) -> Result<(), DispatchError> {
+    // `generate_guard` (`pyjitpl.py`) sets `after_residual_call` for
+    // GUARD_EXCEPTION / GUARD_NO_EXCEPTION / GUARD_NOT_FORCED /
+    // GUARD_ALWAYS_FAILS. GUARD_NOT_FORCED_2 is not on that list:
+    // `store_token_in_vable` records it at `compile_done_with_this_frame`
+    // after `_get_opimpl_method` has already advanced `MIFrame.pc` to the
+    // residual's op end, so `get_list_of_active_boxes(after_residual_call=False)`
+    // reads `self.pc - SIZE_LIVE_OP` = the trailing `-live-`
+    // (`jtransform.py handle_residual_call`). pyre still captures at the
+    // residual_call byte; without this arm `resume_pc_past_call_pops`
+    // pulls that snapshot to the after-pops dest colors the residual
+    // already consumed, and leftover inputargs are numbered as CALL dests.
+    let last_guard = ctx.trace_ctx.last_guard_opcode();
     let after_residual_call = matches!(
-        ctx.trace_ctx.last_guard_opcode(),
+        last_guard,
         Some(
             OpCode::GuardException
                 | OpCode::GuardNoException
                 | OpCode::GuardNotForced
                 | OpCode::GuardAlwaysFails
         )
-    );
+    ) || (matches!(last_guard, Some(OpCode::GuardNotForced2))
+        && walked_snapshot_jitcode(ctx)
+            .and_then(|jc| trailing_live_marker(&jc.payload, op_pc))
+            .is_some());
     let scope = GuardCaptureScope {
         residual_call_catch_resume: scope.residual_call_catch_resume || after_residual_call,
         ..scope
@@ -669,6 +1258,21 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
     // `after_residual_guard_marker`). Deopt runs the helper from the
     // guard to its return; nothing before the guard runs twice.
     //
+    // A helper sub-walk with paused Python parents takes
+    // `walker_capture_transparent_helper_snapshot`, which encodes those
+    // parents at CALL `next_pc` dest-cleared and appends one section per
+    // live helper (`collect_live_helper_guard_sections`); parents that
+    // are images of those live helpers are dropped. `capture_resumedata`
+    // numbers every `MIFrame` already on `framestack`. A numbered helper
+    // whose seated pc can still reach `abort/` (`bhimpl_abort`) is
+    // refused there (`append_innermost_helper_guard_section` /
+    // `helper_resume_can_reach_abort`); that pc falls through to
+    // `numbered_helper_guard_resume`, which collapses to the CALL-entry
+    // snapshot when the helper has not yet written (`blackhole.py`
+    // re-executes the CALL). A numberable helper stays on the transparent
+    // snapshot. A helper entered without a paused caller (Root GET_ITER)
+    // still collapses to the containing Python opcode.
+    //
     // `opencoder.py create_top_snapshot` writes vable_array +
     // vref_array on the top snapshot. Feed the trace-time vable/vref
     // shadow through. Empty when no virtualizable / virtualref is live,
@@ -724,6 +1328,20 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
             HelperChain::NoHelper
         };
         if helper_chain == HelperChain::Unresumable {
+            // CalleePrologue / Converted on top of numbered helpers
+            // (`call_trace` / `gettrace` under a looked-inside `__import__`).
+            // The CallEntry parent is the enclosing numbered helper paused at
+            // this CALL; number that chain and re-execute the CALL. Refusing
+            // the guard aborted the portal (`get_list_of_active_boxes` still
+            // reads the paused frame at its CALL).
+            if unpublished_helper_resumes_at_call_entry(ctx) && !parent_frames.is_empty() {
+                return walker_capture_transparent_helper_snapshot(
+                    ctx,
+                    op_pc,
+                    parent_frames,
+                    scope.guard_stamp,
+                );
+            }
             return Err(DispatchError::callee_inline_unsupported(op_pc));
         }
         if helper_chain == HelperChain::Numbered {
@@ -1115,8 +1733,10 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
             } else if after_residual_call {
                 // #366: extend the direct-pc carry to the after-residual-call
                 // guard family (`GuardException`/`GuardNoException`/
-                // `GuardNotForced`/`GuardAlwaysFails` — exactly what the
-                // `after_residual_call` bool tracks, `walker_capture_snapshot_for_last_guard`).
+                // `GuardNotForced`/`GuardAlwaysFails`, and `GuardNotForced2`
+                // when a trailing `-live-` follows the residual — exactly
+                // what the `after_residual_call` bool tracks,
+                // `walker_capture_snapshot_for_last_guard`).
                 // These resume AFTER the residual call at the marker the
                 // decoder already resolves for this guard, so carrying it
                 // directly makes decode consult the carried word instead of a
@@ -1186,6 +1806,11 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                         None => majit_ir::resumedata::NO_JITCODE_PC,
                     }
                 }
+            };
+            let guard_jitcode_pc = if after_residual_call || scope.carried_resume_jit_pc.is_some() {
+                guard_jitcode_pc
+            } else {
+                resume_pc_past_call_pops(&walked_owned.payload, op_pc, guard_jitcode_pc)
             };
             let liveness_py_pc = py_pc;
             let payload = &walked_owned.payload;
@@ -1364,6 +1989,10 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
     // handle_jit_marker__jit_merge_point`). Active boxes were collected
     // at that same pc.
     fill_vable_vref_into(ctx.trace_ctx, &mut scratch.vable, &mut scratch.vref);
+    // Helper guards skip full-body capture (`inline_subwalk`); boxes
+    // were numbered at helper ENTRY against `outer_resume_marker_jit_pc`.
+    // Publishing a different pc here desyncs the resume stream
+    // (`blackhole_from_resumedata: invalid jitcode index`).
     let arm_word = ctx
         .outer_resume_marker_jit_pc
         .map(|m| m as i32)
@@ -1432,7 +2061,7 @@ fn publish_single_frame_snapshot<Sym: WalkSym>(
     origin: &str,
     op_pc: usize,
 ) {
-    if guard_resume_pc_probe_enabled() {
+    if guard_resume_pc_probe_enabled() || fbw_debug_abort_enabled() {
         let opcode = match guard_stamp {
             GuardStampTarget::LastOp => ctx.trace_ctx.last_op_opcode(),
         };
@@ -1560,24 +2189,32 @@ pub(crate) fn collect_call_stack_overrides<Sym: WalkSym>(
     if jc.payload.code_ptr.is_null() {
         return None;
     }
-    // The caller CALL key is a plain JitCode→Python inversion, so use the
-    // certified predecessor twins rather than the marker/trivia flavor
-    // reserved for the CALL fallthrough below.
+    // The CALL byte is interior to its opcode. `pc_first_insn_pos`
+    // (`GraphFlattener::serialize_op`) skips `-live-`, so the first_jit
+    // predecessor twin of that byte can still name the previous opcode's
+    // entry depth / pcdep. `caller_operand_slots` already uses
+    // `exact_py_pc_for_jitcode_pc`. The trivia twins are keyed on those
+    // emission runs (`py_exact_by_jit_pc`), so a lookup at the CALL names
+    // the emitting opcode — the operand stack `handle_regular_call`
+    // (`jtransform.py`) leaves in registers after the pops.
     let depth = jc
         .payload
-        .depth_for_jitcode_pc_pred(call_jitcode_pc)
+        .depth_trivia_for_jitcode_pc(call_jitcode_pc)
+        .or_else(|| jc.payload.depth_for_jitcode_pc_pred(call_jitcode_pc))
         .unwrap_or(0) as usize;
     let pcdep_entries = jc
         .payload
-        .pcdep_for_jitcode_pc(call_jitcode_pc)
+        .pcdep_trivia_for_jitcode_pc(call_jitcode_pc)
+        .or_else(|| jc.payload.pcdep_for_jitcode_pc(call_jitcode_pc))
         .unwrap_or(&[]);
-    // Same predecessor coordinate as `pcdep_for_jitcode_pc`.
+    // Same exact-run coordinate as the depth / pcdep twins.
     // `pcdep_slot_var_resume` records Variables only; `const_ref_slots_at_pc`
     // (via `resolve_const_ref_slot`) holds the Ref constants beside it.
     let const_ref_slots = jc
         .payload
-        .const_ref_slots_for_jitcode_pc(call_jitcode_pc)
-        .unwrap_or(&[]);
+        .const_ref_trivia_for_jitcode_pc(call_jitcode_pc)
+        .or_else(|| jc.payload.const_ref_slots_for_jitcode_pc(call_jitcode_pc))
+        .unwrap_or_default();
     let nlocals = caller_sym.nlocals();
     let assembled = assemble_call_stack_overrides(
         caller_sym,
@@ -1586,7 +2223,7 @@ pub(crate) fn collect_call_stack_overrides<Sym: WalkSym>(
         nlocals,
         depth,
         pcdep_entries,
-        const_ref_slots,
+        &const_ref_slots,
     );
     match assembled {
         Ok(overrides) => Some(overrides),
@@ -1664,6 +2301,68 @@ fn note_stack_override(
     overrides.push((slot, value));
 }
 
+/// Ref-bank colors `do_residual_call` (`pyjitpl.py`) reads from the MIFrame.
+///
+/// A shared `dispatch_bytecode` residual names those colors in its `R`
+/// varlist. They hold the executed boxes (`execute_and_record` /
+/// `ResumeDataBoxReader.decode_box`), including a bridge inputarg, even
+/// when the vstack image still has encoder `CONST_NULL`.
+fn residual_call_ref_reg_indices<Sym: WalkSym>(
+    caller_sym: &Sym,
+    call_jitcode_pc: usize,
+) -> Option<Vec<usize>> {
+    let jc = unsafe { caller_sym.jitcode().as_ref()? };
+    let code = jc.payload.jitcode.code.as_slice();
+    let op = crate::jitcode_runtime::decode_op_at(code, call_jitcode_pc)?;
+    if !op.opname.starts_with("residual_call") {
+        return None;
+    }
+    let mut offset = 0usize;
+    for c in op.argcodes.chars() {
+        match c {
+            'i' | 'c' | 'r' | 'f' => offset += 1,
+            'I' | 'F' => {
+                let len = *code.get(op.pc + 1 + offset)? as usize;
+                offset += 1 + len;
+            }
+            'R' => {
+                let len_pc = op.pc + 1 + offset;
+                let len = *code.get(len_pc)? as usize;
+                if len_pc + 1 + len > code.len() {
+                    return None;
+                }
+                return Some((0..len).map(|i| code[len_pc + 1 + i] as usize).collect());
+            }
+            'd' | 'j' => offset += 2,
+            'L' => offset += majit_jitcode::jitcode::LABEL_OPERAND_SIZE,
+            '>' => break,
+            _ => return None,
+        }
+    }
+    None
+}
+
+fn bind_ref_color_override<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    color: usize,
+    slot: usize,
+    overrides: &mut Vec<(usize, pyre_object::PyObjectRef)>,
+) {
+    if let Some(value) = concrete_ref_for_color(ctx, color) {
+        note_stack_override(overrides, slot, value, true);
+    } else if let Some(opref) = ctx.registers_r.get(color)
+        && crate::state::reconstructed_box_holds_live_ref(ctx.trace_ctx, opref)
+        && let Some(majit_ir::Value::Ref(r)) = ctx.trace_ctx.box_value(opref)
+    {
+        note_stack_override(
+            overrides,
+            slot,
+            r.as_usize() as pyre_object::PyObjectRef,
+            true,
+        );
+    }
+}
+
 fn assemble_call_stack_overrides<Sym: WalkSym>(
     caller_sym: &Sym,
     ctx: &WalkContext<'_, '_, Sym>,
@@ -1677,6 +2376,21 @@ fn assemble_call_stack_overrides<Sym: WalkSym>(
     if depth == 0 {
         return Ok(Vec::new());
     }
+    let operand_slots = caller_operand_slots(caller_sym, call_jitcode_pc, stack_end)
+        .ok_or(AssembleFail::NoShape)?;
+    let (sentinel_slots, proof_slot): ([Option<usize>; 2], Option<usize>) = match operand_slots {
+        CallerOperandSlots::Call {
+            null_or_self,
+            callable,
+        } => ([Some(null_or_self), None], Some(callable)),
+        CallerOperandSlots::CallFunctionEx {
+            self_or_null,
+            kwargs,
+            callable,
+        } => ([Some(self_or_null), Some(kwargs)], Some(callable)),
+        CallerOperandSlots::Operands { deepest } => ([None, None], Some(deepest)),
+        CallerOperandSlots::Empty => ([None, None], None),
+    };
     let mut overrides = Vec::new();
     if pcdep_entries.is_empty() {
         for slot in nlocals..stack_end {
@@ -1749,33 +2463,45 @@ fn assemble_call_stack_overrides<Sym: WalkSym>(
         }
         note_stack_override(&mut overrides, slot, raw as pyre_object::PyObjectRef, true);
     }
+    // GET dest colors `emit_popvalue_ref` recorded as `(slot, color)`.
+    // Opcode-entry pcdep still names the pre-pop Variables; after the pops
+    // those values live in the GET dests (`handle_regular_call`). The table
+    // is keyed by compact slot, not by R-varlist position, so extra helper
+    // Refs (frame, execution context, code/const) never bind to a stack slot.
+    if let Some(jc) = unsafe { caller_sym.jitcode().as_ref() } {
+        for &(slot, color) in dest_slot_colors_at_jit_pc(&jc.payload, call_jitcode_pc) {
+            let slot = slot as usize;
+            if slot < nlocals || slot >= stack_end {
+                continue;
+            }
+            bind_ref_color_override(ctx, color as usize, slot, &mut overrides);
+        }
+    }
+    // `do_residual_call` (`pyjitpl.py`) reads the MIFrame registers the
+    // residual names. A bridge inputarg in one of those colors is the
+    // executed callable (`execute_and_record` / `ResumeDataBoxReader.decode_box`)
+    // even when pcdep colors at the shared residual were never reconstructed.
+    if let Some(callable) = match operand_slots {
+        CallerOperandSlots::Call { callable, .. }
+        | CallerOperandSlots::CallFunctionEx { callable, .. } => Some(callable),
+        _ => None,
+    } {
+        if let Some(regs) = residual_call_ref_reg_indices(caller_sym, call_jitcode_pc) {
+            for (i, &reg) in regs.iter().enumerate() {
+                let slot = callable + i;
+                if slot < nlocals || slot >= stack_end {
+                    break;
+                }
+                bind_ref_color_override(ctx, reg, slot, &mut overrides);
+            }
+        }
+    }
     // A CALL's `[callable, null_or_self, arg0 .. arg_{argc-1}]` operands end at
     // `stack_end`.  The null_or_self slot is the one stack slot no source above
     // can speak for, so synthesize its known null and require the callable
     // immediately below it to prove that reconstruction reached the operand
     // region.  Every other resume shape synthesizes nothing and proves itself
     // with the deepest operand it consumes.
-    let Some(operand_slots) = caller_operand_slots(caller_sym, call_jitcode_pc, stack_end) else {
-        return Err(AssembleFail::NoShape);
-    };
-    let (sentinel_slots, proof_slot): ([Option<usize>; 2], Option<usize>) = match operand_slots {
-        CallerOperandSlots::Call {
-            null_or_self,
-            callable,
-        } => ([Some(null_or_self), None], Some(callable)),
-        // `self_or_null` and `kwargs_or_null` are the checked null sentinels.
-        // A resolved receiver or mapping already in `overrides` stays; only a
-        // slot no source named is filled with null.
-        CallerOperandSlots::CallFunctionEx {
-            self_or_null,
-            kwargs,
-            callable,
-        } => ([Some(self_or_null), Some(kwargs)], Some(callable)),
-        CallerOperandSlots::Operands { deepest } => ([None, None], Some(deepest)),
-        // `LOAD_GLOBAL` / `LOAD_NAME` consume nothing, so there is no
-        // operand slot to prove.
-        CallerOperandSlots::Empty => ([None, None], None),
-    };
     for sentinel_slot in sentinel_slots.into_iter().flatten() {
         if sentinel_slot >= nlocals
             && !overrides
@@ -1853,6 +2579,15 @@ enum CallerOperandSlots {
     Empty,
 }
 
+/// `do_residual_or_indirect_call` (`pyjitpl.py`) sits on a `residual_call_*`
+/// whose Python operands already left the stack
+/// (`handle_residual_call` / `emit_live_before_residual_call`). The parent
+/// image is leftover-stack only — the same Empty `LOAD_GLOBAL` uses.
+fn residual_call_parent_has_empty_operand_region(code: &[u8], call_jitcode_pc: usize) -> bool {
+    crate::jitcode_runtime::decode_op_at(code, call_jitcode_pc)
+        .is_some_and(|op| op.opname.starts_with("residual_call"))
+}
+
 /// Absolute frame slots proving the operand region at `call_jitcode_pc`, for a
 /// caller whose operand stack ends at `stack_end`. The CALL forms name
 /// their synthetic `null_or_self` sentinel and callable proof; every other
@@ -1889,6 +2624,15 @@ enum CallerOperandSlots {
 /// LIST_EXTEND and the other container-building opcodes call their
 /// `*_value` helper with the receiver peeked in place, so the operand
 /// block is only the popped value(s).
+///
+/// A `residual_call_*` at this jit pc is `do_residual_or_indirect_call`
+/// (`pyjitpl.py`): `perform_call` / `newframe` when `bytecode_for_address`
+/// hits, else `do_residual_call`. The Python opcode already popped
+/// (`handle_residual_call` / `emit_live_before_residual_call`), so an
+/// unlisted opcode (`TO_BOOL`, `STORE_SUBSCR`, `BUILD_TUPLE`,
+/// `MAKE_FUNCTION`) has no CALL-style proof slot. Numbering the helper
+/// (`HelperReturn::CallResult` / `helper_subwalk_level`) still needs a
+/// parent image; Empty is that image.
 fn caller_operand_slots<Sym: WalkSym>(
     caller_sym: &Sym,
     call_jitcode_pc: usize,
@@ -2039,7 +2783,26 @@ fn caller_operand_slots<Sym: WalkSym>(
         // `[level, fromlist]`. `IMPORT_NAME` pops fromlist then level, then
         // reads `self.get_w_globals()` (`pyopcode.py IMPORT_NAME`).
         pyre_interpreter::Instruction::ImportName { .. } => 2,
+        // `[seq]`. `unpack_sequence` pops the sequence then pushes items.
+        pyre_interpreter::Instruction::UnpackSequence { .. } => 1,
         other => {
+            // `do_residual_or_indirect_call` (`pyjitpl.py`) `perform_call`s a
+            // generated helper when `bytecode_for_address` hits. The parent
+            // `MIFrame` stays at the residual's trailing `-live-`
+            // (`handle_residual_call`); `emit_popvalue` already ran
+            // (`emit_live_before_residual_call`). That parent is not a
+            // Python CALL, so there is no operand region to prove. Empty is
+            // the leftover-stack-only image `LOAD_GLOBAL` uses. A listed arm
+            // above still applies when the residual is the CALL / `LOAD_ATTR`
+            // / … helper those arms name (`try_walker_inline_truth_bool` on
+            // `POP_JUMP_IF_*`, a dunder under `BINARY_OP`).
+            //
+            if residual_call_parent_has_empty_operand_region(
+                jc.payload.jitcode.code.as_slice(),
+                call_jitcode_pc,
+            ) {
+                return Some(CallerOperandSlots::Empty);
+            }
             if fbw_debug_abort_enabled() {
                 let jit_op = crate::jitcode_runtime::decode_op_at(
                     jc.payload.jitcode.code.as_slice(),
@@ -2130,9 +2893,11 @@ fn report_caller_image_ref_box<Sym: WalkSym>(ctx: &WalkContext<'_, '_, Sym>, col
 }
 
 /// Python `MIFrame` paused under a transparent helper. The helper's own
-/// banks are a different jitcode; `framestack[-1].live` is the caller
-/// (`pyjitpl.py` keeps that frame while the looked-inside body runs).
-fn paused_python_live<Sym: WalkSym>(
+/// banks are a different jitcode; the caller's banks sit on the last
+/// non-helper frame (`bind_paused_caller_regs`). `pyjitpl.py` keeps that
+/// `MIFrame` while the looked-inside body runs; `framestack[-1]` is the
+/// helper (`w_code == 0`).
+pub(crate) fn paused_python_live<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
 ) -> Option<crate::jitcode_dispatch::LiveFrameRegs> {
     if !ctx.fbw_mode.transparent_helper_subwalk {
@@ -2140,8 +2905,7 @@ fn paused_python_live<Sym: WalkSym>(
     }
     ctx.session
         .borrow()
-        .framestack
-        .last()
+        .last_non_helper()
         .and_then(|frame| frame.paused_live())
 }
 
@@ -2190,11 +2954,13 @@ pub(in crate::jitcode_dispatch) fn refresh_paused_parent_concretes<Sym: WalkSym>
     parent: &mut InlineParentFrame,
 ) {
     refresh_paused_parent_blackhole(parent);
-    // Nested callers leave `call_stack_overrides` empty: their operand
+    // Nested Python callers leave `call_stack_overrides` empty: their operand
     // stack is reconstructed from the sym-less banks, and filling it here
     // would publish slots the original capture deliberately omitted.
-    // A top-level caller has no inlined frame on the session yet.
-    if ctx.session.borrow().last_inline().is_some() {
+    // A helper level on `framestack` is not that caller; the portal CALL
+    // that entered the helper still needs its BinarySlice `[obj, start, stop]`
+    // image (`caller_operand_slots`).
+    if ctx.session.borrow().last_python_inline().is_some() {
         return;
     }
     let Some(call_pc) = parent.call_jitcode_pc else {
@@ -2600,8 +3366,16 @@ pub(crate) fn clear_in_a_call_result(
 ) -> Option<(usize, usize, OpRef)> {
     let (bank, color) = result_register?;
     let (index, cleared) = match bank {
-        'i' => (0, trace_ctx.const_int(0)),
-        'r' => (1, trace_ctx.const_ref(pyre_object::PY_NULL as i64)),
+        'i' => {
+            let cleared = trace_ctx.const_int(0);
+            super::assert_int_bank_box(cleared, "in_a_call");
+            (0, cleared)
+        }
+        'r' => {
+            let cleared = trace_ctx.const_ref(pyre_object::PY_NULL as i64);
+            super::assert_ref_bank_box(cleared, "in_a_call");
+            (1, cleared)
+        }
         'f' => (2, trace_ctx.const_float(0)),
         _ => return None,
     };
@@ -2617,6 +3391,11 @@ pub(crate) fn restore_in_a_call_result(
     saved: Option<(usize, usize, OpRef)>,
 ) {
     if let Some((index, color, saved)) = saved {
+        match index {
+            0 => super::assert_int_bank_box(saved, "in_a_call"),
+            1 => super::assert_ref_bank_box(saved, "in_a_call"),
+            _ => {}
+        }
         banks[index].set(color, saved);
     }
 }
@@ -2634,7 +3413,17 @@ pub(crate) fn compute_inline_caller_frame<Sym: WalkSym>(
     // the intermediate callee's banks here) via the sym-less
     // `collect_callee_active_boxes`.  The stack is empty for a top-level
     // caller, falling through to the `fbw_mode.snapshot_sym` path below.
-    let caller_code = ctx.session.borrow().last_inline().map(|frame| frame.w_code);
+    // Helper levels (`w_code == 0`) sit on `framestack` for capture
+    // (`enter_helper_level`). They are not Python `MIFrame`s:
+    // `ensure_jitcode_index` on that null code is `Unavail::Nested/NoJitcodeIndex`.
+    // Walk past them (`last_python_inline`) so a nested `__index__` inside
+    // `binary_slice_values_inner` pauses the BINARY_SLICE CALL
+    // (`descroperation.py get_and_call_function` / `pyjitpl.py capture_resumedata`).
+    let caller_code = ctx
+        .session
+        .borrow()
+        .last_python_inline()
+        .map(|frame| frame.w_code);
     if let Some(caller_code) = caller_code {
         return compute_nested_inline_caller_frame(ctx, call_jit_pc, caller_code);
     }
@@ -2686,7 +3475,7 @@ pub(crate) fn compute_inline_caller_frame<Sym: WalkSym>(
         (
             jc.index as u32,
             fallthrough,
-            inline_call_return_marker(&jc.payload, call_jit_pc),
+            helper_parent_call_live(&jc.payload, call_jit_pc),
             jc.payload.code_ptr,
             call_is_void,
         )
@@ -2816,7 +3605,7 @@ pub(crate) fn compute_nested_inline_caller_frame<Sym: WalkSym>(
     if !pjc.is_populated() || pjc.code_ptr.is_null() {
         return Err(unavail("Unavail::Nested/NotPopulated"));
     }
-    let resume_marker_jit_pc = inline_call_return_marker(&pjc, call_jit_pc);
+    let resume_marker_jit_pc = helper_parent_call_live(&pjc, call_jit_pc);
     let call_is_void =
         crate::jitcode_runtime::decode_op_at(pjc.jitcode.code.as_slice(), call_jit_pc)
             .is_some_and(|op| op.result_argcode() == 'v');
@@ -3061,7 +3850,7 @@ pub(crate) fn paused_helper_caller_frame_from_banks(
     if pjc.jitcode.code.is_empty() {
         return Err(unavail("Unavail::PausedHelper/Empty"));
     }
-    let resume_marker_jit_pc = inline_call_return_marker(&pjc, call_jit_pc)
+    let resume_marker_jit_pc = helper_parent_call_live(&pjc, call_jit_pc)
         .ok_or_else(|| unavail("Unavail::PausedHelper/NoMarker"))?;
     let result_register = super::residual_call::parent_call_result_color(&pjc, call_jit_pc);
     let banks = [registers_i, registers_r, registers_f];
@@ -3100,6 +3889,68 @@ pub(crate) fn paused_helper_caller_frame_from_banks(
     ))
 }
 
+/// Pause the enclosing numbered helper at the CALL entry of a nested
+/// CalleePrologue / Converted helper.
+///
+/// `call_trace` / `gettrace` return void; numbering them as a dest-write
+/// section would `_setup_return_value_*` that void into the CALL dest
+/// (`HelperReturn::CalleePrologue`). A guard inside the prologue resumes
+/// at this CALL and re-executes it (`HelperResume::CallEntry`). The marker
+/// is the last `-live-` before the CALL, never the trailing after-call live
+/// (`handle_residual_call` dest not yet written).
+fn compute_paused_helper_call_entry_frame<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    call_jit_pc: usize,
+    ret: HelperReturn,
+) -> Result<InlineParentFrame, InlineCallerFrameDecline> {
+    let Some(jitcode_index) = ctx.fbw_mode.transparent_helper_jitcode_index else {
+        return Err(unavail("Unavail::PausedHelper/NoIndex"));
+    };
+    let Some(pjc) = crate::state::pyjitcode_for_jitcode_index(jitcode_index as i32) else {
+        return Err(unavail("Unavail::PausedHelper/NoPjc"));
+    };
+    if pjc.jitcode.code.is_empty() {
+        return Err(unavail("Unavail::PausedHelper/Empty"));
+    }
+    let op_live = crate::state::op_live();
+    let resume_marker_jit_pc =
+        super::specialize::collapsed_resume_marker_for_helper(&pjc, call_jit_pc, ret)
+            .or_else(|| last_live_before(&pjc, 0, call_jit_pc))
+            .filter(|&marker| pjc.jitcode.can_decode_live_vars(marker, op_live))
+            .ok_or_else(|| unavail("Unavail::PausedHelper/NoMarker"))?;
+    let boxes = collect_callee_active_boxes(
+        ctx.registers_i,
+        ctx.registers_r,
+        ctx.registers_f,
+        jitcode_index as u32,
+        call_jit_pc,
+        resume_marker_jit_pc as i32,
+    )
+    .map_err(|_| unavail("Unavail::PausedHelper/BoxesErr"))?;
+    Ok(InlineParentFrame {
+        jitcode_index: jitcode_index as u32,
+        call_jitcode_pc: Some(call_jit_pc),
+        resume_pc: Some(resume_marker_jit_pc),
+        call_stack_overrides: Vec::new(),
+        blackhole: None,
+        resume_coord: ParentResumeCoord::CallFallthrough(call_jit_pc),
+        resume_marker_jit_pc: Some(resume_marker_jit_pc),
+        boxes,
+        registers_r: None,
+        registers_i: None,
+        registers_f: None,
+        frame_state: None,
+        caller_py_pc: None,
+        result_slot: CallResultSlot::Unknown,
+    }
+    .attach_live_caller(
+        ctx.registers_r,
+        ctx.registers_i,
+        ctx.registers_f,
+        &ctx.frame_state,
+    ))
+}
+
 /// Pause the enclosing helper at its CALL into a nested helper.
 fn compute_paused_helper_caller_frame<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
@@ -3126,6 +3977,24 @@ fn jitcode_index_names_python_code(jitcode_index: u32) -> bool {
         .is_some_and(|pjc| pjc.is_populated() && !pjc.code_ptr.is_null())
 }
 
+/// After-call `-live-` of `call_jit_pc`, the parent coordinate a numbered
+/// helper chain returns into with `_setup_return_value_*`.
+///
+/// `Transformer.handle_residual_call` / `handle_regular_call` emit that
+/// marker immediately after the call. `MIFrame.get_list_of_active_boxes`
+/// (`in_a_call=True`) resumes every non-top frame there;
+/// `BlackholeInterpreter._setup_return_value_*` writes
+/// `code[position-1]`, the call's dest. Never the CALL pc: an adjacent
+/// pre-call `-live-` makes `can_decode_live_vars(call_pc)` true, and
+/// `code[call_pc-1]` is then a liveness-offset byte. Never the pre-call
+/// live (`handle_regular_indirect_call` fold-guard resume).
+pub(crate) fn helper_parent_call_live(
+    pjc: &crate::pyjitcode::PyJitCode,
+    call_jit_pc: usize,
+) -> Option<usize> {
+    inline_call_return_marker(pjc, call_jit_pc)
+}
+
 /// Capture the current inlined Python frame at a translated helper call's
 /// entry boundary, for a helper whose return is not the call's result
 /// ([`HelperReturn::Converted`] / [`HelperReturn::CalleePrologue`]). No
@@ -3138,6 +4007,7 @@ fn jitcode_index_names_python_code(jitcode_index: u32) -> bool {
 pub(crate) fn compute_inline_helper_call_entry_frame<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     call_jit_pc: usize,
+    ret: HelperReturn,
 ) -> Result<InlineParentFrame, InlineCallerFrameDecline> {
     // `w_code == 0` is a helper already on the framestack. It has no PyCode.
     // `rebuild_from_resumedata` does not look one up either: it indexes the
@@ -3224,11 +4094,20 @@ pub(crate) fn compute_inline_helper_call_entry_frame<Sym: WalkSym>(
     if !pjc.is_populated() || pjc.code_ptr.is_null() {
         return Err(unavail("Unavail::Helper/NotPopulated"));
     }
-    // Same parent resume as `run_orthodox_helper_subwalk`: the op2 `-live-`
-    // after `jit_merge_point` on a loop-header opcode
-    // (`jtransform.py handle_jit_marker__jit_merge_point`).
-    let resume_marker_jit_pc = super::specialize::collapsed_parent_resume_marker(&pjc, call_jit_pc)
-        .ok_or_else(|| unavail("Unavail::Helper/NoResumeMarker"))?;
+    // CallResult collapse, and Converted / CalleePrologue of an opcode
+    // that already popped, re-execute from the after-pops `-live-`
+    // (`collapsed_resume_marker_for_helper` / `get_list_of_active_boxes`
+    // at `pc = self.pc - SIZE_LIVE_OP`). The opcode-start twin
+    // (`collapsed_parent_resume_marker`) re-runs those pops on the NULL
+    // slots `_opimpl_setarrayitem_vable` already wrote. Other Converted
+    // helpers keep opcode-start so they re-pop.
+    // `run_orthodox_helper_subwalk` picks the same marker for
+    // `outer_resume_marker_jit_pc`.
+    let resume_marker_jit_pc =
+        super::specialize::collapsed_resume_marker_for_helper(&pjc, call_jit_pc, ret)
+            .ok_or_else(|| unavail("Unavail::Helper/NoResumeMarker"))?;
+    let after_pops = ret == HelperReturn::CallResult
+        || super::specialize::helper_parent_call_already_popped(&pjc, call_jit_pc);
     let boxes = if caller_code.is_some() {
         collect_callee_active_boxes(
             ctx.registers_i,
@@ -3243,6 +4122,11 @@ pub(crate) fn compute_inline_helper_call_entry_frame<Sym: WalkSym>(
         let caller_sym_ptr = ctx.fbw_mode.snapshot_sym;
         // SAFETY: checked non-null above and valid for this full-body walk.
         let caller_sym = unsafe { &*caller_sym_ptr };
+        let entry_word = if after_pops {
+            resume_marker_jit_pc as i32
+        } else {
+            call_jit_pc as i32
+        };
         collect_outer_active_boxes(
             caller_sym,
             ctx.trace_ctx,
@@ -3251,7 +4135,7 @@ pub(crate) fn compute_inline_helper_call_entry_frame<Sym: WalkSym>(
             ctx.registers_f,
             jitcode_index,
             resume_marker_jit_pc as i32,
-            call_jit_pc as i32,
+            entry_word,
             OuterActiveBoxesEntryTwin::Plain,
         )
     };
@@ -3330,6 +4214,16 @@ impl HelperLevel {
         Self::section(caller, HelperCallEntry::Unavailable)
     }
 
+    fn call_entry(caller: InlineParentFrame) -> Self {
+        HelperLevel {
+            parents: vec![caller],
+            resume: HelperResume::CallEntry,
+            call_entry: HelperCallEntry::Unavailable,
+            entry_array_len: None,
+            entry_trace_index: 0,
+        }
+    }
+
     fn unresumable() -> Self {
         HelperLevel {
             parents: Vec::new(),
@@ -3351,10 +4245,12 @@ impl HelperLevel {
 /// cannot pause past the call (or whose return is not the call's result)
 /// resumes at the CALL entry instead; an `Err` there declines the descent. At
 /// the portal, a helper whose return is the call's result and whose caller
-/// cannot pause past the call declines the descent. A helper under a numbered
-/// helper that cannot be numbered is pushed as [`HelperResume::Unresumable`]
-/// so its guards are refused rather than numbered at the enclosing helper's
-/// position.
+/// cannot pause past the call declines the descent. A CallResult helper under
+/// a numbered helper that cannot pause its caller is
+/// [`HelperResume::Unresumable`]. A CalleePrologue / Converted helper under
+/// a numbered chain is [`HelperResume::CallEntry`] at that CALL: numbering it
+/// as a dest-write section would `_setup_return_value_*` a void prologue into
+/// the CALL dest, and refusing the guard aborted the portal.
 pub(crate) fn helper_subwalk_level<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     call_jit_pc: usize,
@@ -3363,12 +4259,15 @@ pub(crate) fn helper_subwalk_level<Sym: WalkSym>(
     if ctx.fbw_mode.transparent_helper_subwalk {
         let chain = ctx.session.borrow().helper_chain();
         return Ok(match chain {
-            HelperChain::Numbered => Some(
-                (!ret.resumes_at_call_entry())
-                    .then(|| compute_paused_helper_caller_frame(ctx, call_jit_pc).ok())
-                    .flatten()
-                    .map_or_else(HelperLevel::unresumable, HelperLevel::nested_section),
-            ),
+            HelperChain::Numbered => Some(if ret.resumes_at_call_entry() {
+                compute_paused_helper_call_entry_frame(ctx, call_jit_pc, ret)
+                    .ok()
+                    .map_or_else(HelperLevel::unresumable, HelperLevel::call_entry)
+            } else {
+                compute_paused_helper_caller_frame(ctx, call_jit_pc)
+                    .ok()
+                    .map_or_else(HelperLevel::unresumable, HelperLevel::nested_section)
+            }),
             HelperChain::NoHelper | HelperChain::Collapsed | HelperChain::Unresumable => None,
         });
     }
@@ -3376,7 +4275,7 @@ pub(crate) fn helper_subwalk_level<Sym: WalkSym>(
         match compute_inline_caller_frame(ctx, call_jit_pc) {
             Ok(caller) => {
                 let call_entry = if ctx.fbw_mode.inline_subwalk {
-                    compute_inline_helper_call_entry_frame(ctx, call_jit_pc)
+                    compute_inline_helper_call_entry_frame(ctx, call_jit_pc, ret)
                         .map_or(HelperCallEntry::Unavailable, HelperCallEntry::Frame)
                 } else {
                     HelperCallEntry::CallerBoundary
@@ -3399,7 +4298,7 @@ pub(crate) fn helper_subwalk_level<Sym: WalkSym>(
         // returned above (`compute_inline_caller_frame`).
         return Ok(None);
     }
-    compute_inline_helper_call_entry_frame(ctx, call_jit_pc).map(|caller| {
+    compute_inline_helper_call_entry_frame(ctx, call_jit_pc, ret).map(|caller| {
         Some(HelperLevel {
             parents: vec![caller],
             resume: HelperResume::CallEntry,
@@ -3471,7 +4370,9 @@ fn looked_inside_helper_resume_frames<Sym: WalkSym>(
         };
         let caller = compute_inline_caller_frame(ctx, call_jit_pc);
         let caller = if call_entry_parent {
-            caller.or_else(|_| compute_inline_helper_call_entry_frame(ctx, call_jit_pc))
+            caller.or_else(|_| {
+                compute_inline_helper_call_entry_frame(ctx, call_jit_pc, HelperReturn::CallResult)
+            })
         } else {
             caller
         };
@@ -3534,7 +4435,20 @@ fn numbered_helper_runnable_frames<Sym: WalkSym>(
     // what lets `check_truediv`'s `except OverflowError` steal the residual.
     // Reported as runnable so numbered_helper_guard_resume takes NumberedHelperGuard::Frames.
     if after_residual_call {
-        return Ok((parent_frames, true));
+        // `GUARD_NO_EXCEPTION` numbers the helper so `catch_exception`
+        // runs (`blackhole.py` `handle_exception_in_frame`). A seated pc
+        // that can reach `abort` cannot be numbered (`bhimpl_abort`);
+        // fall through to CALL-entry / refuse like any other unlowered
+        // helper (`call.py` `guess_call_kind`).
+        let abort_reachable = parent_frames.iter().any(|frame| {
+            crate::state::jitcode_is_transparent_helper(frame.jitcode_index as i32)
+                && frame.resume_marker_jit_pc.is_some_and(|pc| {
+                    helper_resume_can_reach_abort(frame.jitcode_index as usize, pc)
+                })
+        });
+        if !abort_reachable {
+            return Ok((parent_frames, true));
+        }
     }
     // Helper-section markers only — not the portal parent's. A helper
     // whose resume can reach a blackhole blocker collapses to CALL-entry
@@ -4075,6 +4989,42 @@ pub(crate) fn finished_callee_parent_frames<Sym: WalkSym>(
     Some(parent_frames)
 }
 
+/// `opencoder.py` `_ensure_parent_resumedata` numbers each `framestack`
+/// `MIFrame` once. `sections` are the live helper `MIFrame`s (outermost
+/// ancestor first, innermost last). Paused-caller images stop at the last
+/// numbered caller, so the trailing helper images match a prefix of
+/// `sections`; drop that suffix of images (and a numbered innermost image).
+/// Outer images stay.
+pub(crate) fn drop_parent_images_of_live_helper_sections(
+    parents: &mut Vec<InlineParentFrame>,
+    sections: &[(u32, u32, u32, Vec<OpRef>)],
+    is_transparent_helper: impl Fn(u32) -> bool,
+) {
+    let Some(inner) = sections.last() else {
+        return;
+    };
+    if parents.last().is_some_and(|last| {
+        is_transparent_helper(last.jitcode_index) && last.jitcode_index == inner.0
+    }) {
+        parents.pop();
+    }
+    let start = parents
+        .iter()
+        .rposition(|p| !is_transparent_helper(p.jitcode_index))
+        .map_or(0, |i| i + 1);
+    let images = &parents[start..];
+    let drop_n = (1..=images.len().min(sections.len()))
+        .rev()
+        .find(|&n| {
+            images[images.len() - n..]
+                .iter()
+                .zip(&sections[..n])
+                .all(|(p, s)| p.jitcode_index == s.0)
+        })
+        .unwrap_or(0);
+    parents.truncate(parents.len() - drop_n);
+}
+
 fn walker_capture_transparent_helper_snapshot<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -4107,7 +5057,6 @@ fn walker_capture_transparent_helper_snapshot<Sym: WalkSym>(
     // `_opimpl_setfield_vable` / `write_box_at` left them; the blackhole
     // re-executes from the guard and writes the arm's own vsd
     // (`bhimpl_setfield_vable_i`).
-    let (vable_boxes, vref_boxes) = ctx.trace_ctx.build_snapshot_vable_vref_boxes();
     // `capture_resumedata` numbers every `MetaInterp.framestack` level in one
     // `ResumeDataLoopMemo` pass (`resume.py` `number`). Each section's tagged
     // values are the live boxes at that frame's published pc, so the length
@@ -4130,6 +5079,7 @@ fn walker_capture_transparent_helper_snapshot<Sym: WalkSym>(
         let boxes = boxes_matching_resume_liveness(frame, pc_word, op_pc)?;
         captured.push((frame.jitcode_index, pc_word, py_pc, boxes));
     }
+    let (vable_boxes, vref_boxes) = ctx.trace_ctx.build_snapshot_vable_vref_boxes();
     let frames: Vec<(u32, u32, u32, &[OpRef])> = captured
         .iter()
         .map(|(jitcode_index, pc_word, py_pc, boxes)| {

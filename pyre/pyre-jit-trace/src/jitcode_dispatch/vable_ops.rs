@@ -41,6 +41,11 @@ fn replace_live_regs(live: &LiveFrameRegs, oldbox: OpRef, newbox: OpRef) {
 
 /// Bind this walk's live banks onto the MIFrame that is about to pause
 /// for a child: the top inlined Python frame, or the portal.
+///
+/// Helper levels sit above that frame (`enter_helper`). Writing `last()`
+/// stores the caller's banks on the helper, and a nested helper's
+/// `live == None` then numbers the caller's `-live-` through the helper
+/// file (`portal_frame_reg` past `num_regs_r`).
 pub(super) fn bind_paused_caller_regs(
     session: &std::cell::RefCell<WalkSession>,
     registers_r: &RegisterBank,
@@ -54,8 +59,7 @@ pub(super) fn bind_paused_caller_regs(
         session.framestack.push(InlineFrame::portal());
     }
     let frame = session
-        .framestack
-        .last_mut()
+        .last_non_helper_mut()
         .expect("portal occupies framestack[0]");
     frame.live = Some(live);
 }
@@ -85,8 +89,14 @@ fn replace_box_in_parent_frame(parent: &mut InlineParentFrame, oldbox: OpRef, ne
         state.replace_active_box(oldbox, newbox);
     }
     let bank = match oldbox.ty() {
-        Some(Type::Int) => parent.registers_i.as_ref(),
-        Some(Type::Ref) => parent.registers_r.as_ref(),
+        Some(Type::Int) => {
+            assert_int_bank_box(newbox, "replace_active_box");
+            parent.registers_i.as_ref()
+        }
+        Some(Type::Ref) => {
+            assert_ref_bank_box(newbox, "replace_active_box");
+            parent.registers_r.as_ref()
+        }
         Some(Type::Float) => parent.registers_f.as_ref(),
         _ => None,
     };
@@ -156,8 +166,14 @@ pub(super) fn with_replace_frames<Sym: WalkSym, R>(
         let mut session = unsafe { (*data.session).borrow_mut() };
         replace_box_in_paused_frames(&mut session, oldbox, newbox);
         match oldbox.ty() {
-            Some(Type::Int) => unsafe { (*data.registers_i).replace_active_box(oldbox, newbox) },
-            Some(Type::Ref) => unsafe { (*data.registers_r).replace_active_box(oldbox, newbox) },
+            Some(Type::Int) => {
+                assert_int_bank_box(newbox, "replace_active_box");
+                unsafe { (*data.registers_i).replace_active_box(oldbox, newbox) }
+            }
+            Some(Type::Ref) => {
+                assert_ref_bank_box(newbox, "replace_active_box");
+                unsafe { (*data.registers_r).replace_active_box(oldbox, newbox) }
+            }
             Some(Type::Float) => unsafe { (*data.registers_f).replace_active_box(oldbox, newbox) },
             _ => {}
         }
@@ -202,8 +218,14 @@ fn replace_box_in_all_walk_frames<Sym: WalkSym>(
 ) {
     replace_box_in_paused_frames(&mut ctx.session.borrow_mut(), oldbox, newbox);
     let bank = match oldbox.ty() {
-        Some(Type::Int) => ctx.registers_i,
-        Some(Type::Ref) => ctx.registers_r,
+        Some(Type::Int) => {
+            assert_int_bank_box(newbox, "replace_active_box");
+            ctx.registers_i
+        }
+        Some(Type::Ref) => {
+            assert_ref_bank_box(newbox, "replace_active_box");
+            ctx.registers_r
+        }
         Some(Type::Float) => ctx.registers_f,
         _ => panic!("replace_active_box_in_frame requires a typed value: {oldbox:?}"),
     };
@@ -918,6 +940,11 @@ pub(crate) fn getfield_vable_via_metainterp<Sym: WalkSym>(
     // with, or the trace and the optimizer could disagree about the constant;
     // `trace.rs` installs this same `shared()` handle via `set_cpu`.
     let cpu = crate::pyre_cpu::shared();
+    // `_opimpl_getfield_vable` (`pyjitpl.py`) takes
+    // `_nonstandard_virtualizable` first: Box identity against
+    // `virtualizable_boxes[-1]`, then `vinfo is fielddescr.get_vinfo()`,
+    // then `PTR_EQ` / `GUARD_VALUE` on the PendingEq path. A pointer-equal
+    // copy of the portal frame is still a distinct Box, so it records.
     let (result, shadow_value) = with_replace_frames(ctx, |ctx| {
         let nonstandard = walker_nonstandard_virtualizable(ctx, pc, obj, &descr)?;
         // Seeded virtual callee frame: fold a scalar field through the heapcache
@@ -1158,20 +1185,27 @@ pub(crate) fn setfield_vable_via_metainterp<Sym: WalkSym>(
             _ => unreachable!("value_bank must be 'i', 'r' or 'f'"),
         };
         let descr = vable_static_field_descr_from_jitcode(code, op, 2, ctx)?;
-        if let (Some(Value::Int(value)), Some(field_index), Some(shadow)) = (
-            vable_value_concrete(code, op, 1, ctx, value_bank, value),
-            ctx.trace_ctx
-                .virtualizable_info()
-                .and_then(|info| info.static_field_by_descr(&descr)),
-            ctx.frame_state.borrow().callee_shadow.as_ref(),
-        ) {
-            let frame =
-                arm_durable_store_frame(ctx, re_read_own_durable_frame(ctx, shadow.concrete_frame));
-            crate::state::store_live_frame_static_int(frame, field_index, value);
+        let field_index = ctx
+            .trace_ctx
+            .virtualizable_info()
+            .and_then(|info| info.static_field_by_descr(&descr));
+        let concrete = vable_value_concrete(code, op, 1, ctx, value_bank, value);
+        let shadow_frame = ctx
+            .frame_state
+            .borrow()
+            .callee_shadow
+            .as_ref()
+            .map(|shadow| shadow.concrete_frame);
+        if let (Some(Value::Int(int_val)), Some(field_index), Some(frame)) =
+            (concrete, field_index, shadow_frame)
+        {
+            let frame = arm_durable_store_frame(ctx, re_read_own_durable_frame(ctx, frame));
+            crate::state::store_live_frame_static_int(frame, field_index, int_val);
         }
         let vable = read_ref_reg_raw(code, op, 0, ctx)?;
         // Same split as `setarrayitem_vable`: only the standard virtualizable
-        // folds SETFIELD_GC away. `_opimpl_setfield_vable` still assigns
+        // Box folds SETFIELD_GC away (`_nonstandard_virtualizable` is
+        // `standard_box is box`). `_opimpl_setfield_vable` still assigns
         // `virtualizable_boxes[index] = valuebox` then
         // `synchronize_virtualizable_at`.
         if ctx.trace_ctx.standard_virtualizable_box() == Some(vable) {
@@ -1257,6 +1291,90 @@ pub(crate) fn setfield_vable_via_metainterp<Sym: WalkSym>(
     Ok((DispatchOutcome::Continue, op.next_pc))
 }
 
+/// Flatten's shared `get_is_being_profiled` + `promote_greens` block:
+/// `-live-`, `getfield debugdata`, `goto_if_not_ptr_iszero`, then the
+/// profiled diamond and `{int,ref}_guard_value` before `switch next_instr`.
+/// The prefix alone also matches a look-inside graph's own `debugdata`
+/// diamond, so the copy is identified by the greens and `switch` that
+/// follow it ([`merge_greens_reach_switch`]).
+pub(crate) fn is_shared_pmg_block(code: &[u8], target: usize) -> bool {
+    let Some(live) = crate::jitcode_runtime::decode_op_at(code, target) else {
+        return false;
+    };
+    if live.opname != "live" {
+        return false;
+    }
+    let Some(getfield) = crate::jitcode_runtime::decode_op_at(code, live.next_pc) else {
+        return false;
+    };
+    if getfield.opname != "getfield_vable_r" {
+        return false;
+    }
+    let mut pc = getfield.next_pc;
+    if let Some(op) = crate::jitcode_runtime::decode_op_at(code, pc) {
+        if op.opname == "live" {
+            pc = op.next_pc;
+        }
+    }
+    let Some(branch) = crate::jitcode_runtime::decode_op_at(code, pc) else {
+        return false;
+    };
+    if branch.opname != "goto_if_not_ptr_iszero" {
+        return false;
+    }
+    merge_greens_reach_switch(code, branch.next_pc)
+}
+
+/// The rest of the `pmg_shared` shape: the promoted greens
+/// (`int_guard_value` and `ref_guard_value`, `interp_jit.py
+/// PyFrame.dispatch` `promote_greens`) and then the `switch` on
+/// `next_instr`, before any exit of the jitcode.  A look-inside graph whose
+/// own `debugdata` test has the same prefix (`pyframe.py get_w_globals`)
+/// returns or raises instead and is not the copy.
+fn merge_greens_reach_switch(code: &[u8], mut pc: usize) -> bool {
+    let mut int_green = false;
+    let mut ref_green = false;
+    while let Some(op) = crate::jitcode_runtime::decode_op_at(code, pc) {
+        match op.opname {
+            "int_guard_value" => int_green = true,
+            "ref_guard_value" => ref_green = true,
+            "switch" => return int_green && ref_green,
+            name if name.ends_with("_return") || name == "raise" || name == "reraise" => {
+                return false;
+            }
+            _ => {}
+        }
+        if op.next_pc <= pc {
+            return false;
+        }
+        pc = op.next_pc;
+    }
+    false
+}
+
+/// Whether `vable` is the standard virtualizable identity, by Box or by
+/// the concrete frame pointer `virtualizable_boxes[-1]` carries.
+///
+/// `_nonstandard_virtualizable` compares Box identity first
+/// (`pyjitpl.py`); a portal frame register that is a copy of that
+/// identity still names the same object, and the `dispatch_bytecode`
+/// `last_instr` store has to see it.
+fn vable_is_standard_virtualizable<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    vable: OpRef,
+) -> bool {
+    if ctx.trace_ctx.standard_virtualizable_box() == Some(vable) {
+        return true;
+    }
+    let Some(std_ptr) = ctx.trace_ctx.standard_virtualizable_ptr() else {
+        return false;
+    };
+    matches!(
+        ctx.trace_ctx.lookup_opref_concrete(vable),
+        Some(Value::Ref(ptr)) if ptr.as_usize() == std_ptr
+    )
+}
+
 /// `setfield_vable_i_imm/rdd`: `_opimpl_setfield_vable` with a u16 immediate
 /// instead of an int register. Same standard-vable box update, no recorded
 /// op (`pyjitpl.py` `_opimpl_setfield_vable`).
@@ -1269,33 +1387,41 @@ pub(crate) fn setfield_vable_int_imm<Sym: WalkSym>(
     let fold_frame_reg = fbw_strict_fold_frame_reg(ctx);
     if fold_frame_reg != u16::MAX && code[op.pc + 1] as u16 == fold_frame_reg {
         let descr = vable_static_field_descr_from_jitcode(code, op, 3, ctx)?;
-        if let (Some(field_index), Some(shadow)) = (
-            ctx.trace_ctx
-                .virtualizable_info()
-                .and_then(|info| info.static_field_by_descr(&descr)),
-            ctx.frame_state.borrow().callee_shadow.as_ref(),
-        ) {
-            let frame =
-                arm_durable_store_frame(ctx, re_read_own_durable_frame(ctx, shadow.concrete_frame));
-            crate::state::store_live_frame_static_int(frame, field_index, imm);
+        let field_index = ctx
+            .trace_ctx
+            .virtualizable_info()
+            .and_then(|info| info.static_field_by_descr(&descr));
+        let shadow_frame = ctx
+            .frame_state
+            .borrow()
+            .callee_shadow
+            .as_ref()
+            .map(|shadow| shadow.concrete_frame);
+        if let (Some(field_index), Some(frame)) = (field_index, shadow_frame) {
+            if frame != 0 {
+                let frame = arm_durable_store_frame(ctx, re_read_own_durable_frame(ctx, frame));
+                crate::state::store_live_frame_static_int(frame, field_index, imm);
+            }
         }
-        let vable = read_ref_reg_raw(code, op, 0, ctx)?;
+        let obj = read_ref_reg_raw(code, op, 0, ctx)?;
         // Same split as `setfield_vable_via_metainterp`: only the standard
-        // virtualizable folds SETFIELD_GC away. `_opimpl_setfield_vable`
+        // virtualizable Box folds SETFIELD_GC away. `_opimpl_setfield_vable`
         // still assigns `virtualizable_boxes[index] = valuebox`.
-        if ctx.trace_ctx.standard_virtualizable_box() == Some(vable) {
-            if vable.is_none() {
+        if ctx.trace_ctx.standard_virtualizable_box() == Some(obj) {
+            if obj.is_none() {
                 return Err(DispatchError::VableBoxNotSeeded { pc: op.pc });
             }
             let _ = ctx.trace_ctx.vable_setfield_checked(
                 false,
-                vable,
+                obj,
                 descr.clone(),
                 OpRef::ConstInt(imm),
                 Value::Int(imm),
             );
             return Ok((DispatchOutcome::Continue, op.next_pc));
         }
+        // Identity mismatch: fall through to `vable_setfield_checked`
+        // (records SETFIELD_GC for a nonstandard box).
     }
     let obj = read_ref_reg_raw(code, op, 0, ctx)?;
     if obj.is_none() {
@@ -1528,6 +1654,41 @@ pub(crate) fn walker_nonstandard_virtualizable<Sym: WalkSym>(
     vable: OpRef,
     fielddescr: &majit_ir::DescrRef,
 ) -> Result<bool, DispatchError> {
+    walker_nonstandard_virtualizable_promote(ctx, pc, vable, fielddescr, true)
+}
+
+/// Handler-entry traceback writes `last_instr` before the reconstructed
+/// carrier walk has filled the CALL `-live-` window.
+///
+/// `resume.py rebuild_from_resumedata` rebuilt this MIFrame; it is not
+/// `virtualizable_boxes[-1]`. `pyjitpl.py implement_guard_value` would
+/// `generate_guard` then `capture_resumedata` at that CALL pc and abort
+/// the catching frame (`finishframe_exception` /
+/// `pytraceback.record_application_traceback`). A concrete `isstandard==0`
+/// is already the `heapcache.py nonstandard_virtualizables_now_known`
+/// result of the PTR_EQ, so commit without the promote.
+pub(crate) fn walker_nonstandard_virtualizable_handler_entry<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    pc: usize,
+    vable: OpRef,
+    fielddescr: &majit_ir::DescrRef,
+) -> Result<bool, DispatchError> {
+    walker_nonstandard_virtualizable_promote(
+        ctx,
+        pc,
+        vable,
+        fielddescr,
+        !(ctx.fbw_mode.carrier_resume),
+    )
+}
+
+fn walker_nonstandard_virtualizable_promote<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    pc: usize,
+    vable: OpRef,
+    fielddescr: &majit_ir::DescrRef,
+    promote: bool,
+) -> Result<bool, DispatchError> {
     match ctx
         .trace_ctx
         .begin_nonstandard_virtualizable(pc, vable, fielddescr)
@@ -1539,7 +1700,11 @@ pub(crate) fn walker_nonstandard_virtualizable<Sym: WalkSym>(
             vable_opref,
             standard_box,
         } => {
-            let promoted = walker_implement_guard_value(ctx, pc, eqbox, isstandard)?;
+            let promoted = if promote || isstandard != 0 {
+                walker_implement_guard_value(ctx, pc, eqbox, isstandard)?
+            } else {
+                eqbox
+            };
             Ok(ctx.trace_ctx.commit_nonstandard_virtualizable(
                 promoted,
                 vable_opref,

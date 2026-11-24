@@ -1314,7 +1314,7 @@ pub struct GraphFlattener<'a> {
 /// *between* recursive `make_link` calls (`Label(link)` after the
 /// child subtree).
 enum FlattenWork {
-    Block(BlockRef, bool),
+    Block(BlockRef, bool, Option<LinkRef>),
     AfterCanraiseNormal {
         normal_link: LinkRef,
         catch_links: Vec<LinkRef>,
@@ -1659,7 +1659,7 @@ impl<'a> GraphFlattener<'a> {
             return;
         }
         self.insert_renamings(link);
-        work.push(FlattenWork::Block(target, handling_ovf));
+        work.push(FlattenWork::Block(target, handling_ovf, Some(link.clone())));
     }
 
     #[cfg_attr(target_arch = "wasm32", inline(never))]
@@ -1869,10 +1869,13 @@ impl<'a> GraphFlattener<'a> {
             // stack slot).  Emit the byte-adjacent `catch_exception <L>`
             // dispatch and lower the handler entry through
             // `make_exception_link` — `L` is the handler entry placed
-            // right before `make_exception_link`'s `last_exception` /
-            // `last_exc_value` emission, mirroring the canraise arm's
+            // before `make_exception_link`.  `last_exception` /
+            // `last_exc_value` emit *inside* the landing (after
+            // `Label(target)` in `make_bytecode_block`), matching
+            // `pyopcode.py handle_operation_error` → `pushvalue(w_exc)`.
+            // Stream layout still mirrors the canraise arm's
             // `catch_exception TLabel(normal) … Label(normal) …
-            // make_exception_link` layout (flatten.py).
+            // make_exception_link` (flatten.py).
             if block.borrow().canraise() {
                 let catch_label = self.tlabel_for_link(link);
                 self.emitline(Insn::op("catch_exception", vec![catch_label]));
@@ -2279,8 +2282,12 @@ impl<'a> GraphFlattener<'a> {
                 }
             }
         }
-        let link_borrow = link.borrow();
-        self.generate_last_exc(&link_borrow, &target_inputargs);
+        // `flatten.py insert_renamings` calls `generate_last_exc` here,
+        // before `Label(target)`.  That makes `last_exc_value` dest live-in
+        // of the landing.  `pyopcode.py handle_operation_error` reads the
+        // exception *inside* the handler and `pushvalue(w_exc)` onto
+        // `locals_cells_stack_w`.  Emit the load after `Label` in
+        // `make_bytecode_block` so dest is defined in the landing (INV).
     }
 
     fn generate_last_exc(&mut self, link: &super::flow::Link, inputargs: &[FlowValue]) {
@@ -2338,11 +2345,15 @@ impl<'a> GraphFlattener<'a> {
     /// stacking one Rust frame per canraise block.
     pub fn generate_ssa_form(&mut self) {
         self.seen_blocks.clear();
-        let mut work = vec![FlattenWork::Block(self.graph.startblock.clone(), false)];
+        let mut work = vec![FlattenWork::Block(
+            self.graph.startblock.clone(),
+            false,
+            None,
+        )];
         while let Some(item) = work.pop() {
             match item {
-                FlattenWork::Block(block, handling_ovf) => {
-                    self.make_bytecode_block(block, handling_ovf, &mut work);
+                FlattenWork::Block(block, handling_ovf, incoming) => {
+                    self.make_bytecode_block(block, handling_ovf, incoming.as_ref(), &mut work);
                 }
                 FlattenWork::AfterCanraiseNormal {
                     normal_link,
@@ -2419,6 +2430,7 @@ impl<'a> GraphFlattener<'a> {
         &mut self,
         block: BlockRef,
         handling_ovf: bool,
+        incoming: Option<&LinkRef>,
         work: &mut Vec<FlattenWork>,
     ) {
         if block.borrow().exits.is_empty() {
@@ -2429,6 +2441,10 @@ impl<'a> GraphFlattener<'a> {
             // inside `make_return` (upstream raises `Exception("?")` at
             // `flatten.py`).  Pyre keeps the upstream behavior:
             // delegate to `make_return` directly.
+            if let Some(link) = incoming {
+                let inputargs = block.borrow().inputargs.clone();
+                self.generate_last_exc(&link.borrow(), &inputargs);
+            }
             let args = block.borrow().inputargs.clone();
             self.make_return(&args);
             return;
@@ -2442,6 +2458,14 @@ impl<'a> GraphFlattener<'a> {
         self.seen_blocks.push(block.clone());
         let block_label = self.label_for_block(&block);
         self.emitline(block_label);
+        if let Some(link) = incoming {
+            // `pyopcode.py handle_operation_error` → `pushvalue(w_exc)`:
+            // the exception is loaded inside the handler block, then
+            // stored on `locals_cells_stack_w`.  A later opcode re-reads
+            // it with `getarrayitem_vable_r` (`peekvalue`/`popvalue`).
+            let inputargs = block.borrow().inputargs.clone();
+            self.generate_last_exc(&link.borrow(), &inputargs);
+        }
         // `flatten.py` make_bytecode_block emits Label(block)
         // at entry, then ops via `serialize_op`, then `insert_exits`.
         // No per-PC anchors, no `-live-` interleaving — those come
@@ -3445,7 +3469,10 @@ fn flatten_descr_by_ptr(descr: &super::flow::DescrByPtr) -> Operand {
                     size: size.size(),
                     type_id: size.cache_key(),
                     vtable: size.vtable() as u64,
-                    owner: String::new(),
+                    // STRUCT._name.  Empty feeds the already-qualified
+                    // display string back as FIELDNAME and mints a
+                    // parallel descriptor (`descr.py cache[STRUCT]`).
+                    owner: owner.to_string(),
                     is_gc_managed: size.is_gc_managed(),
                     headerless: size.headerless(),
                     is_immutable: size.is_immutable(),
@@ -8560,6 +8587,33 @@ mod tests {
                 DescrOperand::Bh(BhDescr::Field { name, owner, .. }) => {
                     assert_eq!(name, "PyFrame.PyFrame.flags");
                     assert_eq!(owner, "PyFrame");
+                }
+                other => panic!("expected BhDescr::Field, got {other:?}"),
+            },
+            other => panic!("expected Operand::Descr, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn flatten_w_f_trace_descr_keeps_frame_debug_data_owner() {
+        let field = pyre_jit_trace::descr::frame_debug_data_w_f_trace_descr();
+        let by_ptr = super::super::flow::DescrByPtr(field);
+        match flatten_descr_by_ptr(&by_ptr) {
+            Operand::Descr(rc) => match &*rc {
+                DescrOperand::Bh(BhDescr::Field {
+                    name,
+                    owner,
+                    parent,
+                    ..
+                }) => {
+                    assert_eq!(owner, "FrameDebugData");
+                    assert!(
+                        name.ends_with("w_f_trace"),
+                        "display name should end with the field key, got {name}"
+                    );
+                    let parent = parent.as_ref().expect("w_f_trace carries its SizeDescr");
+                    assert_eq!(parent.owner, "FrameDebugData");
+                    assert_ne!(parent.type_id, 0, "headerless STRUCT still has a cache key");
                 }
                 other => panic!("expected BhDescr::Field, got {other:?}"),
             },

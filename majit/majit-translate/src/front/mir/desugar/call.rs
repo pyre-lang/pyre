@@ -1017,6 +1017,13 @@ impl<'a> Lowering<'a> {
                 }
             }
         }
+        // FunDecl id of a Regular callee, captured before `call.func`
+        // is moved into the match. Gate A stamps `FUNC.RESULT` of
+        // `&*p.add(i)` as `Ptr(Interior)` (`InteriorPtrRepr.lowleveltype`).
+        let callee_fun_decl_id = match &call.func {
+            CallFunc::Regular(reg) => regular_call_fun_decl_id(&reg.kind),
+            _ => None,
+        };
         let op_kind = match (class, call.func) {
             (CallClass::Direct | CallClass::Trait, CallFunc::Regular(_))
                 if let Some(kind) = vec_extend_kind =>
@@ -2289,6 +2296,46 @@ impl<'a> Lowering<'a> {
                 )? {
                     return Ok(());
                 }
+                // Gate A: escaped `&*p.add(i)` / `&mut *p.add(i)` of a
+                // GcArray struct pointee is `PtrRepr.rtype_getitem`'s
+                // InteriorPtr arm (`rptr.py`): malloc Interior + setfield
+                // ptr + setfield index (`lltype.py`
+                // `Ptr._interior_ptr_type_with_index`).
+                if self.try_lower_interior_ptr_add(
+                    mir_bb,
+                    &reg,
+                    &args,
+                    &arg_locals,
+                    first_arg_ty.as_ref(),
+                    dest_local,
+                    target,
+                )? {
+                    return Ok(());
+                }
+                if self.try_lower_entry_ptr_as_interior(
+                    mir_bb,
+                    &reg,
+                    &args,
+                    dest_local,
+                    &call.dest.ty,
+                    target,
+                )? {
+                    return Ok(());
+                }
+                // Gate B add: `ptr::write(p.add(i), S{..})` records the
+                // GcArray header so the write emits `setinteriorfield`s
+                // (`rordereddict.py` `_ll_dict_setitem_lookup_done`).
+                if self.try_lower_struct_write_ptr_add(
+                    mir_bb,
+                    &reg,
+                    &args,
+                    &arg_locals,
+                    first_arg_ty.as_ref(),
+                    dest_local,
+                    target,
+                )? {
+                    return Ok(());
+                }
                 // Copy-struct `<[T]>::get(s, i)` used only as `get(i)?.field`
                 // is `ll_getitem_nonneg` + `getinteriorfield`. The Option
                 // dest stays a bounds bool, never a tagged aggregate.
@@ -2434,6 +2481,20 @@ impl<'a> Lowering<'a> {
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
+                // Gate B write: `core::ptr::write(p.add(i), S{..})` as one
+                // `setinteriorfield` per field (`rordereddict.py`
+                // `_ll_dict_setitem_lookup_done`).
+                if self.try_lower_interior_aggregate_ptr_write(
+                    mir_bb,
+                    &reg,
+                    &arg_locals,
+                    &arg_operands,
+                    second_arg_ty.as_ref(),
+                    dest_local,
+                    target,
+                )? {
                     return Ok(());
                 }
                 // `core::ptr::write` of a Copy scalar or thin pointer is a
@@ -7151,225 +7212,272 @@ impl<'a> Lowering<'a> {
                     });
                     let promote_marker = self.jit_promote_marker(&reg);
                     let fun_decl_id = regular_call_fun_decl_id(&reg.kind);
-                    let target = if let Some((trait_root, method_name)) =
-                        abstract_trait_call_target(&reg, self.llbc)
-                    {
-                        CallTarget::indirect(trait_root, method_name)
-                    } else if let Some(path) = scalar_inherent_method_path(
-                        &reg,
-                        self.llbc,
-                        self.tombstoned_leaves,
-                        self.gc_struct_ids,
-                        &self.raw_alloc_flavor_structs,
-                    ) {
-                        CallTarget::FunctionPath {
-                            segments: path,
-                            resolved_path: None,
-                            fun_decl_id: None,
-                            specialization: crate::parse::GraphSpecialization::Regular,
-                        }
-                    } else if args.len() == 1
-                        && let Some(marker) = promote_marker
-                    {
-                        CallTarget::FunctionPath {
-                            segments: vec![marker.to_string()],
-                            resolved_path: None,
-                            fun_decl_id: None,
-                            specialization: crate::parse::GraphSpecialization::Regular,
-                        }
-                    } else {
-                        // `CallTarget::Method` requires a receiver in `args[0]`
-                        // (the flowspace adapter lowers it to `getattr(recv,
-                        // method_leaf) → simple_call(bound_method, …)`).
-                        // Charon's `impl_method_owner` matches both inherent
-                        // methods (which carry `&self`) *and* associated
-                        // functions (e.g. `RootScope::new()` — no `self` arg).
-                        // Only the former actually has a receiver in `args[0]`;
-                        // routing a 0-arg associated function through `Method`
-                        // panics at `flowspace_adapter.rs` ("Call::Method
-                        // has empty args").  Fall back to the `FunctionPath`
-                        // segments when there is no receiver to thread.
-                        // Fold niche `Option` `eq`/`ne` before the Method
-                        // target is chosen (`impl_method_owner` /
-                        // `first_is_self`). Left as `CallTarget::Method
-                        // { name: "eq" }`, the adapter getattr's `eq` off
-                        // the niche payload (`SomeInstance(PyObject,
-                        // can_be_None=True)`) and annotate blocks.
-                        if self.try_lower_option_niche_eq_ne(
-                            mir_bb,
-                            &segments,
-                            method_hint.as_ref(),
-                            &args,
-                            first_arg_ty.as_ref(),
-                            second_arg_ty.as_ref(),
-                            dest_local,
-                            target,
-                        )? {
-                            return Ok(());
-                        }
-                        if self.try_lower_result_eq_ne(
-                            mir_bb,
-                            &segments,
-                            method_hint.as_ref(),
-                            &args,
-                            first_arg_ty.as_ref().or(const_arg_ty.as_ref()),
-                            second_arg_ty.as_ref().or(second_const_arg_ty.as_ref()),
-                            dest_local,
-                            target,
-                            &arg_locals,
-                            &arg_operands,
-                        )? {
-                            return Ok(());
-                        }
-                        if self.try_lower_unwrap_or_default_string(
-                            mir_bb,
-                            &reg,
-                            &args,
-                            first_arg_ty.as_ref(),
-                            dest_local,
-                            &call.dest.ty,
-                            target,
-                        )? {
-                            return Ok(());
-                        }
-                        if self.try_lower_unwrap_or_gcref(
-                            mir_bb,
-                            &reg,
-                            &args,
-                            first_arg_ty.as_ref(),
-                            dest_local,
-                            &call.dest.ty,
-                            target,
-                        )? {
-                            return Ok(());
-                        }
-                        let same_callee =
-                            segments == original_segments && method_hint == original_method_hint;
-                        match method_hint {
-                            Some((owner_root, leaf, _)) if !args.is_empty() => {
-                                // Method is this FunDecl: stamp its registered
-                                // path so `target_to_path` does not use the
-                                // owner leaf as a suffix of the impl key.
-                                let mut target = CallTarget::method(leaf, Some(owner_root));
-                                if let Some(id) = fun_decl_id {
-                                    target = target.with_fun_decl_id(id);
-                                    if let Some(fd) = self.llbc.fn_by_id(id) {
-                                        target = stamp_call_target_fun_decl(target, self.llbc, fd);
-                                    }
-                                }
-                                target
-                            }
-                            _ => {
-                                // Opaque cross-crate `self` (`RootScope` in the
-                                // caller's LLBC). `impl_method_owner` declines
-                                // `CallTarget::Method`, so `MethodDesc.func_args`
-                                // never prepends `SomeInstance(selfclassdef)`
-                                // and the traced body binds a classdef-less
-                                // receiver. Paint the classdef onto this
-                                // argument only.
-                                if let Some(root) = self.opaque_traced_method_self_root(&reg)
-                                    && let Some(recv) = args.first().cloned()
-                                {
-                                    let narrowed = self.graph.alloc_value_var_with_type(
-                                        crate::model::ConcreteType::Unknown,
-                                    );
-                                    let bb_id = self.emit_bb(mir_bb);
-                                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-                                        result: Some(narrowed.clone()),
-                                        kind: crate::model::cast_instance_call(root, recv),
-                                    });
-                                    args[0] = narrowed;
-                                }
-                                // `ll_dict_setitem` / `ll_dict_lookup`
-                                // (`rordereddict.py`) type the receiver as
-                                // the ordered dict. Paint the instantiated
-                                // `RDict<K,V,S>` so that cast is `SomeDict`;
-                                // a bare `RDict` parameter stays an instance.
-                                if let Some(root) = rdict_insert_get_cast_root(
-                                    &segments,
-                                    first_arg_ty.as_ref(),
-                                    self.llbc,
-                                ) && let Some(recv) = args.first().cloned()
-                                {
-                                    let narrowed = self.graph.alloc_value_var_with_type(
-                                        crate::model::ConcreteType::Unknown,
-                                    );
-                                    let bb_id = self.emit_bb(mir_bb);
-                                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-                                        result: Some(narrowed.clone()),
-                                        kind: crate::model::cast_instance_call(root, recv),
-                                    });
-                                    args[0] = narrowed;
-                                }
-                                let mut target = CallTarget::FunctionPath {
-                                    segments,
-                                    resolved_path: None,
-                                    fun_decl_id: None,
-                                    specialization: crate::parse::GraphSpecialization::Regular,
-                                };
-                                if same_callee && let Some(id) = self.call_target_fun_decl_id(&reg)
-                                {
-                                    target = target.with_fun_decl_id(id);
-                                    if let Some(fd) = self.llbc.fn_by_id(id) {
-                                        target = stamp_call_target_fun_decl(target, self.llbc, fd);
-                                    }
-                                }
-                                target
-                            }
-                        }
-                    };
-                    if self.graph.name.ends_with("pyobject_from_constant_addr")
-                        && args.len() == 1
-                        && regular_call_name_path(&reg, self.llbc)
-                            .is_some_and(|path| path.ends_with("pyobject_from_constant"))
-                    {
-                        // The address argument is an int word. The callee
-                        // takes `&ConstantData`. `lltype.cast_int_to_ptr`
-                        // is the host call `rtype_cast_int_to_ptr` accepts.
-                        let cast = self
-                            .graph
-                            .alloc_value_var_with_type(crate::model::ConcreteType::GcRef);
-                        let bb_id = self.emit_bb(mir_bb);
-                        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-                            result: Some(cast.clone()),
-                            kind: cast_int_to_ptr_call(args[0].clone()),
-                        });
-                        args[0] = cast;
-                    }
                     let result_ty = if byte_item {
                         ValueType::Unsigned
                     } else {
                         result_ty
                     };
-                    if let Some(id) = fun_decl_id
-                        && let Some(fd) = self.llbc.fn_by_id(id)
-                        && fundecl_keeps_zst_self(
+                    if let Some((trait_root, method_name)) =
+                        abstract_trait_call_target(&reg, self.llbc)
+                    {
+                        // rpbc.py FunctionReprBase.call: a Constant funcptr is a direct_call; an Unsize vtable is a constant.
+                        if let Some(kind) =
+                            self.unsize_constant_vtable_direct_call(&reg, &args, result_ty.clone())
+                        {
+                            kind
+                        } else {
+                            // Path B: a bodyless `dyn Trait` method. Path A already
+                            // emits `ClassRepr.getclsfield` (`{vtable}.method_*`)
+                            // plus `FunctionReprBase.call` (`IndirectCall` with
+                            // `family_key`). Synthesize that same pair; do not
+                            // emit `CallTarget::Indirect`.
+                            let trait_decl_path = match &reg.kind {
+                                CallKind::Trait(value) => trait_payload_decl_path(value, self.llbc),
+                                _ => None,
+                            }
+                            .expect("abstract_trait_call_target resolved the trait decl");
+                            let receiver = args.first().cloned().ok_or_else(|| {
+                                LowerError::Unsupported(format!(
+                                    "bb{mir_bb}: dyn-Trait method call must have a receiver arg"
+                                ))
+                            })?;
+                            let funcptr = self.emit_vtable_method_slot_read(
+                                mir_bb,
+                                &receiver,
+                                &trait_decl_path,
+                                &method_name,
+                            );
+                            self.keep_dyn_call_receiver(mir_bb, &mut args);
+                            OpKind::IndirectCall {
+                                funcptr,
+                                args,
+                                graphs: None,
+                                family_key: Some(crate::model::IndirectFamilyKey::dyn_trait(
+                                    trait_root,
+                                    method_name,
+                                )),
+                                result_ty,
+                            }
+                        }
+                    } else {
+                        let target = if let Some(path) = scalar_inherent_method_path(
+                            &reg,
                             self.llbc,
-                            fd,
-                            None,
                             self.tombstoned_leaves,
                             self.gc_struct_ids,
                             &self.raw_alloc_flavor_structs,
-                        )
-                    {
-                        self.keep_dyn_call_receiver(mir_bb, &mut args);
-                    }
-                    if !pair_lens.is_empty() {
-                        let name = regular_call_name_path(&reg, self.llbc).unwrap_or_default();
-                        self.pair_callee_decl(mir_bb, &reg, &name, &pair_lens, false)?;
-                        callee_name_path = Some(name);
-                        let target = self.pair_call_target(mir_bb, &reg, &args, &pair_lens)?;
-                        let args = splice_pair_lens(args, pair_lens);
-                        OpKind::Call {
-                            target,
-                            args: crate::model::call_args(args),
-                            result_ty,
+                        ) {
+                            CallTarget::FunctionPath {
+                                segments: path,
+                                fun_decl_id: None,
+                                resolved_path: None,
+                                specialization: crate::parse::GraphSpecialization::Regular,
+                            }
+                        } else if args.len() == 1
+                            && let Some(marker) = promote_marker
+                        {
+                            CallTarget::FunctionPath {
+                                segments: vec![marker.to_string()],
+                                fun_decl_id: None,
+                                resolved_path: None,
+                                specialization: crate::parse::GraphSpecialization::Regular,
+                            }
+                        } else {
+                            // `CallTarget::Method` requires a receiver in `args[0]`
+                            // (the flowspace adapter lowers it to `getattr(recv,
+                            // method_leaf) → simple_call(bound_method, …)`).
+                            // Charon's `impl_method_owner` matches both inherent
+                            // methods (which carry `&self`) *and* associated
+                            // functions (e.g. `RootScope::new()` — no `self` arg).
+                            // Only the former actually has a receiver in `args[0]`;
+                            // routing a 0-arg associated function through `Method`
+                            // panics at `flowspace_adapter.rs` ("Call::Method
+                            // has empty args").  Fall back to the `FunctionPath`
+                            // segments when there is no receiver to thread.
+                            // Fold niche `Option` `eq`/`ne` before the Method
+                            // target is chosen (`impl_method_owner` /
+                            // `first_is_self`). Left as `CallTarget::Method
+                            // { name: "eq" }`, the adapter getattr's `eq` off
+                            // the niche payload (`SomeInstance(PyObject,
+                            // can_be_None=True)`) and annotate blocks.
+                            if self.try_lower_option_niche_eq_ne(
+                                mir_bb,
+                                &segments,
+                                method_hint.as_ref(),
+                                &args,
+                                first_arg_ty.as_ref(),
+                                second_arg_ty.as_ref(),
+                                dest_local,
+                                target,
+                            )? {
+                                return Ok(());
+                            }
+                            if self.try_lower_result_eq_ne(
+                                mir_bb,
+                                &segments,
+                                method_hint.as_ref(),
+                                &args,
+                                first_arg_ty.as_ref().or(const_arg_ty.as_ref()),
+                                second_arg_ty.as_ref().or(second_const_arg_ty.as_ref()),
+                                dest_local,
+                                target,
+                                &arg_locals,
+                                &arg_operands,
+                            )? {
+                                return Ok(());
+                            }
+                            if self.try_lower_unwrap_or_default_string(
+                                mir_bb,
+                                &reg,
+                                &args,
+                                first_arg_ty.as_ref(),
+                                dest_local,
+                                &call.dest.ty,
+                                target,
+                            )? {
+                                return Ok(());
+                            }
+                            if self.try_lower_unwrap_or_gcref(
+                                mir_bb,
+                                &reg,
+                                &args,
+                                first_arg_ty.as_ref(),
+                                dest_local,
+                                &call.dest.ty,
+                                target,
+                            )? {
+                                return Ok(());
+                            }
+                            let same_callee = segments == original_segments
+                                && method_hint == original_method_hint;
+                            match method_hint {
+                                Some((owner_root, leaf, _)) if !args.is_empty() => {
+                                    // Method is this FunDecl: stamp its registered
+                                    // path so `target_to_path` does not use the
+                                    // owner leaf as a suffix of the impl key.
+                                    let mut target = CallTarget::method(leaf, Some(owner_root));
+                                    if let Some(id) = fun_decl_id {
+                                        target = target.with_fun_decl_id(id);
+                                        if let Some(fd) = self.llbc.fn_by_id(id) {
+                                            target =
+                                                stamp_call_target_fun_decl(target, self.llbc, fd);
+                                        }
+                                    }
+                                    target
+                                }
+                                _ => {
+                                    // Opaque cross-crate `self` (`RootScope` in the
+                                    // caller's LLBC). `impl_method_owner` declines
+                                    // `CallTarget::Method`, so `MethodDesc.func_args`
+                                    // never prepends `SomeInstance(selfclassdef)`
+                                    // and the traced body binds a classdef-less
+                                    // receiver. Paint the classdef onto this
+                                    // argument only.
+                                    if let Some(root) = self.opaque_traced_method_self_root(&reg)
+                                        && let Some(recv) = args.first().cloned()
+                                    {
+                                        let narrowed = self.graph.alloc_value_var_with_type(
+                                            crate::model::ConcreteType::Unknown,
+                                        );
+                                        let bb_id = self.emit_bb(mir_bb);
+                                        self.graph.block_mut(bb_id).operations.push(
+                                            SpaceOperation {
+                                                result: Some(narrowed.clone()),
+                                                kind: crate::model::cast_instance_call(root, recv),
+                                            },
+                                        );
+                                        args[0] = narrowed;
+                                    }
+                                    // `ll_dict_setitem` / `ll_dict_lookup`
+                                    // (`rordereddict.py`) type the receiver as
+                                    // the ordered dict. Paint the instantiated
+                                    // `RDict<K,V,S>` so that cast is `SomeDict`;
+                                    // a bare `RDict` parameter stays an instance.
+                                    if let Some(root) = rdict_insert_get_cast_root(
+                                        &segments,
+                                        first_arg_ty.as_ref(),
+                                        self.llbc,
+                                    ) && let Some(recv) = args.first().cloned()
+                                    {
+                                        let narrowed = self.graph.alloc_value_var_with_type(
+                                            crate::model::ConcreteType::Unknown,
+                                        );
+                                        let bb_id = self.emit_bb(mir_bb);
+                                        self.graph.block_mut(bb_id).operations.push(
+                                            SpaceOperation {
+                                                result: Some(narrowed.clone()),
+                                                kind: crate::model::cast_instance_call(root, recv),
+                                            },
+                                        );
+                                        args[0] = narrowed;
+                                    }
+                                    let mut target = CallTarget::FunctionPath {
+                                        segments,
+                                        fun_decl_id: None,
+                                        resolved_path: None,
+                                        specialization: crate::parse::GraphSpecialization::Regular,
+                                    };
+                                    if same_callee
+                                        && let Some(id) = self.call_target_fun_decl_id(&reg)
+                                    {
+                                        target = target.with_fun_decl_id(id);
+                                        if let Some(fd) = self.llbc.fn_by_id(id) {
+                                            target =
+                                                stamp_call_target_fun_decl(target, self.llbc, fd);
+                                        }
+                                    }
+                                    target
+                                }
+                            }
+                        };
+                        if self.graph.name.ends_with("pyobject_from_constant_addr")
+                            && args.len() == 1
+                            && regular_call_name_path(&reg, self.llbc)
+                                .is_some_and(|path| path.ends_with("pyobject_from_constant"))
+                        {
+                            // The address argument is an int word. The callee
+                            // takes `&ConstantData`. `lltype.cast_int_to_ptr`
+                            // is the host call `rtype_cast_int_to_ptr` accepts.
+                            let cast = self
+                                .graph
+                                .alloc_value_var_with_type(crate::model::ConcreteType::GcRef);
+                            let bb_id = self.emit_bb(mir_bb);
+                            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                                result: Some(cast.clone()),
+                                kind: cast_int_to_ptr_call(args[0].clone()),
+                            });
+                            args[0] = cast;
                         }
-                    } else {
-                        OpKind::Call {
-                            target,
-                            args: crate::model::call_args(args),
-                            result_ty,
+                        if let Some(id) = fun_decl_id
+                            && let Some(fd) = self.llbc.fn_by_id(id)
+                            && fundecl_keeps_zst_self(
+                                self.llbc,
+                                fd,
+                                None,
+                                self.tombstoned_leaves,
+                                self.gc_struct_ids,
+                                &self.raw_alloc_flavor_structs,
+                            )
+                        {
+                            self.keep_dyn_call_receiver(mir_bb, &mut args);
+                        }
+                        if !pair_lens.is_empty() {
+                            let name = regular_call_name_path(&reg, self.llbc).unwrap_or_default();
+                            self.pair_callee_decl(mir_bb, &reg, &name, &pair_lens, false)?;
+                            callee_name_path = Some(name);
+                            let target = self.pair_call_target(mir_bb, &reg, &args, &pair_lens)?;
+                            let args = splice_pair_lens(args, pair_lens);
+                            OpKind::Call {
+                                target,
+                                args: crate::model::call_args(args),
+                                result_ty,
+                            }
+                        } else {
+                            OpKind::Call {
+                                target,
+                                args: crate::model::call_args(args),
+                                result_ty,
+                            }
                         }
                     }
                 }
@@ -8485,6 +8593,36 @@ impl<'a> Lowering<'a> {
         // bank is `ref`.
         if result_var.concretetype().is_none() {
             stamp_rust_vec_header(&result_var, &call.dest.ty, self.llbc);
+        }
+        // Caller of `&*p.add(i)` (`entry_at`): FUNC.RESULT is
+        // `Ptr(Interior)` so `e.f_hash` / `e.key` lower through
+        // `InteriorPtrRepr.rtype_getattr` (`rptr.py`). Gate A on the
+        // callee body decides that this dest is InteriorPtr, never by
+        // function name. ARRAY identity is the instantiated dest
+        // (`get_ll_dict` `DICTENTRYARRAY`): the generic body's add
+        // pointee is `Entry<K,V>` and would intern the one-word-key
+        // template. `RDict::entry_ptr` is the items pointer at index 0:
+        // callers `entry_ptr().add(slot)` recover the `entries` header
+        // (`header_producer` / `InteriorHeader::Entries`). Stamping
+        // that dest InteriorPtr would hide the header from Gate A.
+        // A method call is `CallKind::Trait` in MIR (`regular_call_fun_decl_id`
+        // is None); the resolved FunDecl id is on the Call target.
+        let interior_callee_id = callee_fun_decl_id.or_else(|| match &op_kind {
+            OpKind::Call { target, .. } => target.fun_decl_id(),
+            _ => None,
+        });
+        if result_var.concretetype().is_none()
+            && let Some(id) = interior_callee_id
+            && let Some(fd) = self.llbc.fn_by_id(id)
+            && let Some(array_type_id) = callee_returns_interior_array_type_id_at_dest(
+                fd,
+                &call.dest.ty,
+                self.llbc,
+                self.tombstoned_leaves,
+            )
+            && let Some(ip_ty) = interior_ptr_lltype(&array_type_id)
+        {
+            result_var.set_concretetype(Some(ip_ty));
         }
         // A Ref-banked items-block result (`rlist.py` `ll_items`) keeps
         // the `tyref_to_value_type_with` record; CCHARP is Int-banked.
@@ -9872,21 +10010,35 @@ impl<'a> Lowering<'a> {
         // `do_fixed_list_ll_arraycopy` reads the dest ARRAY, and without
         // it the residual `OS_ARRAYCOPY` lands on
         // `WriteAnalyzer.top_result` (`EF_RANDOM_EFFECTS`).
+        //
+        // `InteriorPtrRepr.lowleveltype` is `Ptr(Interior)`, not the
+        // Entry class (`rptr.py`). Recasting the Gate A result to Entry
+        // allocates a new Variable without the `interior_ptr_type` hint,
+        // so the caller's `e.f_hash` / `e.key` miss
+        // `InteriorPtrRepr.rtype_getattr` and `getfield` the 2-word
+        // Interior as if it were ENTRY.
         if !dest_is_cell && let Some(root) = recast_result_root {
             let root = if crate::annotator::bookkeeper::is_gcref_type_spelling(&root) {
                 "GCREF".to_string()
             } else {
                 root
             };
-            let narrowed = self
-                .graph
-                .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-            copy_concretetype(&result_var, &narrowed);
-            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-                result: Some(narrowed.clone()),
-                kind: crate::model::cast_instance_call(root, result_var.clone()),
-            });
-            self.local_var[dest_local] = Some(LocalValue::One(narrowed));
+            let interior = result_var
+                .concretetype()
+                .as_ref()
+                .and_then(array_type_id_from_interior_lltype)
+                .is_some();
+            if !interior {
+                let narrowed = self
+                    .graph
+                    .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                copy_concretetype(&result_var, &narrowed);
+                self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                    result: Some(narrowed.clone()),
+                    kind: crate::model::cast_instance_call(root, result_var.clone()),
+                });
+                self.local_var[dest_local] = Some(LocalValue::One(narrowed));
+            }
         }
         // `from_raw_parts{,_mut}` of a pointer slice returns the data
         // address. `getkind` of that raw word is `int`, while every

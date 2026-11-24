@@ -221,6 +221,7 @@ fn entries_item_ptr_gcentries_i64_gcref_items_offset_is_8() {
             &body,
             crate::HostStaticAddrs::default(),
             &jitdriver_receiver_roots,
+            None,
             &context.struct_field_attrs,
             &struct_fields,
             Default::default(),
@@ -861,6 +862,7 @@ fn enum_variant_vec_u8_payload_gets_two_field_layout_and_owner_id() {
         &std::collections::HashMap::new(),
         &std::collections::HashMap::new(),
         &std::collections::HashSet::new(),
+        &std::collections::HashMap::new(),
     );
     assert!(
         heuristic

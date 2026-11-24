@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=6
+# pyre-check: max-pypy-ratio=4.4
 # Readings 1.7x-3.9x (macOS cranelift 1.7x-2.1x, Linux 2.6x-3.3x, wasm 3.8x-3.9x,
 # Windows 2.7x-3.4x); the floor, a fourth of the ceiling, sits under the fastest.
 # Bare `raise` (RERAISE) inside a handler re-raises the exception currently

@@ -1271,18 +1271,14 @@ pub(crate) fn binary_slice_values_inner(
             };
             let s = if s < 0 { (len + s).max(0) } else { s.min(len) } as usize;
             let e = (if e < 0 { (len + e).max(0) } else { e.min(len) } as usize).max(s);
-            // `_utf8[start:end]` through `ll_stringslice_startstop`
-            // (`rstr.py`); wrap with `space.newutf8`. A whole-string slice
-            // of an exact `str` shares the operand (`unicodeobject.py`
-            // `_getitem_slice`). Take storage and index table after the last
-            // conversion — off the receiver that conversion may have moved.
+            // `_unicode_sliced`: `_utf8[start:end]` through
+            // `ll_stringslice_startstop` (`rstr.py`); wrap with
+            // `space.newutf8`. A whole-string slice shares the payload
+            // inside `ll_stringslice_startstop`, outside the JIT only, so
+            // no `start == 0` test is recorded here. Take storage and index
+            // table after the last conversion — off the receiver that
+            // conversion may have moved.
             let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
-            if s == 0
-                && e == pyre_object::w_str_len(obj)
-                && pyre_object::pyobject::is_exact_type(obj, &pyre_object::pyobject::STR_TYPE)
-            {
-                return Ok(obj);
-            }
             let start_b = pyre_object::w_str_index_to_byte(obj, s) as i64;
             let stop_b = pyre_object::w_str_index_to_byte(obj, e) as i64;
             let storage = unsafe { pyre_object::unicodeobject::w_str_storage(obj) };

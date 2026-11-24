@@ -662,8 +662,8 @@ static UNWRAP_CELL_JITCODE_INDEX: OnceLock<Option<usize>> = OnceLock::new();
 /// Cached `ALL_JITCODES` index of `w_list_setitem_inner`, resolved by name for
 /// the same reason.
 static LIST_SETITEM_JITCODE_INDEX: OnceLock<Option<usize>> = OnceLock::new();
-/// Cached `ALL_JITCODES` index of `w_list_getitem_inner`, resolved by name for
-/// the same reason.
+/// Cached `ALL_JITCODES` index of `baseobjspace::getitem_list`, resolved by
+/// graph key the way [`str_getitem_jitcode`] resolves `getitem_str`.
 static LIST_GETITEM_JITCODE_INDEX: OnceLock<Option<usize>> = OnceLock::new();
 /// Cached `ALL_JITCODES` index of `w_tuple_getitem`, resolved by graph key
 /// rather than by name -- see [`compute_pathed_jitcode_index`].
@@ -888,10 +888,14 @@ pub fn list_setitem_jitcode() -> Option<Arc<JitCode>> {
     get_jitcode_by_index(idx)
 }
 
-/// The lock-guard-free charon `w_list_getitem_inner` body in `ALL_JITCODES`.
+/// `baseobjspace::getitem_list` — `descr_getitem` after `getindex_w`.
+/// The IndexError lives in this PyResult graph (`ll_getitem` dum_checkidx);
+/// `w_list_getitem_inner` remains the unique lock-free leaf the in-range
+/// path nested-walks.
 pub fn list_getitem_jitcode() -> Option<Arc<JitCode>> {
-    let idx = (*LIST_GETITEM_JITCODE_INDEX
-        .get_or_init(|| compute_named_jitcode_index("w_list_getitem_inner")))?;
+    let idx = (*LIST_GETITEM_JITCODE_INDEX.get_or_init(|| {
+        compute_pathed_jitcode_index("pyre_interpreter::baseobjspace::getitem_list")
+    }))?;
     get_jitcode_by_index(idx)
 }
 
@@ -2644,9 +2648,9 @@ pub fn descr_spelling_gate_recheck_now() {
 /// - `JitCode` → `make_jitcode_descr` (the existing adapter the
 ///   walker's `inline_call_*` recursion exercises).
 ///
-/// `Switch` / `VableField` / `VableArray` / `VtableMethod` also get
-/// concrete trace-side descriptor adapters so the pool shape stays
-/// equivalent to `Assembler.descrs`.
+/// `Switch` / `VableField` / `VableArray` also get concrete trace-side
+/// descriptor adapters so the pool shape stays equivalent to
+/// `Assembler.descrs`.
 ///
 /// Identity (`Arc::ptr_eq`) currently matches only for the `JitCode`
 /// slot — content-derived adapters
@@ -3506,12 +3510,28 @@ pub fn decoded_ops(code: &[u8]) -> impl Iterator<Item = DecodedOp> + '_ {
     })
 }
 
+/// Listed arm targets of a `switch` op, from the SwitchDescr
+/// `bhimpl_switch` reads. `None` when the descr is missing or a listed
+/// key does not resolve — dropping an arm would report the remaining
+/// body clean.
+fn switch_resume_arm_targets(code: &[u8], op: &DecodedOp) -> Option<Vec<usize>> {
+    let descr = descr_ref_at(decoded_op_descr_index(code, op)? as usize)?;
+    let switch = descr.as_switch_descr()?;
+    switch
+        .const_keys_in_order()
+        .iter()
+        .map(|&key| switch.lookup(key))
+        .collect()
+}
+
 /// Instruction starts the blackhole can dispatch from `pc` on: the
 /// fallthrough of every instruction that does not end its block, plus every
 /// `L` label operand (`blackhole.py` `bhimpl_goto*` return the label or the
 /// next position). `catch_exception` `L` is followed like any other label.
-/// `None` when a reached instruction cannot be decoded or branches through a
-/// descr (`switch/id`), so the caller reads the whole body.
+/// A `switch` follows every listed SwitchDescr arm (`bhimpl_switch`) and
+/// the fallthrough (`KeyError`). `None` when a reached instruction cannot
+/// be decoded or a `switch` descr cannot be resolved, so the caller reads
+/// the whole body.
 pub fn reachable_starts_from(code: &[u8], pc: usize) -> Option<Vec<usize>> {
     reachable_starts_from_catch(code, pc, |_, _| true)
 }
@@ -3538,7 +3558,14 @@ pub fn reachable_starts_from_catch(
             }
             let op = decode_op_at(code, pc)?;
             if op.opname == "switch" {
-                return None;
+                // `bhimpl_switch`: `switchdict.dict[switchvalue]`, or the
+                // next instruction on `KeyError`. An unresolved table would
+                // drop arms, so the scan refuses rather than report that
+                // remaining body clean.
+                match switch_resume_arm_targets(code, &op) {
+                    Some(targets) => work.extend(targets),
+                    None => return None,
+                }
             }
             let mut cursor = pc + 1;
             if op.opname != "live" {
@@ -4703,8 +4730,7 @@ mod tests {
                 | BhDescr::Size { .. } => 0,
                 BhDescr::Switch { .. }
                 | BhDescr::VableField { .. }
-                | BhDescr::VableArray { .. }
-                | BhDescr::VtableMethod { .. } => 2,
+                | BhDescr::VableArray { .. } => 2,
             };
             assert_eq!(kind, expected, "descriptor index {i}");
         }
@@ -5894,11 +5920,7 @@ mod tests {
                 list_setitem_jitcode(),
                 "w_list_setitem_inner",
             ),
-            (
-                "list_getitem",
-                list_getitem_jitcode(),
-                "w_list_getitem_inner",
-            ),
+            ("list_getitem", list_getitem_jitcode(), "getitem_list"),
             (
                 "list_pop_end",
                 list_pop_end_jitcode(),
@@ -6531,11 +6553,6 @@ mod tests {
     /// pinned so that an opname MOVING out of this list (because the codewriter
     /// started emitting it) shows up as a test failure to be classified,
     /// instead of silently becoming a live `dispatch_step` panic.
-    ///
-    /// `vtable_method_ptr/rd>i` left the list exactly that way: routing
-    /// `dyn Trait` calls through `CallTarget::Indirect` became the default, so
-    /// the codewriter emits it and it is now registered in
-    /// `build_inline_call_only_bh_builder` instead.
     ///
     /// `new/d>r` left it the same way: lowering a rebuilt `Result` shell as an
     /// allocation, and a `#[jit_interp]` frontend's declared `struct_allocs`

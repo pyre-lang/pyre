@@ -9619,14 +9619,13 @@ impl<S: JitState> JitDriver<S> {
         let info_clone = self.meta.virtualizable_info().cloned();
         if let Some(ref info) = info_clone {
             if let Some(ptr) = state.virtualizable_heap_ptr(meta, &info.name, info) {
+                // The compiled entry's own vable (`compile.py`
+                // `execute_assembler` / `vinfo.reset_vable_token`).  The
+                // recording context's virtualizable is the trace's own vable
+                // box (`virtualizable.py` `tracing_before_residual_call` /
+                // `tracing_after_residual_call`); entering compiled code for
+                // another frame must not retarget `TraceCtx.virtualizable_heap_ptr`.
                 self.meta.set_vable_ptr(ptr.cast_const());
-                // The entry names the frame this run executes.  The exits
-                // put the caller's frame back through
-                // `restore_trace_vable_ptr`: `sync_after` for the ones that
-                // take it, the decline and finish exits directly.
-                if let Some(ctx) = self.meta.tracing.as_mut() {
-                    ctx.set_virtualizable_heap_ptr(ptr.cast_const());
-                }
             }
             // Fallback cache for layouts that cannot expose array length on
             // the heap object alone (header-less embedded arrays). Unused in
@@ -9654,11 +9653,22 @@ impl<S: JitState> JitDriver<S> {
     /// A parked outer attempt keeps its own copy and restores it here.
     fn restore_trace_vable_ptr(&mut self, saved: Option<*const u8>) {
         match saved {
-            Some(ptr) => {
-                if let Some(ctx) = self.meta.tracing.as_mut() {
-                    ctx.set_virtualizable_heap_ptr(ptr);
-                }
-                self.meta.set_vable_ptr(ptr);
+            Some(_) => {
+                // `warmstate.py execute_assembler` keeps `virtualizable` as
+                // `args[index_of_virtualizable]`, a traced local of that
+                // call. `sync_before` no longer retargets
+                // `TraceCtx.virtualizable_heap_ptr` (the recording context
+                // keeps its own vable box). A compiled entry can collect, so
+                // the snapshot taken before the entry is from-space. Re-read
+                // the owner root (`virtualizable_heap_ptr` prefers
+                // `virtualizable_heap_root`) and do not plant that snapshot.
+                let live = self
+                    .meta
+                    .tracing
+                    .as_ref()
+                    .and_then(|ctx| ctx.virtualizable_heap_ptr())
+                    .unwrap_or(std::ptr::null());
+                self.meta.set_vable_ptr(live);
             }
             None => {
                 self.meta.set_vable_ptr(std::ptr::null());

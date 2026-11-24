@@ -2617,18 +2617,6 @@ impl AssemblerEncode for Assembler {
                 let opnum = self.get_opnum(&key);
                 state.code[startposition] = opnum;
             }
-            // RPython `rpython/jit/codewriter/jtransform.py:546` emits
-            // `int_guard_value(op.args[0])` where `op.args[0]` is already a
-            // `Ptr(FuncType)` integer after rtype.  Rust `&dyn Trait` is a
-            // fat pointer so the rtyper-equivalent layer
-            // (`translator/rtyper/rclass.rs::class_get_method_ptr`) emits
-            // `OpKind::VtableMethodPtr(receiver)` with the
-            // `(trait_root, method_name)` pair; the assembler encodes it
-            // as `vtable_method_ptr/rd>i` carrying a `BhDescr::VtableMethod`.
-            // The result register is the integer function address that
-            // `int_guard_value` and the subsequent `residual_call_*`
-            // consume — backend lowering of the actual vtable slot read
-            // is not yet implemented.
             // blackhole.py `@arguments("cpu", "r", returns="i")
             // bhimpl_guard_class` — one ref register in, the class out.
             // The result bank follows the register the original read was
@@ -2659,32 +2647,6 @@ impl AssemblerEncode for Assembler {
                 );
                 argcodes.push(kc);
                 state.code.push(reg);
-                let opname = op_kind_to_opname(&op.kind);
-                let key = format!("{opname}/{argcodes}");
-                let opnum = self.get_opnum(&key);
-                state.code[startposition] = opnum;
-            }
-            OpKind::VtableMethodPtr {
-                receiver,
-                trait_root,
-                method_name,
-            } => {
-                let (reg, kc) = self.lookup_reg_with_kind_var(receiver, regallocs);
-                state.code.push(reg);
-                argcodes.push(kc);
-                let descr_idx = self.emit_ready_descr(crate::jitcode::BhDescr::VtableMethod {
-                    trait_root: trait_root.clone(),
-                    method_name: method_name.clone(),
-                });
-                state.code.push((descr_idx & 0xFF) as u8);
-                state.code.push((descr_idx >> 8) as u8);
-                argcodes.push('d');
-                if let Some(result) = op.result.as_ref() {
-                    argcodes.push('>');
-                    let (reg, kc) = self.lookup_reg_with_kind_var(result, regallocs);
-                    argcodes.push(kc);
-                    state.code.push(reg);
-                }
                 let opname = op_kind_to_opname(&op.kind);
                 let key = format!("{opname}/{argcodes}");
                 let opnum = self.get_opnum(&key);
@@ -4176,7 +4138,6 @@ impl AssemblerEncode for Assembler {
                 OpKind::GuardFalse { .. } => "GuardFalse",
                 OpKind::GuardValue { .. } => "GuardValue",
                 OpKind::GuardClass { .. } => "GuardClass",
-                OpKind::VtableMethodPtr { .. } => "VtableMethodPtr",
                 OpKind::IndirectCall { .. } => "IndirectCall",
                 OpKind::VableFieldRead { .. } => "VableFieldRead",
                 OpKind::VableFieldWrite { .. } => "VableFieldWrite",
@@ -6863,7 +6824,15 @@ fn bh_all_field_specs_for_struct_into(
                     .unwrap_or(std::mem::size_of::<usize>()),
             )
         } else {
-            type_flag_from_str(field_type_str, &cc.raw_alloc_flavor_structs)
+            let layout_size = cc
+                .struct_layout_for(field_type_str)
+                .map(|layout| layout.size)
+                .filter(|&s| s > 0);
+            super::call::get_type_flag_with_size(
+                field_type_str,
+                &cc.raw_alloc_flavor_structs,
+                layout_size,
+            )
         };
         if field_type == majit_ir::value::Type::Void || field_size == 0 {
             continue;
@@ -8046,9 +8015,6 @@ fn op_kind_to_opname(kind: &crate::model::OpKind) -> String {
         OpKind::CallMayForce { .. } => "call_may_force".into(),
         OpKind::InlineCall { .. } => "inline_call".into(),
         OpKind::RecursiveCall { .. } => "recursive_call".into(),
-        // RPython: no dedicated opname — the vtable entry becomes the `funcptr`
-        // Variable that `int_guard_value` + `residual_call_*` consume.
-        OpKind::VtableMethodPtr { .. } => "vtable_method_ptr".into(),
         OpKind::IndirectCall { .. } => "indirect_call".into(),
         // jtransform.py:901-903 — `record_quasiimmut_field(v_inst, descr, descr1)`.
         OpKind::RecordQuasiImmutField { .. } => "record_quasiimmut_field".into(),
@@ -8142,6 +8108,7 @@ pub(crate) fn host_header_layout() -> crate::call::StructLayout {
         &std::collections::HashMap::new(),
         &std::collections::HashMap::new(),
         &std::collections::HashSet::new(),
+        &std::collections::HashMap::new(),
     )
 }
 
@@ -9549,6 +9516,7 @@ mod tests {
             &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
             &std::collections::HashSet::new(),
+            &std::collections::HashMap::new(),
         );
         assert_eq!(layout.fields.len(), 1);
         assert_eq!(layout.fields[0].name, "__pos_0");

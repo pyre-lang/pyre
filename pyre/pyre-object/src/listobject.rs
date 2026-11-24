@@ -2010,6 +2010,29 @@ pub unsafe fn switch_to_correct_strategy(
     crate::gc_roots::shadow_stack_get(root_base)
 }
 
+/// Residual-call target for [`switch_to_correct_strategy`].
+///
+/// `call.py getfunctionptr(graph)` gives every jitcode a real `fnaddr`;
+/// `blackhole.py bhimpl_inline_call_*` then
+/// `cpu.bh_call_*(adr2int(jitcode.fnaddr), ...)`. The picker is crate-private,
+/// so this wrapper is the address `jit_trace_fnaddrs` publishes under that
+/// graph's path (`pyre_object::listobject::switch_to_correct_strategy`).
+///
+/// # Safety
+/// `list` must point to a valid `W_ListObject`.
+#[inline(never)]
+pub unsafe fn switch_to_correct_strategy_word(
+    list: PyObjectRef,
+    w_item: PyObjectRef,
+) -> PyObjectRef {
+    majit_ir::icf_identity!(concat!(
+        module_path!(),
+        "::",
+        "switch_to_correct_strategy_word"
+    ));
+    switch_to_correct_strategy(&mut *(list as *mut W_ListObject), w_item)
+}
+
 /// The strategy `w_list_new` picks for a given item set.
 ///
 /// `listobject.py UNROLL_CUTOFF`.
@@ -4589,7 +4612,7 @@ fn list_boxed_getitem(wrapped: PyObjectRef) -> Option<PyObjectRef> {
 }
 
 /// `#[inline(never)]` keeps a unique Charon leaf so
-/// `list_getitem_jitcode()` resolves `w_list_getitem_inner` the way
+/// `array_descr_identity` can name `w_list_getitem_inner` the way
 /// `list_setitem_jitcode()` resolves `w_list_setitem_inner`.
 #[inline(never)]
 pub unsafe fn w_list_getitem_inner(obj: PyObjectRef, index: i64) -> Option<PyObjectRef> {

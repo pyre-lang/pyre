@@ -238,6 +238,7 @@ impl HeuristicLayoutProvider {
                     &known_aligns,
                     &imm_ranks,
                     raw_alloc_flavor_structs,
+                    fields_by_struct,
                 );
                 if known_sizes.get(struct_name) != Some(&layout.size)
                     || known_aligns.get(struct_name) != Some(&layout.align)
@@ -277,6 +278,7 @@ impl LayoutProvider for HeuristicLayoutProvider {
             &self.known_struct_aligns,
             &imm_ranks,
             &self.raw_alloc_flavor_structs,
+            &self.fields_by_struct,
         ))
     }
 
@@ -301,6 +303,7 @@ impl LayoutProvider for HeuristicLayoutProvider {
             &self.known_struct_aligns,
             &imm_ranks,
             &self.raw_alloc_flavor_structs,
+            &self.fields_by_struct,
         ))
     }
 }
@@ -316,6 +319,7 @@ pub(crate) fn struct_layout_from_rows_and_exact(
     known_struct_aligns: &HashMap<String, usize>,
     immutable_field_ranks: &HashMap<String, ImmutableRank>,
     raw_alloc_flavor_structs: &HashSet<String>,
+    nested_fields: &HashMap<String, Vec<(String, String)>>,
 ) -> StructLayout {
     let mut layout = StructLayout::from_type_strings(
         rows,
@@ -324,6 +328,7 @@ pub(crate) fn struct_layout_from_rows_and_exact(
         known_struct_aligns,
         immutable_field_ranks,
         raw_alloc_flavor_structs,
+        nested_fields,
     );
     layout.apply_exact_layout(
         rows,

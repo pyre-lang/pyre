@@ -1820,8 +1820,11 @@ fn store_subscr_current_if_callback_free(
             }
             let key_text = pyre_object::unicodeobject::w_str_get_value_opt(key)?;
             return Some(
-                pyre_object::w_module_dict_getitem_str(namespace, key_text)
-                    .unwrap_or(std::ptr::null_mut()),
+                pyre_object::w_module_dict_getitem_str(
+                    namespace,
+                    pyre_object::unicodeobject::prebuilt_str_storage(key_text),
+                )
+                .unwrap_or(std::ptr::null_mut()),
             );
         }
         if pyre_object::w_dict_is_empty_strategy(namespace) {
@@ -2479,23 +2482,24 @@ pub fn fbw_foriter_inflight_take(
     let namespace_rolled_back = fbw_namespace_store_rolled_back();
     let committed_effect = body_effect || store_len != 0 || append_len != 0 || cell_store_len != 0;
     if committed_effect || namespace_rolled_back {
-        // Same cursor restore as `fbw_foriter_report_refused_header`, and only
-        // on the half that has committed nothing.  A root walk's non-commit
-        // epilogue leaves the journal in place so a delivery can push the
-        // consumed item; refusing here without putting the cursor back loses
-        // that iteration (`fbw_foriter_item_dropped`).  That is the shape the
-        // rollback was added for: a `GotoIfNotValueNotConcrete` abort on the
-        // first body opcode, whose only standing signal is a namespace binding
-        // that was itself rolled back, so re-consuming replays a body that has
-        // run to none of its stores.
-        //
-        // `committed_effect` is the opposite case and keeps drop-on-abort: an
-        // effect already stands on the live heap for this iteration, and a
-        // rewound cursor would re-run the body and double it.
-        if !committed_effect {
-            fbw_bridge_iter_journal_rollback();
+        // Delivery still refuses: a standing body effect must not also be
+        // pushed onto the header stack (that would yield the item twice).
+        // The live frame is parked at the FOR_ITER header
+        // (`fbw_exit_last_instr_rollback`), so a journaled cursor has to
+        // go back with it — `fbw_foriter_report_refused_header` already
+        // restores unconditionally. Leaving the cursor advanced here is
+        // what drops a `range()` item after BuiltinRange retired
+        // (`attr_instance_shadows_class` / `dict_hash_protocol`: one
+        // `GotoIfNotValueNotConcrete` abort, `fbw_foriter_item_dropped`).
+        // `pyjitpl.py` abort continues `interpret()` from the current
+        // opcode; FBW rewinds, and the cursor restore is that rewind's
+        // compensation. The interpreter's FOR_ITER then re-yields the
+        // restored item once. An unjournaled consume has nothing to put
+        // back, so that item stays dropped.
+        fbw_bridge_iter_journal_rollback();
+        if !stash.consume_journaled {
+            crate::trace::fbw_diag::record_foriter_item_dropped();
         }
-        crate::trace::fbw_diag::record_foriter_item_dropped();
         if let Some((code_ptr, body_pc)) = key {
             super::census_record_foriter_inflight(
                 code_ptr,
@@ -2509,8 +2513,8 @@ pub fn fbw_foriter_inflight_take(
                  body_effect={body_effect} store_journal_len={store_len} \
                  append_journal_len={append_len} unjournaled={unjournaled} \
                  namespace_rolled_back={namespace_rolled_back} \
-                 — restored the iterator cursor so resume re-consumes",
-                body_pc
+                 consume_journaled={} — cursor restored, item not delivered",
+                body_pc, stash.consume_journaled
             );
         }
         return None;
@@ -2605,6 +2609,7 @@ mod foriter_delivery_tests {
     }
 
     fn loop_frame() -> LoopFrame {
+        pyre_interpreter::test_hooks::install_hash_hook();
         let code =
             function_code("def f(xs):\n    for x in xs:\n        for y in x:\n            pass\n");
         let units = foriter_units(&code);
@@ -3791,6 +3796,13 @@ pub(crate) fn fbw_unjournaled_kinds() -> (bool, bool) {
     )
 }
 
+/// Put the unjournaled flags back to a snapshot taken before a descent
+/// whose recorded-but-unexecuted residuals the cut has just dropped.
+pub(crate) fn fbw_restore_unjournaled_kinds(kinds: (bool, bool)) {
+    FBW_UNJOURNALED_VALUE_UNAVAILABLE.with(|c| c.set(kinds.0));
+    FBW_UNJOURNALED_SYMBOLIC.with(|c| c.set(kinds.1));
+}
+
 pub(crate) fn fbw_count_executed_residual(is_void: bool, is_may_force: bool) {
     let counter = if is_void {
         &FBW_EXECUTED_RESIDUAL_VOID
@@ -3843,7 +3855,10 @@ pub(crate) fn fbw_ensure_boxed_for_ca<Sym: WalkSym>(
     };
     let _ = op_pc;
     let boxed = match ty {
-        Type::Int => crate::state::wrapint(ctx.trace_ctx, value),
+        Type::Int => {
+            assert_int_bank_box(value, "walker_box_int");
+            crate::state::wrapint(ctx.trace_ctx, value)
+        }
         Type::Float => crate::state::wrapfloat(ctx.trace_ctx, value),
         Type::Ref | Type::Void => value,
     };
@@ -3904,7 +3919,8 @@ pub(crate) fn fbw_record_top_level_frame_finished<Sym: WalkSym>(
 
 /// Shared top-level finish path for the three value-returning arms
 /// (`ref_return` / `int_return` / `float_return`).  Re-boxes `result` to
-/// `Type::Ref`, publishes the return coordinate into `last_instr`, and stashes
+/// `Type::Ref`, publishes the return coordinate into `last_instr`, forces
+/// the walker's virtualizable image onto the live portal frame, and stashes
 /// the finish payload for `full_body_walk_trace`.  Deliberately
 /// does NOT record the `FINISH` op: under the gate the compile consumer
 /// (`finish_and_compile` -> `recorder.finish`, mod.rs) records it from
@@ -3922,6 +3938,7 @@ pub(crate) fn fbw_terminate_with_finish<Sym: WalkSym>(
 ) -> Result<(OpRef, Type), DispatchError> {
     let finish_value = fbw_ensure_boxed_for_ca(ctx, op_pc, result)?;
     fbw_publish_exit_last_instr(ctx, op_pc);
+    fbw_force_virtualizable_to_live_frame(ctx);
     let payload = (finish_value, Type::Ref);
     ctx.session.borrow_mut().finish_payload = Some(payload);
     Ok(payload)
@@ -3929,7 +3946,8 @@ pub(crate) fn fbw_terminate_with_finish<Sym: WalkSym>(
 
 /// Void variant of [`fbw_terminate_with_finish`] for the top-level
 /// `void_return/` portal exit (`compile_done_with_this_frame`'s VOID
-/// branch, pyjitpl.py).  Publishes the return coordinate, then stashes a
+/// branch, pyjitpl.py).  Publishes the return coordinate, forces the
+/// walker's virtualizable image onto the live portal frame, then stashes a
 /// `Type::Void`-marked payload so
 /// [`crate::trace::full_body_walk_trace`] builds a `TraceAction::Finish`
 /// with no args (`done_with_this_frame_descr_from_types(&[])` resolves the
@@ -3942,9 +3960,62 @@ pub(crate) fn fbw_terminate_void_with_finish<Sym: WalkSym>(
     op_pc: usize,
 ) -> Result<(OpRef, Type), DispatchError> {
     fbw_publish_exit_last_instr(ctx, op_pc);
+    fbw_force_virtualizable_to_live_frame(ctx);
     let payload = (OpRef::NONE, Type::Void);
     ctx.session.borrow_mut().finish_payload = Some(payload);
     Ok(payload)
+}
+
+/// Write the walker's virtualizable image onto the live portal frame
+/// before a top-level Finish is delivered.
+///
+/// `gen_store_back_in_vable` (`pyjitpl.py`) `execute_and_record`s
+/// SETFIELD_GC / SETARRAYITEM_GC, so tracing mutates the real
+/// virtualizable before `compile_done_with_this_frame`. The walker
+/// records those ops (`TraceCtx::gen_store_back_in_vable`, cpu=None)
+/// and a standard-portal `setfield_vable_i_imm` updates
+/// `virtualizable_boxes` without `store_live_frame_static_int`.
+/// `FinishConcrete::Return` then hands `Done` without a blackhole, so
+/// `valuestackdepth` and the post-pop slots stay on the boxes.
+///
+/// `interp_jit.py` `PyFrame.dispatch` `except Yield` does
+/// `hint(self, force_virtualizable=True)` then `return w_result`;
+/// compiled FINISH and `bhimpl_ref_return` force the same way. Write
+/// the boxes onto `WalkSession::recording_frame_ptr` (the live
+/// `PyFrame` `dispatch_via_miframe` seeded).
+pub(crate) fn fbw_force_virtualizable_to_live_frame<Sym: WalkSym>(ctx: &WalkContext<'_, '_, Sym>) {
+    let frame = ctx.session.borrow().recording_frame_ptr;
+    if frame == 0 {
+        return;
+    }
+    fbw_arm_durable_frame_undo(frame);
+    // `write_boxes` declines the whole image when any slot is Void /
+    // NO_CONCRETE. A portal Finish still owes the live frame every
+    // known static Int (`valuestackdepth`, `last_instr`) and every
+    // known array item — the same fields `setfield_vable_i_imm` /
+    // `setarrayitem_vable` already hold in the boxes.
+    let Some(info) = ctx.trace_ctx.virtualizable_info() else {
+        return;
+    };
+    let static_count = info.num_static_extra_boxes;
+    for index in 0..static_count {
+        if let Some((_, Value::Int(n))) = ctx.trace_ctx.virtualizable_entry_at(index) {
+            crate::state::store_live_frame_static_int(frame, index, n);
+        }
+    }
+    let Some(len) = crate::state::concrete_frame_array_len(frame) else {
+        return;
+    };
+    for j in 0..len {
+        let Some((_, value)) = ctx.trace_ctx.virtualizable_entry_at(static_count + j) else {
+            continue;
+        };
+        match value {
+            Value::Void => {}
+            Value::Ref(gc) if gc == majit_ir::GcRef::NO_CONCRETE => {}
+            other => crate::state::store_live_frame_array_slot(frame, j, other),
+        }
+    }
 }
 
 /// Publish the exiting instruction's Python coordinate into the standard
