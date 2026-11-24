@@ -1121,11 +1121,30 @@ pub fn get_gcid_oopspec(op: &SpaceOperation) -> (String, Vec<NormalizedArg>) {
 }
 
 /// `op.args` for a lowered llop (`OpKind::LoweredBlackholeOp`).
+///
+/// `support.py get_identityhash_oopspec` / `get_gcid_oopspec` return
+/// `op.args` (Variables and Constants). A Constant maps to the
+/// `NormalizedArg` variant of that type (`ConstInt` / `ConstFloat`).
+/// `NormalizedArg` has no constant-GC-pointer arm; a Constant GCREF
+/// panics rather than being dropped (`call_arg_vars`) or inventing a
+/// variant.
 fn spaceop_args_as_normalized(op: &SpaceOperation) -> Vec<NormalizedArg> {
     match &op.kind {
-        OpKind::LoweredBlackholeOp { args, .. } => crate::model::call_arg_vars(args)
-            .into_iter()
-            .map(NormalizedArg::Pass)
+        OpKind::LoweredBlackholeOp { args, .. } => args
+            .iter()
+            .map(|arg| match arg {
+                LinkArg::Value(var) => NormalizedArg::Pass(var.clone()),
+                LinkArg::Const(c) => match &c.value {
+                    ConstValue::Int(n) => NormalizedArg::ConstInt(*n),
+                    ConstValue::Float(bits) => NormalizedArg::ConstFloat(*bits),
+                    other => panic!(
+                        "get_identityhash_oopspec/get_gcid_oopspec: NormalizedArg \
+                         has Pass/ConstInt/ConstFloat only; constant operand \
+                         {other:?} has no variant (constant GC pointer cannot \
+                         be represented)"
+                    ),
+                },
+            })
             .collect(),
         other => panic!(
             "get_identityhash_oopspec/get_gcid_oopspec: expected LoweredBlackholeOp, got {other:?}"
