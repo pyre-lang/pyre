@@ -488,6 +488,27 @@ impl<'a> Lowering<'a> {
             self.graph.set_goto(bb_id, target_bb, link_args);
             return Ok(true);
         }
+        // `null_mut()` dest `*mut ItemsBlock` is the object-item GcArray
+        // (`rlist.py` `FixedSizeListRepr` / `ll_fixed_items`). Residual
+        // `ptr_null_constant` of that root is a classdef-less Instance
+        // (`getuniqueclassdef_for_struct_root` refuses ItemsBlock). Recast
+        // onto the pointee the way the Utf8Str dest recast recasts onto
+        // SomeString; `cast_instance_intrinsic` projects it as `SomeList`
+        // (`project_cast_root`). Family union is `SomeList ∪ SomeList`,
+        // not `Instance(classdef-less) ∪ List`. `rlist.py`
+        // `AbstractBaseListRepr.convert_const(None)` is `null_const()` /
+        // `BaseListRepr.null_const` `nullptr(self.LIST)`; `model.py`
+        // `SomeList.noneify` is the list itself. Takes precedence over
+        // the spelled-GC tail (`push_null_gc_ptr_with_spelling`).
+        if let Some(cast) = self.object_items_list_ptr_null_cast(&call.dest.ty) {
+            let bb_id = self.emit_bb(mir_bb);
+            let res = self.graph.push_niche_null(bb_id, Some(&cast));
+            self.local_var[dest_local] = Some(LocalValue::One(res));
+            let target_bb = self.block_id[target];
+            let link_args = self.edge_args(mir_bb, target)?;
+            self.graph.set_goto(bb_id, target_bb, link_args);
+            return Ok(true);
+        }
         if let Some(spelling) = self.raw_adt_ptr_null_spelling(&call.dest.ty) {
             let bb_id = self.emit_bb(mir_bb);
             let res = self
@@ -594,6 +615,35 @@ impl<'a> Lowering<'a> {
         let link_args = self.edge_args(mir_bb, target)?;
         self.graph.set_goto(bb_id, target_bb, link_args);
         Ok(true)
+    }
+
+    /// Dest-list restore of `null_mut()` / `null()` whose dest is a raw
+    /// pointer to the object-items GcArray (`ItemsBlock`). Residual
+    /// `core::ptr::null_mut` annotates classdef-less `SomeInstance`
+    /// (`ptr_null_constant`); the live items arm is `SomeList` after
+    /// `project_cast_root` of that block. Their return merge is
+    /// `List ∪ Instance(classdef-less)`.
+    ///
+    /// RPython: `lltype.nullptr(GcArray(OBJECTPTR))` unions as
+    /// `unionof(SomeList, s_None)` → `SomeList` (`annmodel.SomeList.noneify`,
+    /// `rlist.py` `AbstractBaseListRepr.convert_const(None)` /
+    /// `BaseListRepr.null_const`). Same dest recast
+    /// [`FunctionGraph::push_niche_null`] already applies to a list-value
+    /// Option None (`option_niche_null_cast`). A scalar
+    /// `TypedItemsBlock` stays on [`Self::try_lower_gcarray_ptr_null`].
+    pub(in crate::front::mir) fn object_items_list_ptr_null_cast(
+        &self,
+        dest_ty: &TyRef,
+    ) -> Option<(String, ValueType)> {
+        if self.tyref_is_scalar_flexible_gcarray(dest_ty) {
+            return None;
+        }
+        if !tyref_is_raw_pointer(dest_ty, self.llbc) {
+            return None;
+        }
+        let root = tyref_class_root_with(dest_ty, self.llbc, self.tombstoned_leaves)?;
+        majit_ir::descr::is_object_gcarray_items_block(&root)
+            .then_some((root.clone(), ValueType::Ref(Some(root))))
     }
 
     /// `core::ptr::null_mut` / `null` whose dest is a declared two-field
