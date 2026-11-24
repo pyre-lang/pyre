@@ -9816,10 +9816,14 @@ fn capture_builtin_wrapper_call_site<Sym: WalkSym>(
     })
 }
 
-/// Live `PyObjectRef`s for a wrapper `&[PyObjectRef]`. `Null` is `PY_NULL`.
-/// A missing shadow declines the executed allocation and leaves the array
-/// virtual, which is enough for a body that only `getarrayitem`s.
-fn wrapper_args_item_pointers<Sym: WalkSym>(
+/// Live `PyObjectRef`s for a wrapper `&[PyObjectRef]`.
+///
+/// `ConcreteValue::Null` is the walker's unknown sentinel (`state.rs`),
+/// not an executed NULL: decline so `emit_wrapper_args_array` leaves the
+/// array virtual. A known pointer, including `PY_NULL`, is `Ref`.
+/// `execute_and_record_varargs` (`pyjitpl.py`) executes with the actual
+/// argument-box values.
+pub(crate) fn wrapper_args_item_pointers<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     wrapper_items: &[OpRef],
     wrapper_item_concretes: &[ConcreteValue],
@@ -9834,8 +9838,7 @@ fn wrapper_args_item_pointers<Sym: WalkSym>(
             continue;
         }
         match *concrete {
-            ConcreteValue::Ref(value) if !value.is_null() => items.push(value),
-            ConcreteValue::Null => items.push(pyre_object::PY_NULL),
+            ConcreteValue::Ref(value) => items.push(value),
             _ => return None,
         }
     }
@@ -25816,11 +25819,21 @@ pub(crate) fn insert_paused_driver_helper_parents<Sym: WalkSym>(
     parents: &mut Vec<InlineParentFrame>,
 ) {
     let extras = collect_paused_driver_helper_parents(ctx);
+    merge_paused_driver_helper_parents(parents, extras);
+}
+
+/// Merge parked driver helper sections by `WalkFrameState::ptr_eq`.
+///
+/// `_ensure_parent_resumedata` (`opencoder.py`) / `newframe` (`pyjitpl.py`)
+/// keep every framestack `MIFrame`. Two extras that share a helper jitcode
+/// are recursive activations; a copy of one activation already listed is
+/// the parked prefix `recursive_portal_inline_parents` also recorded.
+pub(crate) fn merge_paused_driver_helper_parents(
+    parents: &mut Vec<InlineParentFrame>,
+    extras: Vec<InlineParentFrame>,
+) {
     for extra in extras.into_iter().rev() {
-        if parents
-            .iter()
-            .any(|parent| parent.jitcode_index == extra.jitcode_index)
-        {
+        if parents.iter().any(|parent| parent.same_activation(&extra)) {
             continue;
         }
         let insert_at = parents
@@ -26674,8 +26687,11 @@ fn recursive_portal_inline_parents<Sym: WalkSym>(
             }
         }
         insert_paused_driver_helper_parents(ctx, &mut parents);
-        let helper_index = helper.jitcode_index;
-        parents.retain(|parent| parent.jitcode_index != helper_index);
+        // The current helper is a new `MIFrame` (`pyjitpl.py` `newframe` /
+        // `perform_call`). Drop only a second listing of this activation,
+        // not an outer recursive frame that happens to share the jitcode
+        // (`opencoder.py` `_ensure_parent_resumedata`).
+        parents.retain(|parent| !parent.same_activation(&helper));
         parents.push(helper);
         return parents;
     }

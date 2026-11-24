@@ -203,8 +203,10 @@ pub fn binary_value(
     let symbol = operator_symbol(op);
     use crate::objspace::descroperation as desc;
     match op {
-        BinaryOperator::Add | BinaryOperator::InplaceAdd => desc::add_impl(a, b, symbol),
-        BinaryOperator::Subtract | BinaryOperator::InplaceSubtract => desc::sub_impl(a, b, symbol),
+        BinaryOperator::Add => desc::add_impl(a, b),
+        BinaryOperator::InplaceAdd => desc::iadd_impl(a, b),
+        BinaryOperator::Subtract => desc::sub_impl(a, b),
+        BinaryOperator::InplaceSubtract => desc::isub_impl(a, b),
         BinaryOperator::Multiply | BinaryOperator::InplaceMultiply => desc::mul_impl(a, b, symbol),
         BinaryOperator::FloorDivide | BinaryOperator::InplaceFloorDivide => {
             desc::floordiv_impl(a, b, symbol)
@@ -1460,6 +1462,51 @@ pub extern "C" fn jit_descroperation_invert(value: PyObjectRef) -> PyObjectRef {
 #[inline(never)]
 pub extern "C" fn jit_descroperation_pos(value: PyObjectRef) -> PyObjectRef {
     jit_unary_positive_value(value)
+}
+
+/// One-word C-ABI for a two-Ref descroperation graph (`call.py get_jitcode`
+/// / `getfunctionptr`; blackhole `bhimpl_inline_call_r_r`). The source
+/// graph returns `PyResult` (sret), so the address blackhole jumps to is
+/// this wrapper rather than the graph function.
+#[inline(always)]
+fn jit_descroperation_rr(
+    a: PyObjectRef,
+    b: PyObjectRef,
+    op: fn(PyObjectRef, PyObjectRef) -> crate::PyResult,
+) -> PyObjectRef {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(&[a, b]);
+    let a = pyre_object::gc_roots::shadow_stack_get(base);
+    let b = pyre_object::gc_roots::shadow_stack_get(base + 1);
+    match op(a, b) {
+        Ok(value) => value,
+        Err(err) => crate::runtime_ops::jit_publish_residual_error_ref(err),
+    }
+}
+
+#[inline(never)]
+pub extern "C" fn jit_descroperation_sub(a: PyObjectRef, b: PyObjectRef) -> PyObjectRef {
+    jit_descroperation_rr(a, b, crate::objspace::descroperation::sub)
+}
+
+#[inline(never)]
+pub extern "C" fn jit_descroperation_sub_impl(a: PyObjectRef, b: PyObjectRef) -> PyObjectRef {
+    jit_descroperation_rr(a, b, crate::objspace::descroperation::sub_impl)
+}
+
+#[inline(never)]
+pub extern "C" fn jit_descroperation_add(a: PyObjectRef, b: PyObjectRef) -> PyObjectRef {
+    jit_descroperation_rr(a, b, crate::objspace::descroperation::add)
+}
+
+#[inline(never)]
+pub extern "C" fn jit_descroperation_add_impl(a: PyObjectRef, b: PyObjectRef) -> PyObjectRef {
+    jit_descroperation_rr(a, b, crate::objspace::descroperation::add_impl)
+}
+
+#[inline(never)]
+pub extern "C" fn jit_descroperation_floordiv(a: PyObjectRef, b: PyObjectRef) -> PyObjectRef {
+    jit_descroperation_rr(a, b, crate::objspace::descroperation::floordiv)
 }
 
 #[inline(never)]

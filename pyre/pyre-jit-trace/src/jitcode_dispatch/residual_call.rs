@@ -622,9 +622,8 @@ impl MirrorStackImage {
 /// One FBW abort frame: jitcode/pc on the MIFrame, typed `setarg_*` words
 /// on the banks. `_copy_data_from_miframe` (`blackhole.py`) reads
 /// `box.getint()` / `getref_base()` / `getfloatstorage()`; these banks
-/// are those raw words when a colour has a concrete. A virtual/symbolic
-/// box stays in the MIFrame register and is materialized when the
-/// blackhole/resume image is built.
+/// are those raw words. A colour with a box but no recoverable concrete
+/// refuses the image: an unstamped FrontendOp's `getint` is 0.
 pub(crate) struct AbortHandoffFrame {
     pub(crate) miframe: majit_metainterp::MIFrame,
     pub(crate) banks: majit_metainterp::BlackholeAbortBanks,
@@ -828,11 +827,10 @@ pub(crate) fn publish_latched_abort_framestack(ctx: &mut majit_metainterp::Trace
         raising_exception: image.raising_exception,
     });
     for frame in image.framestack.frames.iter_mut() {
-        // A live colour with no bank word is the virtual box
-        // `fill_abort_miframe_register_banks` kept. Stamp `box_bits` onto
-        // Const boxes so `_copy_data_from_miframe` / `getref_base` read the
-        // word after the recorder is dropped, the same freeze
-        // `abort_trace` applies to a guard's resume image.
+        // Stamp `box_bits` onto Const boxes so `_copy_data_from_miframe` /
+        // `getref_base` (`blackhole.py`) read the word after the recorder
+        // is dropped, the same freeze `abort_trace` applies to a guard's
+        // resume image.
         frame.freeze_values_into_const_boxes(ctx);
     }
     ctx.aborted_framestack = Some(image.framestack);
@@ -1380,11 +1378,10 @@ fn build_paused_portal_miframe<Sym: WalkSym>(
         crate::state::pyjitcode_for_jitcode_index(index)
             .and_then(|pjc| parent_call_result_color(&pjc, pc))
     });
-    let mut miframe = mint_abort_handoff_miframe(jitcode, resume_pc);
+    let miframe = mint_abort_handoff_miframe(jitcode, resume_pc);
     let mut banks = majit_metainterp::BlackholeAbortBanks::sized_for(&miframe);
     fill_abort_miframe_register_banks(
         ctx.trace_ctx,
-        &mut miframe,
         &mut banks,
         &paused.registers_i,
         &paused.registers_r,
@@ -1447,11 +1444,10 @@ pub(crate) fn build_helper_parent_miframe(
     if !instruction_starts_at(&jitcode, resume_pc) {
         return None;
     }
-    let mut miframe = mint_abort_handoff_miframe(jitcode, resume_pc);
+    let miframe = mint_abort_handoff_miframe(jitcode, resume_pc);
     let mut banks = majit_metainterp::BlackholeAbortBanks::sized_for(&miframe);
     fill_abort_miframe_register_banks(
         trace_ctx,
-        &mut miframe,
         &mut banks,
         registers_i,
         registers_r,
@@ -2504,9 +2500,9 @@ pub(crate) fn build_trace_too_long_single_frame_miframe<Sym: WalkSym>(
         }
         return None;
     }
-    let mut miframe = mint_abort_handoff_miframe(jitcode, resume_pc);
+    let miframe = mint_abort_handoff_miframe(jitcode, resume_pc);
     let mut banks = majit_metainterp::BlackholeAbortBanks::sized_for(&miframe);
-    fill_trace_too_long_register_banks(ctx, &mut miframe, &mut banks)
+    fill_trace_too_long_register_banks(ctx, &mut banks)
         .then_some(AbortHandoffFrame { miframe, banks })
 }
 
@@ -2550,16 +2546,14 @@ fn instruction_starts_at(jitcode: &majit_metainterp::jitcode::JitCode, pc: usize
 /// colour with no box is not copied: that is how a dead colour kept an
 /// already-materialized `W_ListObject` in the slot `newlist_from_array`
 /// reads as an array length. A colour that has a box but no concrete
-/// keeps that box on the MIFrame; the blackhole/resume image materializes
-/// it the same way a guard's resume data carries virtuals.
+/// refuses the frame (`blackhole.py` `_copy_data_from_miframe` copies
+/// `box.getint()` / `getref_base()` / `getfloatstorage()`).
 fn fill_trace_too_long_register_banks<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
-    miframe: &mut majit_metainterp::MIFrame,
     banks: &mut majit_metainterp::BlackholeAbortBanks,
 ) -> bool {
     fill_abort_miframe_register_banks(
         ctx.trace_ctx,
-        miframe,
         banks,
         ctx.registers_i,
         ctx.registers_r,
@@ -2570,20 +2564,18 @@ fn fill_trace_too_long_register_banks<Sym: WalkSym>(
     )
 }
 
-/// Seed the abort MIFrame from the walker's boxes.
+/// Seed the abort banks from the walker's boxes.
 ///
 /// Walk `0..bank len` for every colour that still holds a box
 /// (`_copy_data_from_miframe` walks `range(num_regs_i/r/f())`).
 /// `skip_result` is the dest of a CALL this paused parent sits on:
 /// `_setup_return_value_*` writes that color when the callee finishes.
-/// A colour with a box but no concrete stays that box on the MIFrame;
-/// `freeze_values_into_const_boxes` / `copy_data_from_abort_banks`
-/// materialize `getint` / `getref_base` / `getfloatstorage` when the
-/// blackhole/resume image is built (`capture_resumedata` carries
-/// virtuals the same way).
-fn fill_abort_miframe_register_banks(
+/// A colour with a box but no recoverable concrete refuses the image:
+/// `_copy_data_from_miframe` (`blackhole.py`) copies `box.getint()` /
+/// `getref_base()` / `getfloatstorage()`, and an unstamped FrontendOp
+/// reads as 0 / NULL / 0.0.
+pub(crate) fn fill_abort_miframe_register_banks(
     trace_ctx: &TraceCtx,
-    miframe: &mut majit_metainterp::MIFrame,
     banks: &mut majit_metainterp::BlackholeAbortBanks,
     registers_i: &RegisterBank,
     registers_r: &RegisterBank,
@@ -2599,13 +2591,6 @@ fn fill_abort_miframe_register_banks(
         ($($a:tt)*) => {
             if fbw_debug_abort_enabled() {
                 eprintln!("[s2-fill-decline] {}", format!($($a)*));
-            }
-        };
-    }
-    macro_rules! s2keep {
-        ($($a:tt)*) => {
-            if fbw_debug_abort_enabled() {
-                eprintln!("[s2-fill-virtual] {}", format!($($a)*));
             }
         };
     }
@@ -2632,18 +2617,11 @@ fn fill_abort_miframe_register_banks(
             banks.registers_i[color] = Some(value);
             continue;
         }
-        if let Some(majit_ir::Value::Int(value)) = trace_ctx.concrete_of_opref(opref) {
-            banks.registers_i[color] = Some(value);
-            continue;
-        }
-        s2keep!(
-            "int color={color} opref={opref:?} opcode={:?}",
-            trace_ctx.opcode_of(opref)
-        );
-        if !keep_virtual_abort_box(&mut miframe.int_regs, color, opref) {
-            s2dbg!("int color={color} opref={opref:?} virtual slot missing");
+        let Some(majit_ir::Value::Int(value)) = trace_ctx.concrete_of_opref(opref) else {
+            s2dbg!("int color={color} opref={opref:?} has no concrete");
             return false;
-        }
+        };
+        banks.registers_i[color] = Some(value);
     }
 
     for color in 0..banks.registers_r.len() {
@@ -2684,14 +2662,8 @@ fn fill_abort_miframe_register_banks(
             let live = pin.as_ref().map_or(value as usize, |p| p.get().0);
             banks.registers_r[color] = Some(live as i64);
         } else {
-            s2keep!(
-                "ref color={color} opref={opref:?} opcode={:?}",
-                trace_ctx.opcode_of(opref)
-            );
-            if !keep_virtual_abort_box(&mut miframe.ref_regs, color, opref) {
-                s2dbg!("ref color={color} opref={opref:?} virtual slot missing");
-                return false;
-            }
+            s2dbg!("ref color={color} opref={opref:?} has no concrete");
+            return false;
         }
     }
 
@@ -2708,31 +2680,12 @@ fn fill_abort_miframe_register_banks(
         if opref == OpRef::NONE {
             continue;
         }
-        if let Some(majit_ir::Value::Float(value)) = trace_ctx.concrete_of_opref(opref) {
-            banks.registers_f[color] = Some(value.to_bits() as i64);
-            continue;
-        }
-        s2keep!(
-            "float color={color} opref={opref:?} opcode={:?}",
-            trace_ctx.opcode_of(opref)
-        );
-        if !keep_virtual_abort_box(&mut miframe.float_regs, color, opref) {
-            s2dbg!("float color={color} opref={opref:?} virtual slot missing");
+        let Some(majit_ir::Value::Float(value)) = trace_ctx.concrete_of_opref(opref) else {
+            s2dbg!("float color={color} opref={opref:?} has no concrete");
             return false;
-        }
+        };
+        banks.registers_f[color] = Some(value.to_bits() as i64);
     }
-    true
-}
-
-/// Park a virtual/symbolic box on the abort MIFrame.
-///
-/// `_copy_data_from_miframe` copies every non-None box; `getint` /
-/// `getref_base` / `getfloatstorage` on an unstamped FrontendOp is 0.
-fn keep_virtual_abort_box(regs: &mut [Option<OpRef>], color: usize, opref: OpRef) -> bool {
-    let Some(slot) = regs.get_mut(color) else {
-        return false;
-    };
-    *slot = Some(opref);
     true
 }
 
@@ -3445,11 +3398,10 @@ fn build_parent_miframe_from_live_banks<Sym: WalkSym>(
     let result = parent
         .call_jitcode_pc
         .and_then(|pc| parent_call_result_color(pjc, pc));
-    let mut miframe = mint_abort_handoff_miframe(pjc.jitcode.clone(), resume_pc);
+    let miframe = mint_abort_handoff_miframe(pjc.jitcode.clone(), resume_pc);
     let mut banks = majit_metainterp::BlackholeAbortBanks::sized_for(&miframe);
     if !fill_abort_miframe_register_banks(
         ctx.trace_ctx,
-        &mut miframe,
         &mut banks,
         registers_i,
         registers_r,
@@ -8022,9 +7974,11 @@ pub(crate) fn do_not_in_trace_call_result<Sym: WalkSym>(
 /// through to the may-force residual, which is the non-standard vref path
 /// `optimize_jit_force_virtual` later folds when the box is a trace Virtual.
 ///
-/// A NULL / `vref_None` argument is `virtualref.py force_virtual_if_necessary`'s
-/// `if not inst: return inst`: the result is a known-null box, not a residual
-/// whose reconstruct later compiled `GUARD_CLASS`.
+/// A NULL / `vref_None` argument is not a recording-time fold:
+/// `_do_jit_force_virtual` still `PTR_EQ`s against `standard_box` and
+/// `implement_guard_value`s that result. `virtualref.py`
+/// `force_virtual_if_necessary` tests `if not inst: return inst` at
+/// execution of the residual helper.
 ///
 /// Missing concrete pointers for the `PTR_EQ` still fail loud: recording
 /// `CALL_MAY_FORCE_*` while PyPy would have returned `standard_box` is
@@ -8083,16 +8037,6 @@ pub(crate) fn walker_do_jit_force_virtual<Sym: WalkSym>(
         .trace_ctx
         .box_bits(vref_box)
         .filter(|&bits| !unresolved(bits));
-    // `virtualref.py force_virtual_if_necessary`: `if not inst: return inst`.
-    // `_do_jit_force_virtual` still PTR_EQ's a non-null non-standard box.
-    // A NULL / `vref_None` argument is that first line: the result is a
-    // known-null box so a later `GUARD_CLASS` does not compile a class
-    // load through the residual's reconstruct of this oopspec.
-    if vref_concrete == Some(0) {
-        let null = ctx.trace_ctx.const_null();
-        write_residual_call_result_to_dst(ctx, pc, dst, dst_bank, null)?;
-        return Ok(Some(DispatchOutcome::Continue));
-    }
     let standard_concrete = ctx
         .trace_ctx
         .box_bits(standard_box)
@@ -14464,7 +14408,7 @@ mod tests {
             "the fixture needs a live colour and a dead colour"
         );
 
-        let mut miframe = majit_metainterp::MIFrame::new(jitcode, 0);
+        let miframe = majit_metainterp::MIFrame::new(jitcode, 0);
         let mut banks = majit_metainterp::BlackholeAbortBanks::sized_for(&miframe);
         let live_box = OpRef::input_arg_ref(0);
         let live_ptr = pyre_object::w_none() as usize;
@@ -14483,7 +14427,6 @@ mod tests {
         assert!(
             fill_abort_miframe_register_banks(
                 &tc,
-                &mut miframe,
                 &mut banks,
                 &regs_i,
                 &regs_r,
@@ -14500,24 +14443,20 @@ mod tests {
             banks.registers_r[1].is_none(),
             "a non-live Ref colour with a stale concrete must stay unset"
         );
-        assert!(
-            miframe.ref_regs[0].is_none(),
-            "a concrete colour lives on the bank, not as a virtual MIFrame box"
-        );
     }
 
-    /// A live colour whose box has no concrete stays that box on the
-    /// MIFrame. `_copy_data_from_miframe` copies every non-None box;
-    /// declining the whole frame is not a missing-concrete path.
+    /// A live colour whose box has no recoverable concrete refuses the
+    /// image. `_copy_data_from_miframe` (`blackhole.py`) copies
+    /// `box.getref_base()`; an unstamped FrontendOp reads as NULL.
     #[test]
-    fn fill_abort_miframe_keeps_a_virtual_ref_box() {
+    fn fill_abort_miframe_refuses_a_virtual_ref_box() {
         pyre_interpreter::module::thread::ensure_runtime_thread();
         let mut builder = majit_metainterp::JitCodeBuilder::new();
         builder.load_const_r_value(0, 0);
         let jitcode = std::sync::Arc::new(builder.finish());
         assert!(jitcode.num_regs_r() >= 1, "the fixture needs a live colour");
 
-        let mut miframe = majit_metainterp::MIFrame::new(jitcode, 0);
+        let miframe = majit_metainterp::MIFrame::new(jitcode, 0);
         let mut banks = majit_metainterp::BlackholeAbortBanks::sized_for(&miframe);
         let live_box = OpRef::input_arg_ref(0);
         let regs_r = RegisterBank::new([live_box]);
@@ -14526,9 +14465,8 @@ mod tests {
         let tc = TraceCtx::for_test_types(&[Type::Ref]);
         let frame_state = WalkFrameState::new(WalkFrameStateData::default());
         assert!(
-            fill_abort_miframe_register_banks(
+            !fill_abort_miframe_register_banks(
                 &tc,
-                &mut miframe,
                 &mut banks,
                 &regs_i,
                 &regs_r,
@@ -14537,16 +14475,11 @@ mod tests {
                 &frame_state,
                 None,
             ),
-            "a virtual live colour must still yield an image"
+            "a live colour with no recoverable concrete must refuse the image"
         );
         assert!(
             banks.registers_r[0].is_none(),
-            "a virtual colour has no concrete bank word"
-        );
-        assert_eq!(
-            miframe.ref_regs[0],
-            Some(live_box),
-            "the virtual box stays on the MIFrame"
+            "a refused colour must not leave a zeroed bank word"
         );
     }
 

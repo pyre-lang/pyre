@@ -377,10 +377,13 @@ impl Drop for CaptureScratch<'_> {
 /// chain this level recorded at enter: Python-to-Python stores the
 /// immediate caller, a helper-reached portal copies the parked driver
 /// helpers (`recursive_portal_inline_parents`). Concatenating every list
-/// duplicates that helper prefix, so a guard inside `__index__` from
-/// `range(...)` rebuilt `w_range_new_stop` / `range_index_bound` /
-/// `space_index` twice (`blackhole.py` `convert_and_run_from_pyjitpl`).
-fn framestack_resume_parent_frames(framestack: &[InlineFrame]) -> Vec<InlineParentFrame> {
+/// lists those parked helpers twice; identity is the live `WalkFrameState`
+/// Rc (`InlineParentFrame::same_activation` / `MetaInterp.newframe`), so a
+/// helper that recurses through itself still occupies two sections
+/// (`blackhole.py` `convert_and_run_from_pyjitpl`).
+pub(crate) fn framestack_resume_parent_frames(
+    framestack: &[InlineFrame],
+) -> Vec<InlineParentFrame> {
     let mut chain = Vec::new();
     for frame in framestack {
         extend_resume_parent_chain(&mut chain, &frame.parents);
@@ -389,35 +392,12 @@ fn framestack_resume_parent_frames(framestack: &[InlineFrame]) -> Vec<InlinePare
 }
 
 fn extend_resume_parent_chain(chain: &mut Vec<InlineParentFrame>, parents: &[InlineParentFrame]) {
-    if parents.is_empty() {
-        return;
-    }
-    let mut overlap = 0;
-    let max = chain.len().min(parents.len());
-    for candidate in (1..=max).rev() {
-        if chain[chain.len() - candidate..]
-            .iter()
-            .zip(&parents[..candidate])
-            .all(|(a, b)| same_paused_helper_parent(a, b))
-        {
-            overlap = candidate;
-            break;
+    for parent in parents {
+        if chain.iter().any(|listed| listed.same_activation(parent)) {
+            continue;
         }
+        chain.push(parent.clone());
     }
-    chain.extend(parents[overlap..].iter().cloned());
-}
-
-/// Cloned helper prefix, not a second Python `MIFrame`.
-///
-/// A helper-reached portal copies the parked driver helpers
-/// (`recursive_portal_inline_parents`); concatenating every
-/// `InlineFrame.parents` list duplicates that prefix. Those clones share a
-/// helper jitcode. Python frames of the same jitcode are distinct recursive
-/// `MIFrame`s (`pyjitpl.py` `newframe` / `perform_call`);
-/// `_ensure_parent_resumedata` (`opencoder.py`) numbers each once.
-fn same_paused_helper_parent(a: &InlineParentFrame, b: &InlineParentFrame) -> bool {
-    a.jitcode_index == b.jitcode_index
-        && crate::state::jitcode_is_transparent_helper(a.jitcode_index as i32)
 }
 
 fn fill_vable_vref_into(

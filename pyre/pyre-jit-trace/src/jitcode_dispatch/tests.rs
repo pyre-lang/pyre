@@ -2234,6 +2234,82 @@ fn list_type_call_resume_levels_do_not_reach_a_blocker() {
     );
 }
 
+/// `descroperation.py _make_binop_impl` / `call.py get_jitcode` store
+/// `getfunctionptr` so `blackhole.py bhimpl_inline_call_r_r` native-calls
+/// the helper. The not-taken arm of `sub`'s `is_not_implemented`
+/// `goto_if_not` is `sub_impl`; remaining from that live marker must not
+/// fold `sub_impl`'s body blockers.
+#[test]
+fn sub_not_implemented_resume_does_not_reach_a_blocker() {
+    fn assert_callable(name: &str) {
+        let jc = crate::jitcode_runtime::named_jitcode(name)
+            .unwrap_or_else(|| panic!("{name} must be a discovered jitcode"));
+        assert!(
+            majit_jitcode::codewriter::call::is_callable_fnaddr(jc.fnaddr),
+            "{name} JitCode.fnaddr must be callable for bhimpl_inline_call_r_r"
+        );
+    }
+    assert_callable("sub");
+    assert_callable("sub_impl");
+    assert_callable("add");
+    assert_callable("add_impl");
+    assert_callable("floordiv");
+
+    let sub = crate::jitcode_runtime::named_jitcode("sub").expect("sub");
+    let ops: Vec<_> = crate::jitcode_runtime::decoded_ops(&sub.code).collect();
+    let not_impl = ops
+        .iter()
+        .find(|op| inline_call_callee_name(&sub.code, op) == Some("is_not_implemented"))
+        .expect("sub inline_call of is_not_implemented");
+    let resume_pc = ops
+        .iter()
+        .find(|op| op.opname == "live" && op.pc > not_impl.pc)
+        .map(|op| op.pc)
+        .expect("live marker after is_not_implemented");
+    assert!(
+        !super::inline_call::helper_resume_reaches_blocker(sub.index(), resume_pc, None),
+        "sub resume at the live marker after is_not_implemented must not reach a blocker"
+    );
+
+    let crl = crate::jitcode_runtime::named_jitcode("compute_range_length")
+        .or_else(|| {
+            crate::jitcode_runtime::pathed_jitcode(
+                "pyre_interpreter::builtins::compute_range_length",
+            )
+        })
+        .expect("compute_range_length");
+    let crl_ops: Vec<_> = crate::jitcode_runtime::decoded_ops(&crl.code).collect();
+    let first_sub = crl_ops
+        .iter()
+        .find(|op| inline_call_callee_name(&crl.code, op) == Some("sub"))
+        .expect("compute_range_length inline_call of sub");
+    let after_sub = crl_ops
+        .iter()
+        .find(|op| op.opname == "live" && op.pc > first_sub.pc)
+        .map(|op| op.pc)
+        .expect("live marker after first sub");
+    assert!(
+        !super::inline_call::helper_resume_reaches_blocker(crl.index(), after_sub, None),
+        "compute_range_length remaining after sub must not reach a blocker"
+    );
+
+    let add = crate::jitcode_runtime::named_jitcode("add").expect("add");
+    let add_ops: Vec<_> = crate::jitcode_runtime::decoded_ops(&add.code).collect();
+    let shortcut_add = add_ops
+        .iter()
+        .find(|op| inline_call_callee_name(&add.code, op) == Some("shortcut_add"))
+        .expect("add inline_call of shortcut_add");
+    let after_shortcut = add_ops
+        .iter()
+        .find(|op| op.opname == "live" && op.pc > shortcut_add.pc)
+        .map(|op| op.pc)
+        .expect("live marker after shortcut_add");
+    assert!(
+        !super::inline_call::helper_resume_reaches_blocker(add.index(), after_shortcut, None),
+        "add remaining after shortcut_add must not fold add_impl body blockers"
+    );
+}
+
 /// Resume does not treat a residual whose funcbox register is a runtime-only
 /// unknown as a blocker: `ResumeDataDirectReader.consume_one_section`
 /// restores it. Whole-body admission already agreed.
@@ -21309,11 +21385,12 @@ fn jit_force_virtual_known_nonstandard_records_no_ptr_eq() {
 }
 
 #[test]
-fn jit_force_virtual_null_non_vref_returns_the_null_box() {
-    // `virtualref.py force_virtual_if_necessary`: a non-vref (NULL /
-    // `vref_None`) is returned unchanged. `_do_jit_force_virtual` answers
-    // with that known-null box so a later `GUARD_CLASS` does not compile
-    // a class load through a residual reconstruct.
+fn jit_force_virtual_const_null_falls_through_to_residual() {
+    // `pyjitpl.py _do_jit_force_virtual`: a NULL / `vref_None` argument is
+    // not the standard virtualizable, so the recording path still
+    // `PTR_EQ`s against `standard_box` and returns None. The residual
+    // helper `virtualref.py force_virtual_if_necessary` tests
+    // `if not inst: return inst` at execution.
     let mut tc = fresh_trace_ctx();
     let mut vable_buf = vec![0u8; 65536];
     bind_fake_vable(&mut tc, &mut vable_buf);
@@ -21364,18 +21441,188 @@ fn jit_force_virtual_null_non_vref_returns_the_null_box() {
         .expect("call descr")
         .get_extra_info();
     let allboxes = vec![func, vref];
+    let outcome = walker_do_jit_force_virtual(&mut wc, ei, &allboxes, 0, 'r', 0)
+        .expect("NULL non-standard is a fall-through, not an error");
+    assert_eq!(
+        outcome, None,
+        "const NULL is not standard_box; residual force_virtual_if_necessary runs"
+    );
+}
+
+#[test]
+fn jit_force_virtual_live_null_does_not_fold_to_const_null() {
+    // A live box whose current concrete is zero is not a Const. Folding
+    // it to `const_null()` without `PTR_EQ` / `implement_guard_value`
+    // (`pyjitpl.py` `_do_jit_force_virtual`) would compile an
+    // unconditional NULL. The residual helper tests NULL at execution
+    // (`virtualref.py` `force_virtual_if_necessary`).
+    let mut tc = fresh_trace_ctx();
+    let mut vable_buf = vec![0u8; 65536];
+    bind_fake_vable(&mut tc, &mut vable_buf);
+    let standard = tc
+        .standard_virtualizable_box()
+        .expect("bind_fake_vable seeds virtualizable_boxes[-1]");
+    let func = tc.const_int(0);
+    let vref = OpRef::input_arg_ref(0);
+    tc.set_opref_concrete(vref, majit_ir::Value::Ref(majit_ir::GcRef(0)));
+    assert!(!vref.is_constant());
+    assert_ne!(vref, standard);
+    let regs_r = [vref, tc.const_null(), tc.const_null(), tc.const_null()];
+    let regs_i = [func];
+    let force_virtual_descr = call_descr_with_oopspec(
+        42,
+        majit_ir::ExtraEffect::ForcesVirtualOrVirtualizable,
+        majit_ir::OopSpecIndex::JitForceVirtual,
+    );
+    let descr_pool = vec![force_virtual_descr.clone()];
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let mut wc = WalkContext {
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            ..Default::default()
+        }),
+        inline_callee_consts: None,
+        fbw_mode: test_fbw_mode(),
+        session: &session,
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
+        concrete_registers_i: &mut [],
+        descr_refs: &descr_pool,
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: false,
+        trace_ctx: &mut tc,
+        is_top_level: true,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: None,
+        outer_jitcode_index: 0,
+        pending_guard_snapshot_error: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+    let ei = force_virtual_descr
+        .as_call_descr()
+        .expect("call descr")
+        .get_extra_info();
+    let allboxes = vec![func, vref];
     let ops_before = wc.trace_ctx.num_ops();
     let outcome = walker_do_jit_force_virtual(&mut wc, ei, &allboxes, 0, 'r', 0)
-        .expect("NULL non-vref is the force_virtual identity, not an error");
-    assert_eq!(outcome, Some(DispatchOutcome::Continue));
+        .expect("live NULL is a fall-through, not an error");
     assert_eq!(
-        wc.trace_ctx.num_ops(),
-        ops_before,
-        "must not record PTR_EQ for a NULL non-vref"
+        outcome, None,
+        "a live zero-concrete box must not become const_null without a guard"
     );
-    let got = wc.registers_r.get(0);
-    let null = wc.trace_ctx.const_null();
-    assert_eq!(got, Some(null));
+    assert_eq!(
+        wc.registers_r.get(0),
+        Some(vref),
+        "dst must stay the live box; the residual writes it"
+    );
+    assert!(
+        wc.trace_ctx.num_ops() > ops_before,
+        "PTR_EQ against standard_box must be recorded for a live operand"
+    );
+}
+
+#[test]
+fn fill_abort_miframe_refuses_an_unresolved_ref_box() {
+    // `_copy_data_from_miframe` (`blackhole.py`) copies `box.getref_base()`.
+    // An unstamped FrontendOp reads as NULL, so a live colour with no
+    // recoverable concrete must refuse the image rather than keep the OpRef.
+    pyre_interpreter::module::thread::ensure_runtime_thread();
+    let mut builder = majit_metainterp::JitCodeBuilder::new();
+    builder.load_const_r_value(0, 0);
+    let jitcode = std::sync::Arc::new(builder.finish());
+    assert!(jitcode.num_regs_r() >= 1, "the fixture needs a live colour");
+
+    let miframe = majit_metainterp::MIFrame::new(jitcode, 0);
+    let mut banks = majit_metainterp::BlackholeAbortBanks::sized_for(&miframe);
+    let live_box = OpRef::input_arg_ref(0);
+    let regs_r = RegisterBank::new([live_box]);
+    let regs_i = RegisterBank::default();
+    let regs_f = RegisterBank::default();
+    let tc = TraceCtx::for_test_types(&[Type::Ref]);
+    let frame_state = WalkFrameState::new(WalkFrameStateData::default());
+    assert!(
+        !fill_abort_miframe_register_banks(
+            &tc,
+            &mut banks,
+            &regs_i,
+            &regs_r,
+            &regs_f,
+            &[],
+            &frame_state,
+            None,
+        ),
+        "a live colour with no recoverable concrete must refuse the image"
+    );
+    assert!(
+        banks.registers_r[0].is_none(),
+        "a refused colour must not leave a zeroed bank word"
+    );
+}
+
+#[test]
+fn wrapper_args_item_pointers_declines_unknown_null() {
+    // `ConcreteValue::Null` is the walker's unknown sentinel, not an
+    // executed NULL. `execute_and_record_varargs` (`pyjitpl.py`) runs
+    // with the actual argument-box values; unknown must not become PY_NULL.
+    pyre_interpreter::module::thread::ensure_runtime_thread();
+    let mut tc = fresh_trace_ctx();
+    let item = OpRef::input_arg_ref(0);
+    let regs_r = [item, tc.const_null(), tc.const_null(), tc.const_null()];
+    let regs_i = [tc.const_int(0)];
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let mut wc = WalkContext {
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            ..Default::default()
+        }),
+        inline_callee_consts: None,
+        fbw_mode: test_fbw_mode(),
+        session: &session,
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
+        concrete_registers_i: &mut [],
+        descr_refs: &[],
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: false,
+        trace_ctx: &mut tc,
+        is_top_level: true,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: None,
+        outer_jitcode_index: 0,
+        pending_guard_snapshot_error: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+    assert!(
+        wrapper_args_item_pointers(&mut wc, &[item], &[ConcreteValue::Null]).is_none(),
+        "unknown must decline, not execute as PY_NULL"
+    );
+    let known_null = wrapper_args_item_pointers(
+        &mut wc,
+        &[item],
+        &[ConcreteValue::Ref(pyre_object::PY_NULL)],
+    );
+    assert_eq!(
+        known_null,
+        Some(vec![pyre_object::PY_NULL]),
+        "a known NULL pointer is Ref(PY_NULL) and is executed as that pointer"
+    );
+    let none = pyre_object::w_none();
+    let known_obj = wrapper_args_item_pointers(&mut wc, &[item], &[ConcreteValue::Ref(none)]);
+    assert_eq!(
+        known_obj,
+        Some(vec![none]),
+        "a known object pointer is executed as that object"
+    );
 }
 
 #[test]
@@ -26722,6 +26969,69 @@ fn helper_activation_identity_is_the_shared_frame_state_not_jitcode_index() {
     );
     let missing = WalkFrameState::new(WalkFrameStateData::default());
     assert!(!helper_activation_already_on_framestack(&walk, &missing));
+}
+
+/// `_ensure_parent_resumedata` (`opencoder.py`) snapshots every framestack
+/// `MIFrame`, including two activations of one helper jitcode (`newframe` /
+/// `perform_call` in `pyjitpl.py`). Concatenating `InlineFrame.parents` and
+/// merging parked driver extras identify those copies by
+/// `WalkFrameState::ptr_eq`, so the inner activation survives.
+#[test]
+fn resume_parent_chain_keeps_two_activations_of_one_helper_jitcode() {
+    let _ = test_outer_resume_jitcode_index();
+    let helper_index = install_live_only_helper_jitcode();
+    assert!(
+        crate::state::jitcode_is_transparent_helper(helper_index as i32),
+        "installed helper must be a transparent helper jitcode"
+    );
+    let outer_state = WalkFrameState::new(WalkFrameStateData::default());
+    let inner_state = WalkFrameState::new(WalkFrameStateData::default());
+    assert!(
+        !outer_state.ptr_eq(&inner_state),
+        "recursive activations keep distinct WalkFrameState Rcs"
+    );
+    let outer = paused_helper_parent_for_activation(helper_index, 10, outer_state);
+    let inner = paused_helper_parent_for_activation(helper_index, 20, inner_state);
+    assert!(
+        !outer.same_activation(&inner),
+        "two activations of one helper jitcode keep distinct WalkFrameState Rcs"
+    );
+
+    let chain = framestack_resume_parent_frames(&[
+        python_level(vec![outer.clone()]),
+        python_level(vec![inner.clone()]),
+    ]);
+    assert_eq!(
+        chain.len(),
+        2,
+        "helper A inlined through itself keeps both parent sections"
+    );
+    assert!(chain[0].same_activation(&outer));
+    assert!(chain[1].same_activation(&inner));
+    assert_eq!(chain[0].jitcode_index, helper_index);
+    assert_eq!(chain[1].jitcode_index, helper_index);
+
+    let cloned_prefix = framestack_resume_parent_frames(&[
+        python_level(vec![outer.clone()]),
+        python_level(vec![outer.clone(), inner.clone()]),
+    ]);
+    assert_eq!(
+        cloned_prefix.len(),
+        2,
+        "a copied listing of the outer activation still numbers it once"
+    );
+    assert!(cloned_prefix[0].same_activation(&outer));
+    assert!(cloned_prefix[1].same_activation(&inner));
+
+    let mut merged = Vec::new();
+    merge_paused_driver_helper_parents(&mut merged, vec![outer.clone(), inner.clone()]);
+    assert_eq!(
+        merged.len(),
+        2,
+        "driver extras of one helper jitcode keep both activations"
+    );
+    assert!(merged[0].same_activation(&outer));
+    assert!(merged[1].same_activation(&inner));
 }
 
 /// Latched parents plus driver ancestors for the same activations stay

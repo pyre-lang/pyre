@@ -9572,6 +9572,20 @@ impl InlineParentFrame {
         self
     }
 
+    /// Same paused `MIFrame` image (`WalkFrameState::ptr_eq`).
+    ///
+    /// `helper_activation_already_on_framestack` / `attach_live_caller`
+    /// clone this Rc when the caller pauses (`MetaInterp.newframe`).
+    /// `_ensure_parent_resumedata` (`opencoder.py`) numbers each framestack
+    /// level once, so a helper that recurses through itself (or A inlines B
+    /// inlines A) keeps both activations.
+    fn same_activation(&self, other: &Self) -> bool {
+        match (self.frame_state.as_ref(), other.frame_state.as_ref()) {
+            (Some(left), Some(right)) => left.ptr_eq(right),
+            _ => false,
+        }
+    }
+
     fn with_caller_py_pc(mut self, jitcode_index: u32, call_jit_pc: usize) -> Self {
         self.caller_py_pc = crate::py_coord::containing_py_pc_for_jitcode_pc_public(
             jitcode_index as i32,

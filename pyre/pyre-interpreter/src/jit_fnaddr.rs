@@ -2733,6 +2733,31 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_interpreter::objspace::descroperation::pos",
         crate::opcode_ops::jit_descroperation_pos,
     );
+    cp2!(
+        &mut entries,
+        "pyre_interpreter::objspace::descroperation::sub",
+        crate::opcode_ops::jit_descroperation_sub,
+    );
+    cp2!(
+        &mut entries,
+        "pyre_interpreter::objspace::descroperation::sub_impl",
+        crate::opcode_ops::jit_descroperation_sub_impl,
+    );
+    cp2!(
+        &mut entries,
+        "pyre_interpreter::objspace::descroperation::add",
+        crate::opcode_ops::jit_descroperation_add,
+    );
+    cp2!(
+        &mut entries,
+        "pyre_interpreter::objspace::descroperation::add_impl",
+        crate::opcode_ops::jit_descroperation_add_impl,
+    );
+    cp2!(
+        &mut entries,
+        "pyre_interpreter::objspace::descroperation::floordiv",
+        crate::opcode_ops::jit_descroperation_floordiv,
+    );
     cp1!(
         &mut entries,
         "pyre_interpreter::baseobjspace::not_",
@@ -8955,6 +8980,26 @@ mod tests {
             (
                 "pyre_interpreter::objspace::descroperation::pos",
                 crate::opcode_ops::jit_descroperation_pos as *const () as usize as i64,
+            ),
+            (
+                "pyre_interpreter::objspace::descroperation::sub",
+                crate::opcode_ops::jit_descroperation_sub as *const () as usize as i64,
+            ),
+            (
+                "pyre_interpreter::objspace::descroperation::sub_impl",
+                crate::opcode_ops::jit_descroperation_sub_impl as *const () as usize as i64,
+            ),
+            (
+                "pyre_interpreter::objspace::descroperation::add",
+                crate::opcode_ops::jit_descroperation_add as *const () as usize as i64,
+            ),
+            (
+                "pyre_interpreter::objspace::descroperation::add_impl",
+                crate::opcode_ops::jit_descroperation_add_impl as *const () as usize as i64,
+            ),
+            (
+                "pyre_interpreter::objspace::descroperation::floordiv",
+                crate::opcode_ops::jit_descroperation_floordiv as *const () as usize as i64,
             ),
             (
                 "pyre_interpreter::baseobjspace::not_",
