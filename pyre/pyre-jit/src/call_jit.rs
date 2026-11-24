@@ -9390,20 +9390,19 @@ pub extern "C" fn bh_normalize_raise_varargs_with_frame(
             //
             // It runs the exception's `__init__`.  `exc` is still unrooted and
             // the cause normalized above is a fresh nursery object, so both
-            // ride the bracket across the call.
+            // ride the bracket across the call — including the invalid
+            // `OperationError` whose `message` rstr wrap_display later shares.
             let roots = pyre_object::gc_roots::push_roots();
-            let base = roots.publish(&[
-                exc,
-                cause.as_ref().map_or(std::ptr::null_mut(), |c| c.w_cause),
-            ]);
-            roots.normalize(base, 2);
+            let exc_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = roots.pin_root(exc);
+            let cause_pins = cause.as_mut().map(|c| c.pin(&roots));
             let result = {
                 let _plain_guard = pyre_interpreter::call::force_plain_eval();
-                pyre_interpreter::call::call_function_impl_result(exc, &[])
+                pyre_interpreter::call::call_function_impl_result(roots.get(exc_slot), &[])
             };
-            exc = roots.get(base);
-            if let Some(c) = cause.as_mut() {
-                c.w_cause = roots.get(base + 1);
+            exc = roots.get(exc_slot);
+            if let (Some(c), Some(pins)) = (cause.as_mut(), cause_pins) {
+                c.reload(&roots, pins);
             }
             match result {
                 Ok(obj) if pyre_object::is_exception(obj) => obj,

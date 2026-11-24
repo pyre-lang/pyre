@@ -1765,6 +1765,42 @@ pub struct RaiseCause {
     invalid: Option<PyError>,
 }
 
+/// Shadow-stack slots [`RaiseCause::pin`] claimed.
+pub struct RaiseCauseRoots {
+    cause_slot: Option<usize>,
+    invalid_slot: Option<usize>,
+}
+
+impl RaiseCause {
+    /// `framework.py` `push_roots` / `pop_roots`: `w_cause` and the
+    /// invalid `OperationError` (`PyError.message` rstr) stay live across
+    /// `space.call_function` (`instantiate_raised_class`).
+    pub fn pin(&mut self, roots: &pyre_object::gc_roots::RootScope) -> RaiseCauseRoots {
+        let cause_slot = if !self.w_cause.is_null() {
+            let slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = roots.pin_root(self.w_cause);
+            Some(slot)
+        } else {
+            None
+        };
+        let invalid_slot = self.invalid.as_mut().map(|err| err.pin(roots));
+        RaiseCauseRoots {
+            cause_slot,
+            invalid_slot,
+        }
+    }
+
+    /// `pop_roots`: reload each livevar the pin published.
+    pub fn reload(&mut self, roots: &pyre_object::gc_roots::RootScope, pinned: RaiseCauseRoots) {
+        if let Some(slot) = pinned.cause_slot {
+            self.w_cause = roots.get(slot);
+        }
+        if let (Some(err), Some(slot)) = (self.invalid.as_mut(), pinned.invalid_slot) {
+            err.reload(roots, slot);
+        }
+    }
+}
+
 /// Instantiate the `from` cause of a `raise X from Y` when it is an exception
 /// class, and answer it unchanged otherwise.
 ///
@@ -1845,7 +1881,16 @@ pub fn attach_raise_cause(exc: PyObjectRef, cause: Option<RaiseCause>) -> Result
     // chain.  It must still become the context of a new exception raised by
     // the generator. `get_sys_exception` is residual, so this does not expose
     // the virtualizable frame to the tracer.
-    crate::error::chain_context(exc, get_sys_exception());
+    let roots = pyre_object::gc_roots::push_roots();
+    let exc_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(exc);
+    let mut cause = cause;
+    let cause_pins = cause.as_mut().map(|c| c.pin(&roots));
+    crate::error::chain_context(roots.get(exc_slot), get_sys_exception());
+    let exc = roots.get(exc_slot);
+    if let (Some(c), Some(pins)) = (cause.as_mut(), cause_pins) {
+        c.reload(&roots, pins);
+    }
     if let Some(RaiseCause { w_cause, invalid }) = cause
         && !w_cause.is_null()
     {
@@ -4981,33 +5026,32 @@ impl OpcodeStepExecutor for PyFrame {
                 // cause; report absence as `None` so the value is never
                 // `Some(null)` (mirrors the JIT paths call_jit.rs / trace_opcode.rs).
                 let c = normalize_raise_cause(raw_cause)?;
-                let cause = if c.w_cause.is_null() { None } else { Some(c) };
-                let w_value = self.pop();
+                let mut cause = if c.w_cause.is_null() { None } else { Some(c) };
+                // `normalize_raise_cause` calls a class cause
+                // (`space.call_function(w_cause)`), which can collect and move
+                // this frame. `PyFrame::pop` does not reload, so the second
+                // pop takes the live frame, as `framework.py` `pop_roots`
+                // reloads `self` after the call.
+                let w_value = self.live_mut().pop();
                 unsafe {
                     if crate::baseobjspace::exception_is_valid_obj_as_class_w(w_value) {
-                        // Root the class and the normalized `cause` across the
-                        // instantiation. `instantiate_raised_class` allocates
-                        // (`malloc_fixedsize` → `collect_and_reserve`), and both
-                        // live only in this Rust local until `attach_raise_cause`
+                        // Root the class, the normalized `cause`, and the
+                        // invalid `OperationError` across the instantiation.
+                        // `instantiate_raised_class` allocates
+                        // (`malloc_fixedsize` → `collect_and_reserve`); those
+                        // live only in Rust locals until `attach_raise_cause`
                         // reads them. Re-read each slot afterwards.
                         let _roots = pyre_object::gc_roots::push_roots();
                         let value_slot = pyre_object::gc_roots::shadow_stack_len();
                         let _ = pyre_object::gc_roots::pin_root(w_value);
-                        let cause_slot = cause.as_ref().map(|c| {
-                            let slot = pyre_object::gc_roots::shadow_stack_len();
-                            let _ = pyre_object::gc_roots::pin_root(c.w_cause);
-                            slot
-                        });
+                        let cause_pins = cause.as_mut().map(|c| c.pin(&_roots));
                         let result = instantiate_raised_class(
                             pyre_object::gc_roots::shadow_stack_get(value_slot),
                         )?;
                         let _ = pyre_object::gc_roots::shadow_stack_get(value_slot);
-                        let cause = cause.map(|mut c| {
-                            if let Some(slot) = cause_slot {
-                                c.w_cause = pyre_object::gc_roots::shadow_stack_get(slot);
-                            }
-                            c
-                        });
+                        if let (Some(c), Some(pins)) = (cause.as_mut(), cause_pins) {
+                            c.reload(&_roots, pins);
+                        }
                         attach_raise_cause(result, cause)?;
                         Err(PyError::from_exc_object(result))
                     } else if pyre_object::is_exception(w_value) {

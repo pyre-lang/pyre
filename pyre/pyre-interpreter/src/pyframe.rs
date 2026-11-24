@@ -5219,7 +5219,7 @@ impl PyFrame {
     /// Cheap on the common path: a nursery range compare, and the header read
     /// only for an address the nursery owns.
     #[inline]
-    fn live_mut(&mut self) -> &mut Self {
+    pub(crate) fn live_mut(&mut self) -> &mut Self {
         let addr = self as *mut Self as pyre_object::gc_hook::GCREF;
         unsafe { &mut *(pyre_object::gc_hook::try_gc_current_object_address(addr) as *mut Self) }
     }
