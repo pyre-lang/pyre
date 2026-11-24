@@ -38,6 +38,34 @@ pub fn target_word_size() -> usize {
     })
 }
 
+/// First word of a host-niche `Option<Cow<str>>` None, as an int-bank
+/// constant of `word` bytes.
+///
+/// rustc reserves `usize::MAX - 1` in the guest pointer word
+/// (`GcRef::NO_CONCRETE` when the host is that width). `fielddescrof`
+/// stamps `HostNicheWord` as `field_size = word` with
+/// `field_flag = Unsigned` and `is_field_signed = false`
+/// (`SimpleFieldDescr::is_field_signed` is `flag == Signed`), so a
+/// 4-byte load zero-extends `0xFFFF_FFFE` to i64 `4294967294`. A
+/// 64-bit translator's `GcRef::NO_CONCRETE.0 as i64` is always `-2`
+/// and never matches. Same unsigned-mask as the host-tag
+/// `tag_word_const` path. The niche lives in the pointer word, not
+/// [`target_signed_size`] (wasm32 Signed is 8 while this word is 4).
+pub fn host_niche_none_word(word: usize) -> i64 {
+    let bits = word.saturating_mul(8).min(64);
+    let mask = if bits >= 64 {
+        u64::MAX
+    } else {
+        (1u64 << bits) - 1
+    };
+    mask.wrapping_sub(1) as i64
+}
+
+/// [`host_niche_none_word`] for [`target_word_size`].
+pub fn target_host_niche_none_word() -> i64 {
+    host_niche_none_word(target_word_size())
+}
+
 /// Byte width of `lltype.Signed` for `target_arch` (`rffi.sizeof(lltype.Signed)`
 /// / `rarithmetic.LONG_BIT // 8`).
 ///
@@ -711,6 +739,20 @@ mod tests {
         assert_eq!(signed_size_for("x86", 4), 4);
         assert_eq!(signed_size_for("x86_64", 8), 8);
         assert_eq!(signed_size_for("aarch64", 8), 8);
+    }
+
+    #[test]
+    fn host_niche_none_word_is_target_width_unsigned() {
+        assert_eq!(host_niche_none_word(4), 0xFFFF_FFFE_u32 as i64);
+        assert_eq!(host_niche_none_word(8), -2);
+        assert_eq!(
+            host_niche_none_word(std::mem::size_of::<usize>()),
+            majit_ir::GcRef::NO_CONCRETE.0 as i64
+        );
+        assert_eq!(
+            target_host_niche_none_word(),
+            host_niche_none_word(target_word_size())
+        );
     }
 
     /// `get_field_descr(STRUCT, fieldname)` reads FIELD off STRUCT. An

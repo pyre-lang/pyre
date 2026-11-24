@@ -578,6 +578,27 @@ pub fn register_struct_fields_with_layout(
                 );
                 continue;
             }
+            // `Option` of a string-family payload is
+            // `SomeString(can_be_None=True)` (`bookkeeper`
+            // `project_struct_field_type` `unionof([s_inner, s_none])`).
+            // `valuetype_to_someshell(Str)` drops that bit, and
+            // `binaryop.py` `is__default` folds `is_(s, None)` to False
+            // (`has_kwarg` / `has_vararg` then constantly True).
+            if matches!(vt, crate::model::ValueType::Str)
+                && majit_ir::descr::option_payload_spelling(ty).is_some()
+            {
+                let s_value = crate::codewriter::annotation_state::valuetype_to_someshell(vt)
+                    .expect("Str shells to SomeString");
+                entry.insert(
+                    name.clone(),
+                    force_annotation_from_shell(
+                        &s_value
+                            .noneify()
+                            .expect("SomeString.noneify sets can_be_None"),
+                    ),
+                );
+                continue;
+            }
             // Instantiated layout spelling (`i64`, `f64`) is the
             // field's type, not the generic `ValueType` of `T`.
             // Seeding Unsigned from the type parameter made
@@ -3989,6 +4010,58 @@ mod tests {
             "Option<&[u8]> FORCE must be dyn_fat_window_annotation, got {:?}",
             entry.get("buf")
         );
+    }
+
+    #[test]
+    fn option_of_string_layout_seeds_nullable_somestring_force() {
+        // `Signature.kwargname` / `varargname` are `Option<Cow<str>>`.
+        // FORCE must noneify so `is_(getattr, None)` does not fold.
+        for (qual, field, spelling) in [
+            (
+                "force_test_optstr::Sig",
+                "kwargname",
+                "Option<borrow::Cow<str>>",
+            ),
+            (
+                "force_test_optstr::SigStatic",
+                "varargname",
+                "Option<Cow<'static, str>>",
+            ),
+            (
+                "force_test_optstr::OptUtf8",
+                "name",
+                "Option<unicodeobject::Utf8Str>",
+            ),
+        ] {
+            register_struct_fields_with_layout(
+                qual,
+                &[(field.into(), crate::model::ValueType::Str)],
+                Some(&[(field.into(), spelling.into())]),
+            );
+            let entry =
+                forced_attributes_for(qual).unwrap_or_else(|| panic!("FORCE row for {qual}"));
+            match entry.get(field) {
+                Some(SomeValue::String(s)) => assert!(
+                    s.inner.can_be_none,
+                    "{qual}.{field} spelling {spelling} must be SomeString(can_be_None=True)"
+                ),
+                other => panic!("expected nullable SomeString for {qual}.{field}, got {other:?}"),
+            }
+        }
+        register_struct_fields_with_layout(
+            "force_test_optstr::PlainCow",
+            &[("name".into(), crate::model::ValueType::Str)],
+            Some(&[("name".into(), "borrow::Cow<str>".into())]),
+        );
+        let entry = forced_attributes_for("force_test_optstr::PlainCow")
+            .expect("FORCE row for plain Cow<str>");
+        match entry.get("name") {
+            Some(SomeValue::String(s)) => assert!(
+                !s.inner.can_be_none,
+                "Cow<str> FORCE stays SomeString(can_be_None=False)"
+            ),
+            other => panic!("expected non-nullable SomeString for Cow<str>, got {other:?}"),
+        }
     }
 
     #[test]

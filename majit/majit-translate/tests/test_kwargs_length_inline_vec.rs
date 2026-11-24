@@ -8,12 +8,15 @@
 mod common;
 
 use common::{
-    OBJECT_LLBC, build_semantic_program_from_llbcs_with_static_addrs_and_function_names, load_llbc,
+    INTERPRETER_LLBC, OBJECT_LLBC,
+    build_semantic_program_from_llbcs_with_static_addrs_and_function_names, load_llbc,
     lower_function,
 };
 use majit_charon_reader::Llbc;
 use majit_translate::HostStaticAddrs;
-use majit_translate::model::{CallTarget, FunctionGraph, OpKind, VecFieldPart, cast_instance_root};
+use majit_translate::model::{
+    CallTarget, FunctionGraph, OpKind, ValueType, VecFieldPart, cast_instance_root,
+};
 
 fn object_llbc() -> &'static Llbc {
     load_llbc(OBJECT_LLBC)
@@ -389,6 +392,36 @@ fn assert_whole_field_of_pos0(graph: &FunctionGraph) {
         "getitem must keep the whole-field `__pos_0` read for later index/gcarray\n{}",
         graph.dump()
     );
+}
+
+/// `has_kwarg` / `has_vararg` getattr the host-niche first word of
+/// `Option<Cow<str>>` (`signature.py` `has_kwarg`). The annotator sees
+/// `getattr` + `is None`; jtransform loads `GETFIELD_RAW_I`.
+#[test]
+fn has_kwarg_and_has_vararg_read_host_niche_word() {
+    let llbc = load_llbc(INTERPRETER_LLBC);
+    for name in ["has_kwarg", "has_vararg"] {
+        let graph = lower_function(llbc, name).unwrap_or_else(|e| panic!("lower {name}: {e:?}"));
+        let has_niche = graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::FieldRead {
+                        field,
+                        ty: ValueType::Str,
+                        ..
+                    } if field.vec_part == Some(VecFieldPart::HostNicheWord)
+                )
+            });
+        assert!(
+            has_niche,
+            "{name} must getattr the host-niche string-option word\n{}",
+            graph.dump()
+        );
+    }
 }
 
 fn assert_defined_link_args(graph: &FunctionGraph) {

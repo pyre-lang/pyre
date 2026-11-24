@@ -974,6 +974,12 @@ pub struct FieldDescriptor {
 /// as a pointer. Slice `FatLen` stays `len(getattr)` (`ListRepr.rtype_len`);
 /// dyn `FatMeta` is `getitem` of `two_word_fat_struct` (`rtuple.py`
 /// `rtype_getitem`).
+///
+/// `HostNicheWord` is the first word of a host-niche string-option field
+/// (`Option<Cow<str>>`): the annotator sees `getattr` + `is None`, and
+/// jtransform loads that word as `GETFIELD_RAW_I` then compares it to
+/// the target-width None word (`layout::target_host_niche_none_word`,
+/// `usize::MAX - 1` in the guest pointer).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum VecFieldPart {
     Buf,
@@ -982,6 +988,7 @@ pub enum VecFieldPart {
     FatLen,
     FatMeta,
     FatVtable,
+    HostNicheWord,
 }
 
 impl PartialEq for FieldDescriptor {

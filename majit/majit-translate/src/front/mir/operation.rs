@@ -4368,13 +4368,14 @@ impl<'a> Lowering<'a> {
                 }
                 // `Option<Cow<str>>` is a 24-byte host niche: None's first
                 // word is `usize::MAX - 1` (`GcRef::NO_CONCRETE`), not a
-                // null pointer. `tyref_is_niche_option_ptr` would emit
-                // `getfield_raw_r` + `ptr_iszero` and the walk would
-                // abort. The first word as `GETFIELD_RAW_I` of an
-                // `_immutable_fields_` slot folds on a constant
-                // Signature, matching `signature.py` `has_kwarg`
-                // (`self.kwargname is not None`) of `_immutable_ = True`.
-                // Peel `Discriminant(*(&self.kwargname))` to the Field.
+                // null pointer. The annotator models `x is None` on a
+                // nullable string (`signature.py` `has_kwarg`); integer
+                // tag-decode of a `SomeString` getattr is a blocked
+                // block. Emit `getattr` (Str) + `is_` here, stamp
+                // `HostNicheWord` so jtransform loads the first word as
+                // `GETFIELD_RAW_I` of an `_immutable_fields_` slot
+                // (`getfield_raw_i_pure` folds on a constant Signature).
+                // Peel `Discriminant(*(&field))` to the Field.
                 let cow_field_place: &Place = match &place.kind {
                     PlaceKind::Projection(inner, ProjectionElem::Atom(name)) if name == "Deref" => {
                         inner.as_ref()
@@ -4387,7 +4388,7 @@ impl<'a> Lowering<'a> {
                         && let Some(field_payload) = v.as_object().and_then(|m| m.get("Field"))
                         && crate::front::result_exc::tyref_option_payload(&place.ty, self.llbc)
                             .is_some_and(|payload| tyref_is_cow_str(&payload, self.llbc))
-                        && let Some(tag) = self.raw_enum_host_tag(&place.ty)
+                        && self.raw_enum_host_tag(&place.ty).is_some()
                         && let Some((f_owner_root, f_name, _f_ty, f_owner_id, f_host_index)) =
                             self.resolve_adt_field(&f_base.ty, field_payload)
                     {
@@ -4408,7 +4409,6 @@ impl<'a> Lowering<'a> {
                             f_owner_id,
                             f_host_index,
                             owner_gc,
-                            tag,
                             pure,
                         ))
                     } else {
@@ -4421,36 +4421,26 @@ impl<'a> Lowering<'a> {
                     f_owner_id,
                     f_host_index,
                     owner_gc,
-                    tag,
                     pure,
                 )) = cow_option_field
                 {
                     let base = self.resolve_place(mir_bb, f_base)?;
-                    let bb_id = self.emit_bb(mir_bb);
-                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-                        result: Some(res.clone()),
-                        kind: OpKind::FieldRead {
-                            base,
-                            field: FieldDescriptor::new(f_name, Some(f_owner_root))
-                                .with_owner_id(f_owner_id)
-                                .with_host_index(f_host_index)
-                                .with_owner_declared_gc(owner_gc),
-                            ty: ValueType::Int,
-                            pure,
-                        },
-                    });
-                    return Ok((None, self.emit_host_variant_index(mir_bb, res, &tag)));
+                    let field = FieldDescriptor::new(f_name, Some(f_owner_root))
+                        .with_owner_id(f_owner_id)
+                        .with_host_index(f_host_index)
+                        .with_owner_declared_gc(owner_gc)
+                        .with_vec_part(crate::model::VecFieldPart::HostNicheWord);
+                    return self.emit_string_option_field_is_some(mir_bb, base, field, pure, res);
                 }
-                // `match &self.kwargname` is `Discriminant(*(&field))`.
+                // `match &field` is `Discriminant(*(&field))`.
                 // The `&field` is a `taken_by_address` FieldRead that
                 // `mark_place_address_of` restamps as `RawEnumField`
-                // (`int_add`). Recover that field so the tag load is
-                // `GETFIELD_RAW_I` of the `_immutable_` slot, which
-                // folds on a constant Signature.
+                // (`int_add`). Recover that field so jtransform still
+                // loads `GETFIELD_RAW_I` of the `_immutable_` slot.
                 let cow_addr_field =
                     if crate::front::result_exc::tyref_option_payload(&place.ty, self.llbc)
                         .is_some_and(|payload| tyref_is_cow_str(&payload, self.llbc))
-                        && let Some(tag) = self.raw_enum_host_tag(&place.ty)
+                        && self.raw_enum_host_tag(&place.ty).is_some()
                         && let PlaceKind::Projection(inner, ProjectionElem::Atom(name)) =
                             &place.kind
                         && name == "Deref"
@@ -4463,29 +4453,20 @@ impl<'a> Lowering<'a> {
                         && let Some((base, field)) =
                             Self::address_taken_field_producer(&self.graph, &addr)
                     {
-                        Some((base, field, tag))
+                        Some((base, field))
                     } else {
                         None
                     };
-                if let Some((base, mut field, tag)) = cow_addr_field {
+                if let Some((base, mut field)) = cow_addr_field {
                     field.taken_by_address = false;
                     if field.owner_declared_gc.is_none() {
                         field.owner_declared_gc = Some(false);
                     }
+                    field.vec_part = Some(crate::model::VecFieldPart::HostNicheWord);
                     let pure = field.owner_root.as_deref().is_some_and(|owner| {
                         self.owner_path_field_declared_immutable(owner, &field.name)
                     });
-                    let bb_id = self.emit_bb(mir_bb);
-                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-                        result: Some(res.clone()),
-                        kind: OpKind::FieldRead {
-                            base,
-                            field,
-                            ty: ValueType::Int,
-                            pure,
-                        },
-                    });
-                    return Ok((None, self.emit_host_variant_index(mir_bb, res, &tag)));
+                    return self.emit_string_option_field_is_some(mir_bb, base, field, pure, res);
                 }
                 // A standalone fieldless (C-like) enum is represented
                 // by-value as its discriminant integer, so
@@ -4874,6 +4855,37 @@ impl<'a> Lowering<'a> {
             }
         }
         None
+    }
+
+    /// `getattr` of a host-niche string-option field, then `is None`
+    /// (`rnone.py` `rtype_is_None` of a nullable `StringRepr`). jtransform
+    /// turns that `is_` into `GETFIELD_RAW_I` of the first word plus
+    /// equality with `GcRef::NO_CONCRETE`.
+    fn emit_string_option_field_is_some(
+        &mut self,
+        mir_bb: usize,
+        base: Variable,
+        field: FieldDescriptor,
+        pure: bool,
+        res: Variable,
+    ) -> Result<(Option<OpKind>, Variable), LowerError> {
+        let field_val = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        let bb_id = self.emit_bb(mir_bb);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(field_val.clone()),
+            kind: OpKind::FieldRead {
+                base,
+                field,
+                ty: ValueType::Str,
+                pure,
+            },
+        });
+        self.graph
+            .push_niche_is_some(bb_id, field_val, None, None, res.clone());
+        self.niche_disc_vars.insert(res.id());
+        Ok((None, res))
     }
 
     /// `Discriminant(*p)` / `Discriminant((*p).field)` on a raw address, and
