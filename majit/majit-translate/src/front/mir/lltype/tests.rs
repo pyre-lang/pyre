@@ -23260,6 +23260,20 @@ fn raw_struct_array_item_interns_instantiation_name() {
 }
 
 #[test]
+fn field_row_w_root_pointer_is_objectptr_ahead_of_declared_gc() {
+    use crate::translator::rtyper::rclass::OBJECTPTR;
+    let mut reg = crate::front::StructFieldRegistry::default();
+    reg.note_declared_gc_name("pyobject::PyObject");
+    note_class_identity(&mut reg, "pyobject::PyObject");
+    let got = super::field_row_lltype(&reg, "*mut pyobject::PyObject", &mut field_row_visited())
+        .expect("W_Root pointer field");
+    assert_eq!(got, OBJECTPTR.clone());
+    let got = super::field_row_lltype(&reg, "*mut PyObject", &mut field_row_visited())
+        .expect("PyObject leaf pointer field");
+    assert_eq!(got, OBJECTPTR.clone());
+}
+
+#[test]
 fn field_row_declared_gc_pointer_is_gcref() {
     use crate::translator::rtyper::lltypesystem::lltype::GCREF;
     let mut reg = crate::front::StructFieldRegistry::default();
