@@ -30,6 +30,12 @@ pub struct GilReadyState {
 
 crate::quasi_immut_words!(GilReadyState, mutate_gil_ready, mutate_gil_ready_lock);
 
+/// Host `GilReadyState` is the process-wide `static mut` cell, never a GC object.
+/// `rclass.py getgcflavor` / `classdesc.py ClassDesc.get_param` read `_alloc_flavor_`.
+#[doc(hidden)]
+#[allow(non_upper_case_globals)]
+pub const _alloc_flavor_GilReadyState: &str = "raw";
+
 impl GilReadyState {
     #[inline]
     pub fn mutate_gil_ready(&self) -> crate::quasiimmut::QuasiImmutField<'_> {

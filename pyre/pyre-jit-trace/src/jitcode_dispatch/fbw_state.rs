@@ -1233,13 +1233,40 @@ pub(crate) fn fbw_note_locals_mirror_undo(frame: usize, nlocals: usize) {
 /// replay re-derives them from the frame's entry state instead of compounding
 /// onto the walk's.  Newest first, matching the store journal.
 pub(crate) fn fbw_locals_mirror_rollback() {
-    let undo = FBW_LOCALS_MIRROR_UNDO.with(|c| std::mem::take(&mut *c.borrow_mut()));
-    for entry in undo.into_iter().rev() {
-        let frame = live_frame_addr(entry.frame);
-        // SAFETY: as in the capture — the frame is live for the whole walk.
+    // Pop one entry at a time so remaining frames stay in the extra-area
+    // root list (`gctransform/shadowstack.py` `push_roots`). `take()` of
+    // the whole vec unroots them; a restore write-barrier can collect and
+    // leave a later entry's nursery frame as a forwarding stub or poison.
+    loop {
+        let Some(entry) = FBW_LOCALS_MIRROR_UNDO.with(|c| c.borrow_mut().pop()) else {
+            break;
+        };
+        let _roots = pyre_object::gc_roots::push_roots();
+        let frame = if entry.frame == 0 {
+            0
+        } else {
+            live_frame_addr(
+                pyre_object::gc_roots::pin_root(entry.frame as pyre_object::PyObjectRef) as usize,
+            )
+        };
+        for &slot in &entry.slots {
+            if !slot.is_null() {
+                let _ = pyre_object::gc_roots::pin_root(slot);
+            }
+        }
+        if frame == 0 {
+            continue;
+        }
+        // SAFETY: as in the capture — the frame is live for the whole walk
+        // while extra-area + the pin above grey it. A torn-down frame
+        // (Drop of a non-GC snapshot) nulls `locals_cells_stack_w`; skip
+        // rather than `locals_w_mut!` through NULL.
         unsafe {
             let pf = &mut *(frame as *mut pyre_interpreter::PyFrame);
             let arr_ptr = pf.locals_cells_stack_w;
+            if arr_ptr.is_null() {
+                continue;
+            }
             let dst = pyre_interpreter::locals_w_mut!(pf);
             // The array cannot be reallocated mid-walk, but clamp anyway: a
             // short write is recoverable, a write past the end is not.
@@ -1365,6 +1392,9 @@ pub(crate) fn fbw_durable_frame_rollback_one(frame: usize) {
             unsafe {
                 let pf = &mut *(frame as *mut pyre_interpreter::PyFrame);
                 let arr_ptr = pf.locals_cells_stack_w;
+                if arr_ptr.is_null() {
+                    return;
+                }
                 let dst = pyre_interpreter::locals_w_mut!(pf);
                 let n = entry.slots.len().min(dst.as_slice().len());
                 for (j, &value) in entry.slots.iter().take(n).enumerate() {
@@ -2280,10 +2310,12 @@ pub fn fbw_foriter_any_body_effect_signal() -> bool {
 ///   a future caller takes before the rollback.
 /// Any signal set → refuse delivery (drop the stash → the legacy bypass keeps
 /// the prior drop-on-abort behaviour for that shape, never a double).
-/// `fbw_has_unjournaled_effect()` is the converse: the residual was recorded
-/// but NOT executed, and only the legacy replay applies it. It prevents an
-/// end-state commit, but it must not suppress delivery of the consumed item
-/// or that replay starts at the next iteration and drops this one.
+/// `fbw_has_unjournaled_effect()` is the converse for abort-path delivery: a
+/// declined residual is recorded symbolically. CloseLoop no longer treats
+/// that flag as a flush veto (`pyjitpl.py` `reached_loop_header` publishes
+/// the current boxes); this take still must not suppress delivery of the
+/// consumed item or a remaining abort-path replay starts at the next
+/// iteration and drops this one.
 /// `for_mutate` aborts BEFORE the append's effect, so both signal classes are
 /// clear at the abort point — the clean continuation case.
 /// Which stash entry a take removes, given the indices of the portal frame's
@@ -3065,10 +3097,11 @@ mod foriter_delivery_tests {
 /// place, sampled before a descent that may later decline to a residual.
 #[derive(Clone, Copy)]
 pub(crate) struct FbwEffectJournalMark {
-    stores: usize,
+    pub(crate) stores: usize,
     list_effects: usize,
     promotes: usize,
     cells: usize,
+    pub(crate) executed: usize,
 }
 
 pub(crate) fn fbw_effect_journal_mark() -> FbwEffectJournalMark {
@@ -3077,6 +3110,7 @@ pub(crate) fn fbw_effect_journal_mark() -> FbwEffectJournalMark {
         list_effects: FBW_LIST_EFFECT_JOURNAL.with(|j| j.borrow().len()),
         promotes: fbw_append_promote_journal_len(),
         cells: FBW_CELL_STORE_JOURNAL.with(|j| j.borrow().len()),
+        executed: fbw_executed_effect_count(),
     }
 }
 

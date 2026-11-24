@@ -541,6 +541,9 @@ pub unsafe fn ll_arraycopy_items_block(
     if length <= 1 {
         if length == 1 {
             // rgc.py `copy_item`: `dest[di] = source[si]`.
+            // This ARRAY is `GcArray(OBJECTPTR)`; the store is setarrayitem_gc
+            // (`items_block_set_ref`), matching the int/float specializations'
+            // typed `dest[i] = source[j]`.
             let item = unsafe { *items_block_items_base(source).add(source_start as usize) };
             unsafe { items_block_set_ref(dest, dest_start as usize, item) };
         }

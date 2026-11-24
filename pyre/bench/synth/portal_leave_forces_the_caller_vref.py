@@ -45,6 +45,9 @@
 # THE SHAPE IS THE TEST, and three parts of it are load-bearing:
 #   * `leaf` must be a RESIDUAL call, so its frame reaches
 #     `leave_compiled_frame_chain` rather than the walker's own leave.
+#     `leaf` contains its own loop so PyPy compiles that loop separately and
+#     the caller reaches it via call_assembler, rather than inlining the
+#     try/except body.
 #   * `leaf` must ESCAPE — its frame is retained out of a traceback — so the
 #     escape branch runs at all.
 #   * `leaf` must return NORMALLY. An exception leaving `leaf` fails the
@@ -78,7 +81,14 @@ def leaf(i, n, depth=0):
             raise ValueError('escape')
         except ValueError as exc:
             HELD.append(exc.__traceback__.tb_frame)
-    return i
+    # Own loop: PyPy compiles this as a separate loop and the caller
+    # reaches `leaf` via call_assembler instead of inlining it.
+    acc = 0
+    j = 0
+    while j < 32:
+        acc += j
+        j += 1
+    return i + (acc - 496)
 
 
 def mid_pass(i, n):

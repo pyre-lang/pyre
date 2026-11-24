@@ -488,7 +488,7 @@ impl<K, V, S> RDict<K, V, S> {
     /// allocation. An old table that holds a young array is remembered so
     /// the next minor greys `d.entries` (`write_barrier`).
     #[inline]
-    fn barrier_entries(&self) {
+    pub(crate) fn barrier_entries(&self) {
         if !self.entries.is_null() {
             crate::gc_hook::try_gc_write_barrier(self.entries as crate::gc_hook::GCREF);
         }

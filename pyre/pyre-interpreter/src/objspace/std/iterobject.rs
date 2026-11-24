@@ -57,7 +57,7 @@ pub(crate) unsafe fn rawdict(
         &[
             (
                 "__iter__",
-                crate::baseobjspace::iter_self_method as crate::gateway::BuiltinCodeFn,
+                crate::baseobjspace::seqiter_iter_method as crate::gateway::BuiltinCodeFn,
                 1,
                 "($self, /)",
             ),
@@ -112,7 +112,8 @@ pub(crate) fn reverse_typedef() -> *const TypeDef {
             &[
                 (
                     "__iter__",
-                    crate::baseobjspace::iter_self_method as crate::gateway::BuiltinCodeFn,
+                    crate::baseobjspace::reverseseqiter_iter_method
+                        as crate::gateway::BuiltinCodeFn,
                     1,
                     "($self, /)",
                 ),

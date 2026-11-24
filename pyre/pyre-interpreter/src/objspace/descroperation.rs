@@ -4915,11 +4915,28 @@ pub fn add(mut a: PyObjectRef, mut b: PyObjectRef) -> PyResult {
             return Ok(w_res);
         }
     }
-    add_impl(a, b, "+")
+    add_impl(a, b)
 }
 
-/// `+` and `+=` — one body, see [`binop_type_error`].
-pub(crate) fn add_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) -> PyResult {
+/// `_make_binop_impl` for `+`. The generated graph is `(w_obj1, w_obj2)`;
+/// `symbol` is a closure constant there, not a runtime argument. A `&str`
+/// parameter is two words, so `call.py get_jitcode` cannot store
+/// `getfunctionptr` and blackhole interprets the body (`bhimpl_inline_call_r_r`).
+#[inline(never)]
+pub(crate) fn add_impl(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+    add_impl_symbol(a, b, "+")
+}
+
+/// `_make_inplace_impl` for `+=`.
+#[inline(never)]
+pub(crate) fn iadd_impl(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+    add_impl_symbol(a, b, "+=")
+}
+
+/// Shared `+` / `+=` body, see [`binop_type_error`]. Inlined into the
+/// two-word graphs so each JitCode keeps `arg_classes=rr`.
+#[majit_macros::always_inline]
+fn add_impl_symbol(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) -> PyResult {
     unsafe {
         let numeric_override = needs_numeric_binop_dispatch_unless_exact(a, b, BinopDunder::Add);
         // A sequence left operand has no `nb_add` to offer, so the numeric
@@ -5085,11 +5102,28 @@ pub fn sub(mut a: PyObjectRef, mut b: PyObjectRef) -> PyResult {
             return Ok(w_res);
         }
     }
-    sub_impl(a, b, "-")
+    sub_impl(a, b)
 }
 
-/// `-` and `-=` — one body, see [`binop_type_error`].
-pub(crate) fn sub_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) -> PyResult {
+/// `_make_binop_impl` for `-`. The generated graph is `(w_obj1, w_obj2)`;
+/// `symbol` is a closure constant there, not a runtime argument. A `&str`
+/// parameter is two words, so `call.py get_jitcode` cannot store
+/// `getfunctionptr` and blackhole interprets the body (`bhimpl_inline_call_r_r`).
+#[inline(never)]
+pub(crate) fn sub_impl(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+    sub_impl_symbol(a, b, "-")
+}
+
+/// `_make_inplace_impl` for `-=`.
+#[inline(never)]
+pub(crate) fn isub_impl(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+    sub_impl_symbol(a, b, "-=")
+}
+
+/// Shared `-` / `-=` body, see [`binop_type_error`]. Inlined into the
+/// two-word graphs so each JitCode keeps `arg_classes=rr`.
+#[majit_macros::always_inline]
+fn sub_impl_symbol(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) -> PyResult {
     unsafe {
         let set_override = needs_set_binop_dispatch_unless_exact(a, b);
         if set_override
