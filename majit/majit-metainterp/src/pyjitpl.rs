@@ -7463,7 +7463,7 @@ impl<M: Clone> MetaInterp<M> {
     fn mark_matched_tracing_cell(
         &mut self,
         jd_no: usize,
-        matched: Option<std::rc::Rc<crate::warmstate::BaseJitCell>>,
+        matched: crate::warmstate::ResolvedJitCell,
         pin: &crate::warmstate::GreenRefPin,
         live: &mut majit_ir::GreenKey,
         has_greenargs: bool,
@@ -7471,9 +7471,9 @@ impl<M: Clone> MetaInterp<M> {
         let mut warm = self.warm_state_for_driver(jd_no);
         if has_greenargs {
             pin.reload(live);
-            warm.start_tracing_cell(matched.as_ref(), pin, live)
+            warm.start_tracing_cell(&matched, pin, live)
         } else {
-            let cell = matched.expect(
+            let cell = matched.cell.expect(
                 "the hash form names an installed cell; a tracing start without one needs greens, \
                  warmstate.py bound_reached JitCell(*greenargs)",
             );
@@ -7491,15 +7491,14 @@ impl<M: Clone> MetaInterp<M> {
         matched: Option<crate::warmstate::ResolvedJitCell>,
         pin: &crate::warmstate::GreenRefPin,
         live: &mut majit_ir::GreenKey,
-    ) -> Option<std::rc::Rc<crate::warmstate::BaseJitCell>> {
+    ) -> crate::warmstate::ResolvedJitCell {
         match matched {
-            Some(resolved) => resolved.cell,
+            Some(resolved) => resolved,
             None => {
                 pin.reload(live);
                 let hash = live.get_uhash();
                 pin.reload(live);
                 self.resolve_jit_cell_on_driver(jd_no, hash, &live.values, &live.types)
-                    .cell
             }
         }
     }
@@ -7519,7 +7518,7 @@ impl<M: Clone> MetaInterp<M> {
         target_pc: usize,
         matched: Option<crate::warmstate::ResolvedJitCell>,
     ) -> (
-        Option<std::rc::Rc<crate::warmstate::BaseJitCell>>,
+        crate::warmstate::ResolvedJitCell,
         majit_ir::GreenKey,
         Option<crate::warmstate::GreenRefPin>,
         bool,
@@ -7552,15 +7551,21 @@ impl<M: Clone> MetaInterp<M> {
                 };
                 let has_greenargs = !live.types.is_empty();
                 let matched = match matched {
-                    Some(resolved) => resolved.cell,
+                    Some(resolved) => resolved,
                     None if has_greenargs => {
                         let pin = crate::warmstate::GreenRefPin::pin_one(0);
                         let mut resolved_live = pin.live_clone(&live);
                         self.matched_or_resolve(jd_no, None, &pin, &mut resolved_live)
                     }
-                    None => self
-                        .warm_state_ref_for_driver(jd_no)
-                        .and_then(|warm| warm.cell_by_key(green_key)),
+                    None => {
+                        let cell = self
+                            .warm_state_ref_for_driver(jd_no)
+                            .and_then(|warm| warm.cell_by_key(green_key));
+                        crate::warmstate::ResolvedJitCell {
+                            cell,
+                            hash: green_key,
+                        }
+                    }
                 };
                 (matched, live, None, has_greenargs)
             }

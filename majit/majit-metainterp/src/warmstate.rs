@@ -1232,21 +1232,20 @@ impl WarmEnterState {
     /// `warmstate.py bound_reached` steps 4-5.
     ///
     /// `matched` is the cell `maybe_compile_and_run`'s one comparekey walk
-    /// returned. `Some(cell)` marks that object. `None` is
-    /// `JitCell(*greenargs)` then `jitcounter.install_new_cell(hash, cell)`
-    /// with no second comparekey search. The counter is not reset here
-    /// (`JitCounter.tick` resets when it fires).
+    /// returned, plus that walk's `hash`. `Some(cell)` marks that object.
+    /// `None` is `JitCell(*greenargs)` then
+    /// `jitcounter.install_new_cell(hash, cell)` under the decision's `hash`
+    /// (`warmstate.py bound_reached`); no second comparekey search. The
+    /// counter is not reset here (`JitCounter.tick` resets when it fires).
     pub(crate) fn start_tracing_cell(
         &mut self,
-        matched: Option<&Rc<BaseJitCell>>,
+        matched: &ResolvedJitCell,
         pin: &GreenRefPin,
         live: &mut GreenKey,
     ) -> Rc<BaseJitCell> {
-        let cell = match matched {
+        let cell = match &matched.cell {
             Some(cell) => Rc::clone(cell),
             None => {
-                pin.reload(live);
-                let hash = live.get_uhash();
                 pin.reload(live);
                 let newcell = Rc::new(BaseJitCell::new_for_driver_with_greens(
                     self.jitdriver_sd,
@@ -1255,7 +1254,7 @@ impl WarmEnterState {
                 ));
                 pin.reload(live);
                 self.counter
-                    .install_new_cell(hash, Some(Rc::clone(&newcell)));
+                    .install_new_cell(matched.hash, Some(Rc::clone(&newcell)));
                 newcell
             }
         };
@@ -1476,7 +1475,8 @@ impl WarmEnterState {
                     return HotResult::NotHot;
                 }
                 pin.reload(&mut live);
-                let _marked = self.start_tracing_cell(cell.as_ref(), pin, &mut live);
+                let matched = ResolvedJitCell { cell, hash };
+                let _marked = self.start_tracing_cell(&matched, pin, &mut live);
                 HotResult::StartTracing
             }
             other => other,
@@ -1595,14 +1595,15 @@ impl WarmEnterState {
 
     /// Typed-key variant of [`Self::force_start_tracing`].
     ///
-    /// `matched` is the cell the one comparekey walk returned.
-    /// `Some(cell)` marks that object. `None` is `JitCell(*greenargs)` then
-    /// `jitcounter.install_new_cell(hash, cell)` with no second comparekey
-    /// search (`warmstate.py bound_reached`). Always `StartTracing`:
-    /// compiled / tracing / `JC_DONT_TRACE_HERE` were the decision's job.
+    /// `matched` is the cell the one comparekey walk returned, plus that
+    /// walk's `hash`. `Some(cell)` marks that object. `None` is
+    /// `JitCell(*greenargs)` then `jitcounter.install_new_cell(hash, cell)`
+    /// under the decision's `hash` (`warmstate.py bound_reached`); no second
+    /// comparekey search. Always `StartTracing`: compiled / tracing /
+    /// `JC_DONT_TRACE_HERE` were the decision's job.
     pub fn force_start_tracing_for_key(
         &mut self,
-        matched: Option<&Rc<BaseJitCell>>,
+        matched: &ResolvedJitCell,
         pin: &GreenRefPin,
         live: &mut GreenKey,
         reds: &[Value],
@@ -3495,9 +3496,11 @@ mod tests {
         live: &mut GreenKey,
     ) -> HotResult {
         pin.reload(live);
-        let matched = ws.lookup_chain_with_key(pin, live);
-        pin.reload(live);
-        ws.force_start_tracing_for_key(matched.as_ref(), pin, live, &[])
+        let (hash, mut hashed) = pin.live_after_hash(live);
+        let cell = ws.lookup_chain_with_greenargs(hash, &hashed.values, &hashed.types);
+        pin.reload(&mut hashed);
+        *live = hashed;
+        ws.force_start_tracing_for_key(&ResolvedJitCell { cell, hash }, pin, live, &[])
     }
 
     fn keys_sharing_index(index_of: impl Fn(u64) -> usize, n: usize) -> Vec<majit_ir::GreenKey> {
@@ -4792,7 +4795,7 @@ mod tests {
 
         assert!(matches!(
             GreenRefPin::with(&key, |__p, __l| ws.force_start_tracing_for_key(
-                Some(&matched),
+                &ResolvedJitCell::matched(Rc::clone(&matched), hash),
                 __p,
                 __l,
                 &[]
@@ -4819,10 +4822,11 @@ mod tests {
         let _ = token;
         let cell = GreenRefPin::with(&key, |__p, __l| ws.lookup_chain_with_key(__p, __l))
             .expect("compiled cell");
+        let hash = key.get_uhash();
         assert!(
             matches!(
                 GreenRefPin::with(&key, |__p, __l| ws.force_start_tracing_for_key(
-                    Some(&cell),
+                    &ResolvedJitCell::matched(Rc::clone(&cell), hash),
                     __p,
                     __l,
                     &[]
@@ -4834,7 +4838,7 @@ mod tests {
         assert!(
             matches!(
                 GreenRefPin::with(&key, |__p, __l| ws.force_start_tracing_for_key(
-                    Some(&cell),
+                    &ResolvedJitCell::matched(Rc::clone(&cell), hash),
                     __p,
                     __l,
                     &[]
@@ -4856,7 +4860,7 @@ mod tests {
         assert!(
             matches!(
                 GreenRefPin::with(&key, |__p, __l| ws.force_start_tracing_for_key(
-                    Some(&cell),
+                    &ResolvedJitCell::matched(Rc::clone(&cell), key.get_uhash()),
                     __p,
                     __l,
                     &[]
@@ -4892,7 +4896,7 @@ mod tests {
         ));
         assert!(matches!(
             GreenRefPin::with(&key, |__p, __l| ws.force_start_tracing_for_key(
-                Some(&cell),
+                &ResolvedJitCell::matched(Rc::clone(&cell), hash),
                 __p,
                 __l,
                 &[]
