@@ -134,6 +134,10 @@ fn empty_error() -> pyre_interpreter::PyError {
     pyre_interpreter::PyError::from_type_and_value(cls, pyre_object::PY_NULL)
 }
 
+// `&queue.queue` and `&queue.not_empty` are interior addresses of a GC
+// object, which `jtransform.py rewrite_op_getsubstruct` rejects for
+// `gckind != 'raw'`; the JIT calls this body instead of tracing it.
+#[majit_macros::dont_look_inside]
 fn simplequeue_put(queue: &W_SimpleQueue, item: PyObjectRef) -> PyObjectRef {
     // `_PySimpleQueue.put` keeps `item` as a frame local across the append.
     // There is no `pypy/module/_queue`; this native `put` is the same live

@@ -915,10 +915,12 @@ fn branch_loop_sum_lifts_next_to_iter_next_op() {
     );
 }
 
-/// `bool::then` / `bool::then_some` stay ordinary calls of the extracted
-/// core bodies (`if self { Some(f()) } else { None }` /
-/// `if self { Some(t) } else { None }`). The Some/None diamond and
-/// `then`'s `FnOnce::call_once` live in those graphs, not in the caller.
+/// `bool::then` stays an ordinary call of the extracted core body
+/// (`if self { Some(f()) } else { None }`); `FnOnce::call_once` and the
+/// Some/None diamond live in that graph, not in the caller.
+/// `bool::then_some` is the Opaque-core diamond (`if self { Some(t) }
+/// else { None }`) synthesized at the caller, the same shape
+/// `<[T]>::get` uses when Charon cannot extract the leaf.
 #[test]
 fn bool_then_keeps_regular_call_to_core_body() {
     use majit_translate::front::mir::lower_fun_decl;
@@ -1011,16 +1013,22 @@ fn bool_then_keeps_regular_call_to_core_body() {
     let (call_once, bool_branches, some_ctor, none_ctor) = diamond_counts(&some_graph);
     assert_eq!(
         residual_bool_calls(&some_graph, "then_some"),
-        1,
-        "then_some: caller keeps a regular call to the core body"
+        0,
+        "then_some: Opaque core leaf is the Some/None diamond"
     );
-    assert_eq!(call_once, 0, "then_some: the core body wraps the value");
-    assert_eq!(
-        bool_branches, 0,
-        "then_some: the caller does not host the Some/None diamond"
+    assert_eq!(call_once, 0, "then_some: wraps the value, no call_once");
+    assert!(
+        bool_branches >= 1,
+        "then_some: caller hosts the Some/None diamond (branches={bool_branches})"
     );
-    assert_eq!(some_ctor, 0, "then_some: Some is built in the core body");
-    assert_eq!(none_ctor, 0, "then_some: None is built in the core body");
+    assert!(
+        some_ctor >= 1,
+        "then_some: then arm builds Some (some={some_ctor})"
+    );
+    assert!(
+        none_ctor >= 1,
+        "then_some: else arm builds None (none={none_ctor})"
+    );
 
     let interpreter = load_llbc(INTERPRETER_LLBC);
     common::with_lowering(interpreter, |ctx| {
@@ -3481,10 +3489,14 @@ fn code_flags_methods_call_translated_bodies() {
     });
 }
 
-/// `PyFrame.co_flags` is `self.getcode().flags.bits()`. The `bits()`
-/// unwrap of the linked `CodeFlags` word is identity
+/// `PyFrame.co_flags` is `pyframe.py` `self.getcode().co_flags`. Two
+/// lowered shapes are accepted: `self.getcode().flags.bits()` — the
+/// `bits()` unwrap of the linked `CodeFlags` word is identity
 /// (`is_transparent_scalar_word_identity`), so the graph reads the
-/// flags field and does not residualize a compiler-core `bits` call.
+/// `flags` field or residualizes a `getcode` call — and a `getcode_w`
+/// call followed by a `FieldRead` of `PyCode.co_flags` that is the
+/// word (not `taken_by_address`). Neither residualizes a compiler-core
+/// `bits` call.
 #[test]
 fn co_flags_peels_bits_as_the_flag_word() {
     use majit_translate::model::{CallTarget, OpKind};
@@ -3527,6 +3539,7 @@ fn co_flags_peels_bits_as_the_flag_word() {
         graph.dump()
     );
     let mut saw_flags_word = false;
+    let mut saw_co_flags_word = false;
     for op in graph
         .blocks
         .iter()
@@ -3535,7 +3548,7 @@ fn co_flags_peels_bits_as_the_flag_word() {
         let OpKind::FieldRead { field, .. } = &op.kind else {
             continue;
         };
-        if field.name != "flags" {
+        if field.name != "flags" && field.name != "co_flags" {
             continue;
         }
         assert!(
@@ -3543,10 +3556,19 @@ fn co_flags_peels_bits_as_the_flag_word() {
             "CodeFlags borrow is the word, got {}",
             graph.dump()
         );
-        saw_flags_word = true;
+        if field.name == "flags" {
+            saw_flags_word = true;
+        } else if field
+            .owner_root
+            .as_deref()
+            .is_some_and(|owner| owner.contains("PyCode"))
+        {
+            saw_co_flags_word = true;
+        }
     }
     assert!(
         saw_flags_word
+            || saw_co_flags_word
             || graph
                 .blocks
                 .iter()
@@ -3560,7 +3582,7 @@ fn co_flags_peels_bits_as_the_flag_word() {
                         } if segments.last().map(String::as_str) == Some("getcode")
                     )
                 }),
-        "co_flags should read getcode/flags, got {}",
+        "co_flags should read getcode/flags or PyCode.co_flags, got {}",
         graph.dump()
     );
 }

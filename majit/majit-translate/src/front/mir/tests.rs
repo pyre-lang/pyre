@@ -9968,6 +9968,50 @@ fn raw_ptr_is_null_of_gc_instance_and_gc_string_keeps_is_none() {
     );
 }
 
+/// `<*mut GCREFOpaque>::is_null` is `eq(bool(p), False)` (`SomePtr.bool`
+/// / `PtrRepr.rtype_bool`). The operand is typed GCREF so `bool` lowers
+/// to `ptr_nonzero` rather than `int_is_true` (`w_pytraceback_new`
+/// `raw.is_null()`).
+#[test]
+fn raw_ptr_is_null_of_gcref_is_bool_of_a_gcref_operand() {
+    let gcrefopaque = named_adt(0, vec![]);
+    let gcref_ptr = serde_json::json!({"RawPtr": [gcrefopaque, "Mut"]});
+    let graph = lower_raw_ptr_is_null(
+        gcref_ptr,
+        vec![type_decl_struct(
+            0,
+            &["majit_gc", "header", "GCREFOpaque"],
+            vec![],
+        )],
+    );
+    let ops = graph_ops(&graph);
+    assert!(
+        is_null_bool_form(&ops),
+        "*mut GCREFOpaque is_null must be eq(bool(p), False); ops={ops:?}"
+    );
+    let has_ptr_iszero = ops.iter().any(
+        |op| matches!(&op.kind, crate::model::OpKind::UnaryOp { op, .. } if op == "ptr_iszero"),
+    );
+    assert!(
+        !has_ptr_iszero,
+        "*mut GCREFOpaque is_null must not emit ptr_iszero; ops={ops:?}"
+    );
+    assert!(
+        !is_null_is_none_form(&ops),
+        "*mut GCREFOpaque is_null must not be is_(p, None); ops={ops:?}"
+    );
+    let bool_operand_is_gcref = ops.iter().any(|op| match &op.kind {
+        crate::model::OpKind::UnaryOp { op, operand, .. } if op == "bool" => {
+            FunctionGraph::concretetype_of(operand) == crate::model::ConcreteType::GcRef
+        }
+        _ => false,
+    });
+    assert!(
+        bool_operand_is_gcref,
+        "*mut GCREFOpaque is_null bool operand must be GCREF; ops={ops:?}"
+    );
+}
+
 #[test]
 fn default_lookalike_path_stays_residual() {
     let i64_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}});
@@ -24669,8 +24713,10 @@ fn option_u8_window_discriminant_is_pointer_null_test() {
 /// `is_(SomePtr, ConstNone)` folds because `SomePtr.can_be_none` is
 /// False (`binaryop.py` `is__default`); `transform.py`
 /// `transform_dead_code` would cut the None arm.
+/// The operand is typed GCREF so the legacy `bool` lowering reads a
+/// ref register, not the int bank.
 #[test]
-fn option_gcref_discriminant_is_ptr_nonzero() {
+fn option_gcref_discriminant_is_bool_of_a_gcref_operand() {
     use crate::model::OpKind;
 
     let disc_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "Isize"}}});
@@ -24732,6 +24778,18 @@ fn option_gcref_discriminant_is_ptr_nonzero() {
         "Option<GCREF> Discriminant must emit bool(self); graph={}",
         graph.dump()
     );
+    for op in &ops {
+        if let OpKind::UnaryOp { op, operand, .. } = &op.kind
+            && op == "bool"
+        {
+            assert_eq!(
+                FunctionGraph::concretetype_of(operand),
+                crate::model::ConcreteType::GcRef,
+                "Option<GCREF> Discriminant bool operand must be GCREF; graph={}",
+                graph.dump()
+            );
+        }
+    }
     let has_is_const_none = ops
         .iter()
         .any(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "is_"))

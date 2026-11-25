@@ -62,6 +62,21 @@ const REVIEWED_UNROLL_SAFE: &[(&str, &str)] = &[
     // `baseobjspace.py call_function(self, w_func, *args_w)`: the same
     // per-call-site `*args_w`, copied by `list(args_w)`.
     ("call_function_impl_result", "baseobjspace.py call_function"),
+    // `call_function` specialised at `nargs == 1` (`len(args_w)`). RPython
+    // specialises `*args_w` so that graph has no loop; pyre's two-word
+    // `pin_roots` slice may inline as a two-iteration loop.
+    (
+        "call_function_1",
+        "baseobjspace.py call_function specialised at nargs==1",
+    ),
+    // `function.py Function.funccall(*args_w)`: RPython specialises
+    // `*args_w` so the graph has no loop; the slice form may inline
+    // `pin_roots` of the 0..=4-word run.
+    ("funccall_result", "function.py Function.funccall"),
+    (
+        "funccall_flat_from_args",
+        "function.py Function.funccall FLATPYCALL arm",
+    ),
     // `argument.py _match_signature` is `@jit.unroll_safe`: the positional
     // fill of a user function, and the argument roots of the builtin
     // `BuiltinCode.funcrun` path that reaches it.

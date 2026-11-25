@@ -4,8 +4,8 @@ use std::collections::HashSet;
 
 use common::{
     INTERPRETER_LLBC, OBJECT_LLBC, RLIB_LLBC,
-    build_semantic_program_from_llbcs_with_static_addrs_and_function_names, load_llbc, lower_named,
-    lower_named_with_static_addrs,
+    build_semantic_program_from_llbcs_with_static_addrs_and_function_names, load_llbc,
+    lower_function, lower_named, lower_named_with_static_addrs,
 };
 use majit_charon_reader::Llbc;
 use majit_translate::{
@@ -1223,6 +1223,83 @@ fn call_path_leaf(kind: &OpKind) -> Option<&str> {
         } => segments.last().map(String::as_str),
         _ => None,
     }
+}
+
+/// `dunder_import_inner` pins `w_name` then reloads it after a collecting
+/// residual (`reload_import`). CapturePlusArg of that pin dest is Get of
+/// the slot local (`shadowstack.py` `push_roots`); residual `get` of the
+/// pin dest would read leftover ROOT_STACK slot 0.
+fn count_gc_leaves(graph: &FunctionGraph) -> (usize, usize) {
+    let mut pin_roots = 0usize;
+    let mut get = 0usize;
+    for op in graph.blocks.iter().flat_map(|b| &b.operations) {
+        match call_path_leaf(&op.kind) {
+            Some("pin_roots") => pin_roots += 1,
+            Some("shadow_stack_get") => get += 1,
+            _ => {}
+        }
+    }
+    (pin_roots, get)
+}
+
+#[test]
+fn dunder_import_inner_erases_pin_roots() {
+    let interpreter_llbc = load_llbc(INTERPRETER_LLBC);
+    let object_llbc = load_llbc(OBJECT_LLBC);
+    let program = build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
+        &[interpreter_llbc, object_llbc],
+        HostStaticAddrs::default(),
+        &["importing"],
+        &["dunder_import_inner"],
+    )
+    .expect("lower importing::dunder_import_inner");
+    let function = program
+        .functions
+        .iter()
+        .find(|f| f.name == "dunder_import_inner")
+        .expect("dunder_import_inner graph");
+    let (pin_roots, get) = count_gc_leaves(function.graph());
+    assert_eq!(
+        (pin_roots, get),
+        (0, 0),
+        "dunder_import_inner residual pin_roots={pin_roots} shadow_stack_get={get}"
+    );
+
+    // Production prepass publishes object effects before interpreter
+    // bodies (`lib.rs` `set_root_stack_effects`). That is the graph the
+    // crashing bridge looks inside.
+    let object = Llbc::load(OBJECT_LLBC).expect("load object");
+    let interpreter = Llbc::load(INTERPRETER_LLBC).expect("load interpreter");
+    let (sens, leaves, params, ret_idx, observes, neutrals) =
+        majit_translate::front::mir::discover_stack_fn_effects(&object);
+    interpreter.register_stack_sensitive_fns(sens);
+    interpreter.register_stack_leaves_above_fns(leaves);
+    interpreter.register_stack_param_slots_fns(params);
+    interpreter.register_stack_returns_index_fns(ret_idx);
+    interpreter.register_stack_observes_fns(observes);
+    interpreter.register_stack_depth_neutral_fns(neutrals);
+    let touching = majit_translate::front::mir::harvest_root_stack_touching_paths(&object);
+    interpreter.set_root_stack_effects(vec![object.crate_name().to_string()], touching);
+    majit_translate::front::mir::mark_foreign_scope_owners(
+        &interpreter,
+        &majit_translate::front::mir::harvest_scope_owning_identities(&object),
+    );
+    let erase_named = majit_translate::front::mir::shadow_stack_erase_named(
+        &interpreter,
+        "::dunder_import_inner",
+    );
+    assert_eq!(
+        erase_named, "erased",
+        "dunder_import_inner CapturePlusArg of pin dest must erase"
+    );
+    let graph = lower_function(&interpreter, "dunder_import_inner")
+        .expect("lower dunder_import_inner with published effects");
+    let (pin_p, get_p) = count_gc_leaves(&graph);
+    assert_eq!(
+        (pin_p, get_p),
+        (0, 0),
+        "published-effects dunder_import_inner residual pin_roots={pin_p} shadow_stack_get={get_p}"
+    );
 }
 
 fn call_leaves(graph: &FunctionGraph) -> Vec<&str> {

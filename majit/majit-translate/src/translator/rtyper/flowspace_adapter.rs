@@ -6717,6 +6717,14 @@ pub(crate) fn derive_subject_inputcells(
                             cells.push(cell);
                             continue;
                         }
+                        // `RootScope` is the save_point int word. SomeInstance
+                        // here stamped GcRef onto `&self` while FUNC.ARGS of
+                        // `pin_roots` is Int (`history.py` `getkind` of a raw
+                        // `Ptr` / `llmemory.Address`).
+                        if crate::front::mir::is_root_scope_class_root(root) {
+                            cells.push(crate::annotator::model::s_int());
+                            continue;
+                        }
                         let cd = match interned {
                             Some(cd) => cd,
                             None if crate::annotator::bookkeeper::struct_root_is_string_family(
@@ -6804,6 +6812,10 @@ pub(crate) fn derive_subject_inputcells(
                 }
                 if let Some(cell) = bk.raw_struct_ptr_annotation(root) {
                     cells.push(cell);
+                    continue;
+                }
+                if crate::front::mir::is_root_scope_class_root(root) {
+                    cells.push(crate::annotator::model::s_int());
                     continue;
                 }
             }

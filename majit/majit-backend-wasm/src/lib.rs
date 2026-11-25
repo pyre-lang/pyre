@@ -2577,11 +2577,11 @@ fn gc_const_keys_of(table: Option<&majit_gc::GcTable>) -> Vec<usize> {
 }
 
 /// rewrite.py `gen_malloc_fixedsize` / gc.py `malloc_big_fixedsize(size, tid)`.
-/// The CALL_R size is `payload + GcHeader::SIZE`; [`wasm_jit_alloc`] takes
-/// `(type_id, payload_size)`.
+/// The CALL_R size is `payload + GcHeader::SIZE`; the helper is
+/// `external_malloc(alloc_young=True)`.
 pub extern "C" fn wasm_malloc_big_fixedsize(size: i64, type_id: i64) -> i64 {
     let payload = (size as usize).saturating_sub(majit_gc::header::GcHeader::SIZE);
-    wasm_jit_alloc(type_id, payload as i64)
+    oom_signal_if_zero(wasm_alloc_young_nonmoving_typed(type_id as u32, payload).0 as i64)
 }
 
 /// `malloc_big_fixedsize` old-generation twin for a `non_moving` size descr.

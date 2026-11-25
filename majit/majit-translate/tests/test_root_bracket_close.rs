@@ -2242,12 +2242,12 @@ fn wrap_cdata_call_erases_the_incoming_slice_bracket() {
     });
 }
 
-/// `try_new_for_call_with_closure_and_globals_obj` publishes `live` (the
-/// `[code, globals, closure, *args]` Vec) through `pin_roots`. That is
-/// the incoming-slice shape (`cdataobj.py descr_call` / `W_CData.call`
-/// passes `args_w` through; `pyframe.py Frame.__init__` livevars are
-/// that list), so the scalar replacement takes the bracket out of the
-/// jitcode and the walker is not left with a residual `push_roots`.
+/// `try_new_for_call_with_closure_and_globals_obj` is a single call into
+/// `finish_for_call_with_globals_obj` (`function.py _flat_pycall`) and
+/// opens no bracket. The incoming-slice livevars (`cdataobj.py descr_call`
+/// / `W_CData.call` passes `args_w` through; `pyframe.py Frame.__init__`
+/// livevars are that list) live in finish, so this graph has no
+/// `push_roots` for the walker to residualize.
 #[test]
 fn try_new_for_call_erases_the_published_slice_bracket() {
     let llbc = interpreter_llbc();

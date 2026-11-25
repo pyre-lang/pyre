@@ -326,7 +326,25 @@ impl<'a> Lowering<'a> {
                 }
                 None
             }
-            "base" | "pin_roots" | "shadow_stack_len" if receiver_scope.is_some() => None,
+            "pin_roots" => {
+                // `shadowstack.py` `push_roots` keeps the pin. Erasing it
+                // while a residual `shadow_stack_get` still names the dest
+                // (`dunder_import_inner` `reload_import`) reads a different
+                // Call's Int (`rewrite.py` `gen_write_barrier` /
+                // `llop.gc_writebarrier` VOID) or `get(0)`. rustc may also
+                // reuse the dest for a prior Call. Residualize unless this
+                // plan recorded a unique unbound base whose reads it
+                // answered.
+                if receiver_scope.is_none()
+                    || !self.root_bracket.base_results.contains_key(&dest_local)
+                    || self.local_var[dest_local].is_some()
+                    || !self.root_bracket.pin_dest_has_answered_read(dest_local)
+                {
+                    return Ok(false);
+                }
+                None
+            }
+            "base" | "shadow_stack_len" if receiver_scope.is_some() => None,
             "shadow_stack_copy_range" | "shadow_stack_copy_range_into_vec"
                 if receiver_scope.is_some() =>
             {
@@ -1172,6 +1190,12 @@ pub(in crate::front::mir) fn gc_rooted_items_type_path(name: &str) -> bool {
     segments.last() == Some(&ROOTED_ITEMS_TYPE) && segments.iter().any(|s| *s == ROOT_SCOPE_MODULE)
 }
 
+/// Class-root / intern-key spelling of [`ROOT_SCOPE_TYPE`]: the module
+/// path `gc_roots::RootScope`, or the harvested leaf.
+pub(crate) fn is_root_scope_class_root(name: &str) -> bool {
+    gc_root_scope_type_path(name) || name == ROOT_SCOPE_TYPE
+}
+
 /// Match Charon's `gc_roots::RootScope::<Impl>::drop_in_place` path.
 pub(in crate::front::mir) fn gc_root_scope_drop_glue_path(name: &str) -> bool {
     let segments: Vec<&str> = name.split("::").collect();
@@ -1700,6 +1724,16 @@ impl RootBracketPlan {
         }
         let scope = self.free_sites.get(&mir_bb).copied()?;
         self.scopes.contains(scope).then_some(scope)
+    }
+
+    /// Whether this plan answered a `get` / leftover-slice read of the
+    /// bracket that owns `dest_local`. Empty reads must not erase the
+    /// pin (`shadowstack.py` `push_roots`).
+    pub(in crate::front::mir) fn pin_dest_has_answered_read(&self, dest_local: usize) -> bool {
+        self.base_results.contains_key(&dest_local)
+            && (!self.get_sites.is_empty()
+                || !self.slice_gets.is_empty()
+                || !self.slice_copies.is_empty())
     }
 
     /// The guard an erased-bracket call's receiver operand names.
@@ -3761,6 +3795,33 @@ pub(in crate::front::mir) struct RootSlotSum {
     pub(in crate::front::mir) from_run: Option<usize>,
 }
 
+/// Whether `scope_gets` names this scope's `pin_roots` dest (or an
+/// offset of it). A classified `get` of a `shadow_stack_len` dest
+/// (`dunder_import_inner` `w_mod`) is not a read of the `pin_roots`
+/// dest; residual `reload_import` still names that dest.
+/// `shadowstack.py` `push_roots` keeps that pin. A bracket with no
+/// `pin_roots` dest (`pin_root` only) has nothing to require.
+pub(in crate::front::mir) fn scope_gets_read_pin_run(
+    scope: usize,
+    scope_gets: &[(usize, usize, u64)],
+    run_dests: &std::collections::HashMap<usize, (usize, usize)>,
+    bases: &std::collections::HashMap<usize, usize>,
+    offsets: &std::collections::HashMap<usize, RootSlotSum>,
+) -> bool {
+    if !run_dests.values().any(|(run_scope, _)| *run_scope == scope) {
+        return true;
+    }
+    scope_gets.iter().any(|(_, index_local, _)| {
+        run_dests
+            .get(index_local)
+            .is_some_and(|(run_scope, _)| *run_scope == scope)
+            || bases.get(index_local) == Some(&scope)
+            || offsets
+                .get(index_local)
+                .is_some_and(|slot| slot.scope == scope && slot.from_run.is_some())
+    })
+}
+
 /// The pin index of a `pin_roots` dest (or a copy of one) in `ordered`.
 ///
 /// `pin_roots` answers with the slot its first value took. The first run in
@@ -5461,6 +5522,27 @@ pub(in crate::front::mir) fn analyze_root_brackets_with(
         std::collections::HashMap::new();
     // A destination two `shadow_stack_len` calls write names no one depth.
     let mut len_poison = bit_set::BitSet::new();
+    // Call terminator destinations, counted separately from statement
+    // `Assign`s. `assigned` ignores Call dests so a `shadow_stack_len`
+    // dest with no statement still looks unique (`unwrap_or(0)==0`).
+    // `pin_roots` that shares its dest with another Call (a residual
+    // `try_gc_write_barrier`) must not be a base: erasing it leaves
+    // `shadow_stack_get` reading the barrier's Int, which for a nursery
+    // object is 0 (`rewrite.py` `gen_write_barrier` /
+    // `llop.gc_writebarrier` VOID).
+    let mut call_dest_counts: std::collections::HashMap<usize, usize> =
+        std::collections::HashMap::new();
+    for (bb_idx, bb) in body.body().iter().enumerate() {
+        if !forward_blocks[bb_idx] {
+            continue;
+        }
+        let Ok(TermKind::Call { call, .. }) = bb.term_ref(llbc) else {
+            continue;
+        };
+        if let PlaceKind::Local(dest) = call.dest.kind {
+            *call_dest_counts.entry(dest as usize).or_default() += 1;
+        }
+    }
     for (bb_idx, bb) in body.body().iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
@@ -5489,6 +5571,10 @@ pub(in crate::front::mir) fn analyze_root_brackets_with(
             let Some(scope) = open_scope_at(bb_idx) else {
                 continue;
             };
+            let dest = *dest as usize;
+            if call_dest_counts.get(&dest).copied() != Some(1) {
+                continue;
+            }
             if let Some(run) = pin_roots_slice_values(body, slice, &assigned, &forward_blocks) {
                 pin_runs.insert(bb_idx, (scope, run.0, run.1));
             } else if let Some(run) =
@@ -5499,8 +5585,8 @@ pub(in crate::front::mir) fn analyze_root_brackets_with(
                 continue;
             }
             free_sites.insert(bb_idx, scope);
-            bases.insert(*dest as usize, scope);
-            run_dests.insert(*dest as usize, (scope, bb_idx));
+            bases.insert(dest, scope);
+            run_dests.insert(dest, (scope, bb_idx));
             continue;
         }
         // `pin_root(value)` pins onto the bracket open where it runs. The
@@ -5562,6 +5648,11 @@ pub(in crate::front::mir) fn analyze_root_brackets_with(
         if pins_many {
             // `scope.pin_roots(&[..])` answers with the slot its first value
             // took. The first run is the scope's base; a later run is not.
+            // A dest another Call also writes is not a unique base; see
+            // the free `pin_roots` arm.
+            if call_dest_counts.get(&(*dest as usize)).copied() != Some(1) {
+                continue;
+            }
             let Some(slice) = operand_local(call.args.get(1)) else {
                 continue;
             };
@@ -6224,6 +6315,16 @@ pub(in crate::front::mir) fn analyze_root_brackets_with(
             if !ok {
                 continue;
             }
+            // `cdataobj.py` `descr_call` leftover-slice erasure answers
+            // `get(base + k)` as `getarrayitem`. Empty `sites` and
+            // `copies` is `dunder_import_inner` `reload_import`: the
+            // gets live in closures this pass did not classify.
+            // Erasing `pin_roots` then leaves residual
+            // `shadow_stack_get` of that dest (`shadowstack.py`
+            // `push_roots` keeps the pin).
+            if sites.is_empty() && copies.is_empty() {
+                continue;
+            }
             plan.scopes.insert(scope);
             plan.slice_gets.extend(sites);
             plan.slice_copies.extend(copies);
@@ -6285,6 +6386,12 @@ pub(in crate::front::mir) fn analyze_root_brackets_with(
             if !ok {
                 continue;
             }
+            // Same empty-read KEEP as the leftover-slice arm:
+            // `shadowstack.py` `push_roots` keeps a pin whose `get`
+            // this pass cannot answer.
+            if sites.is_empty() {
+                continue;
+            }
             plan.scopes.insert(scope);
             plan.slice_gets.extend(sites);
             for (base_local, base_scope) in &bases {
@@ -6312,12 +6419,16 @@ pub(in crate::front::mir) fn analyze_root_brackets_with(
                 continue;
             }
         } else if scope_gets.is_empty()
-            && single_pins
-                .values()
-                .any(|(pin_scope, _)| *pin_scope == scope)
+            || !scope_gets_read_pin_run(scope, &scope_gets, &run_dests, &bases, &offsets)
         {
-            // A free `pin_root` published a slot nothing read back. The close
-            // still rewinds that slot, so the bracket stays.
+            // A pin published a slot this pass cannot name a read-back for.
+            // Erasing it leaves a residual `shadow_stack_get` of that dest
+            // (`dunder_import_inner` `reload_import`) reading a different
+            // Call's Int (`rewrite.py` `gen_write_barrier` /
+            // `llop.gc_writebarrier` VOID). A classified `get` of a
+            // different dest (`shadow_stack_len` / `w_mod`) is not a
+            // read of the `pin_roots` dest. `shadowstack.py` `push_roots`
+            // keeps the unread pin, whether `pin_root` or `pin_roots`.
             continue;
         } else {
             let region = root_bracket_region(llbc, body, opener, scope, &name_of);

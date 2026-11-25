@@ -7451,6 +7451,12 @@ impl CallControl {
         majit_ir::effectinfo::DescrSetMember,
     )> {
         use majit_ir::descr::{LLType, path_hash};
+        // `rclass.InstanceRepr._get_field` walks `rbase` after `cast_pointer`,
+        // so `cpu.fielddescrof` is keyed on the BASE STRUCT.
+        let (owner_root, owner_id) = crate::codewriter::assembler::fielddescrof_enum_base_owner(
+            self, field_name, owner_root, owner_id,
+        );
+        let owner_root = owner_root.as_str();
         let fields = self.struct_fields.fields.get(owner_root).or_else(|| {
             // `Entry<K,V>` reuses the template rows. Other `<…>` owners
             // keep their own registration; falling back there numbers a
@@ -11763,10 +11769,11 @@ fn calldescr_type_of_value_type(
             if crate::front::llbc_hints::alloc_flavor_raw_contains(
                 raw_alloc_flavor_structs,
                 name,
-            ) =>
+            ) || crate::front::mir::is_root_scope_class_root(name) =>
         {
             // `history.getkind` of a raw `Ptr` is int (`rclass.py getgcflavor`).
-            // Front stays `Ref(Some(flavor))`.
+            // Front stays `Ref(Some(flavor))`. `RootScope` is the same
+            // save_point address word (`llmemory.Address`).
             Some(Type::Int)
         }
         // `Str` / `StringBuilder` are GC pointers (`getkind` → `'ref'`).

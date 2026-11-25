@@ -3962,7 +3962,7 @@ static W_SLICE_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
 /// it is a `Type::Ref` row of `gc_fielddescrs` and `clear_gc_fields` zeroes
 /// it.
 static PYFRAME_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
-    build_object_descr_group_with_def_path(
+    let group = build_object_descr_group_with_def_path(
         std::mem::size_of::<pyre_interpreter::pyframe::PyFrame>(),
         PYFRAME_GC_TYPE_ID,
         // `NewWithVtable` writes this typeptr at `cpu.vtable_offset`
@@ -4102,7 +4102,8 @@ static PYFRAME_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
         ],
         "PyFrame",
         "pyframe::PyFrame",
-    )
+    );
+    group
 });
 
 impl Descr for PyreSizeDescr {
