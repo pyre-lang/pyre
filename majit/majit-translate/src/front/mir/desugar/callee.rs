@@ -550,12 +550,13 @@ fn push_unique_spelling(out: &mut Vec<String>, spelling: String) {
 /// `row_of_graphs`). The family is the union of every store: a static
 /// Aggregate, a runtime constructor, a field assignment through a place,
 /// a `from_access`-style copy of the same `(struct, field)`, and a
-/// constructor parameter whose Regular call sites pass FunDecl constants
+/// constructor parameter whose call sites pass FunDecl constants
 /// (`description.py FunctionDesc.pycall` unions arguments over call
-/// sites). A store that is not a recoverable FunDecl (a parameter with no
-/// such call site, a call result, a field of another type) marks the slot
-/// unknown; that field publishes no row (`FnPtrFamily::Unknown` /
-/// `graphs_from` None).
+/// sites; `bookkeeper.py Bookkeeper.consider_call_site` sees a direct
+/// call and a call through a `SomePBC` of the storing function). A store
+/// that is not a recoverable FunDecl (a parameter with no such call site,
+/// a call result, a field of another type) marks the slot unknown; that
+/// field publishes no row (`FnPtrFamily::Unknown` / `graphs_from` None).
 pub fn discover_fnptr_field_families(llbc: &Llbc) -> Vec<(String, String, String)> {
     llbc_derived(llbc)
         .fnptr_field_families
@@ -574,7 +575,7 @@ fn discover_fnptr_field_families_uncached(llbc: &Llbc) -> Vec<(String, String, S
     resolve_fnptr_field_families(&collect_fnptr_family_inputs(llbc))
 }
 
-/// Per-artefact FnPtr-field stores and Regular call arguments, keyed by
+/// Per-artefact FnPtr-field stores and call arguments, keyed by
 /// registered FunDecl path so a constructor in one crate and its call
 /// sites in another union the same way `FunctionDesc.pycall` unions
 /// arguments over the whole program.
@@ -582,6 +583,12 @@ fn discover_fnptr_field_families_uncached(llbc: &Llbc) -> Vec<(String, String, S
 pub(crate) struct FnPtrFamilyInputs {
     call_args: std::collections::HashMap<String, Vec<Vec<PathArg>>>,
     stores: Vec<FieldStore>,
+    /// A `CallFunc::Dynamic` through a fn pointer whose callee is not a
+    /// closed FunDecl set. `Bookkeeper.consider_call_site` then sees a
+    /// `SomePBC` of every FunDecl used as a value.
+    unresolved_fnptr_dynamic: bool,
+    /// FunDecls reified as values (`operand_fundef` / `__fn_const`).
+    fn_defs_as_values: std::collections::BTreeSet<String>,
 }
 
 impl FnPtrFamilyInputs {
@@ -590,6 +597,8 @@ impl FnPtrFamilyInputs {
             self.call_args.entry(callee).or_default().append(&mut sites);
         }
         self.stores.extend(other.stores);
+        self.unresolved_fnptr_dynamic |= other.unresolved_fnptr_dynamic;
+        self.fn_defs_as_values.extend(other.fn_defs_as_values);
     }
 }
 
@@ -624,8 +633,8 @@ enum FieldStore {
     },
 }
 
-/// Walk one artefact: Regular call arguments (resolved inside that
-/// artefact) and FnPtr-field stores (parameters stay parameters).
+/// Walk one artefact: call arguments (resolved inside that artefact)
+/// and FnPtr-field stores (parameters stay parameters).
 pub(crate) fn collect_fnptr_family_inputs(llbc: &Llbc) -> FnPtrFamilyInputs {
     let mut inputs = FnPtrFamilyInputs::default();
     collect_path_call_args(llbc, &mut inputs);
@@ -645,8 +654,10 @@ pub(crate) fn collect_fnptr_family_inputs(llbc: &Llbc) -> FnPtrFamilyInputs {
     inputs
 }
 
-/// `FunctionDesc.pycall` unions over every Regular site of a path.
-/// A parameter store whose sites do not close is Unknown.
+/// `FunctionDesc.pycall` unions over every call site of a path
+/// (`Bookkeeper.consider_call_site`, including a `SomePBC` of the
+/// storing function). A parameter store whose sites do not close is
+/// Unknown.
 pub(crate) fn resolve_fnptr_field_families(
     inputs: &FnPtrFamilyInputs,
 ) -> Vec<(String, String, String)> {
@@ -748,6 +759,10 @@ fn fun_decl_callpath(llbc: &Llbc, id: u64) -> Option<String> {
     if key.is_empty() { None } else { Some(key) }
 }
 
+/// Record every call of a path: a `CallFunc::Regular` FunDecl, and a
+/// `CallFunc::Dynamic` whose callee operand closes to FunDecls
+/// (`FnPtrStoreCx`). An unresolvable fn-pointer Dynamic call may target
+/// any FunDecl used as a value (`operand_fundef`).
 fn collect_path_call_args(llbc: &Llbc, inputs: &mut FnPtrFamilyInputs) {
     for fd in llbc.iter_fun_decls() {
         if !fd.has_unstructured_body() {
@@ -761,29 +776,84 @@ fn collect_path_call_args(llbc: &Llbc, inputs: &mut FnPtrFamilyInputs) {
             if !forward_blocks[bb_idx] {
                 continue;
             }
+            for stmt in &bb.statements {
+                let Ok(StmtKind::Assign(_, rvalue)) = stmt.stmt_kind_ref() else {
+                    continue;
+                };
+                for fun in rvalue_fundefs(llbc, rvalue) {
+                    record_fn_def_as_value(llbc, inputs, fun);
+                }
+            }
             let Ok(TermKind::Call { call, .. }) = bb.term_ref(llbc) else {
                 continue;
             };
-            let CallFunc::Regular(reg) = &call.func else {
-                continue;
-            };
-            let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
-                continue;
-            };
-            let Some(callee_path) = fun_decl_callpath(llbc, *id) else {
-                continue;
-            };
-            let args = call
-                .args
-                .iter()
-                .map(|operand| {
+            if let CallFunc::Dynamic(op, _) = &call.func
+                && let Some(fun) = operand_fundef(llbc, op)
+            {
+                record_fn_def_as_value(llbc, inputs, fun);
+            }
+            for arg in &call.args {
+                if let Some(fun) = operand_fundef(llbc, arg) {
+                    record_fn_def_as_value(llbc, inputs, fun);
+                }
+            }
+            let callee_ids: Vec<u64> = match &call.func {
+                CallFunc::Regular(reg) => match &reg.kind {
+                    CallKind::Fun(FunId::Regular { id }) => vec![*id],
+                    _ => Vec::new(),
+                },
+                CallFunc::Dynamic(op, _) => {
                     let mut cx = FnPtrStoreCx::new(llbc, u64::MAX, "");
-                    path_arg_from(llbc, cx.of_operand_in_fun(fd.def_id, operand))
-                })
-                .collect();
-            inputs.call_args.entry(callee_path).or_default().push(args);
+                    match cx.of_operand_in_fun(fd.def_id, op) {
+                        StoreSource::Funs(funs) => funs.into_iter().collect(),
+                        _ => {
+                            if operand_is_fnptr(llbc, op) {
+                                inputs.unresolved_fnptr_dynamic = true;
+                            }
+                            Vec::new()
+                        }
+                    }
+                }
+                _ => Vec::new(),
+            };
+            for callee_id in callee_ids {
+                record_path_call_args(llbc, inputs, fd.def_id, callee_id, &call.args);
+            }
         }
     }
+}
+
+fn record_fn_def_as_value(llbc: &Llbc, inputs: &mut FnPtrFamilyInputs, fun_id: u64) {
+    if let Some(path) = fun_decl_callpath(llbc, fun_id) {
+        inputs.fn_defs_as_values.insert(path);
+    }
+}
+
+fn record_path_call_args(
+    llbc: &Llbc,
+    inputs: &mut FnPtrFamilyInputs,
+    caller_id: u64,
+    callee_id: u64,
+    args: &[Operand],
+) {
+    let Some(callee_path) = fun_decl_callpath(llbc, callee_id) else {
+        return;
+    };
+    let args = args
+        .iter()
+        .map(|operand| {
+            let mut cx = FnPtrStoreCx::new(llbc, u64::MAX, "");
+            path_arg_from(llbc, cx.of_operand_in_fun(caller_id, operand))
+        })
+        .collect();
+    inputs.call_args.entry(callee_path).or_default().push(args);
+}
+
+fn operand_is_fnptr(llbc: &Llbc, operand: &Operand) -> bool {
+    let ty = operand_tyref(operand)
+        .cloned()
+        .or_else(|| const_operand_tyref(operand, llbc));
+    ty.is_some_and(|ty| tyref_is_fnptr(&ty, llbc))
 }
 
 fn path_arg_from(llbc: &Llbc, source: StoreSource) -> PathArg {
@@ -836,6 +906,13 @@ fn resolve_param(
     arg_pos: usize,
     visiting: &mut Vec<(String, usize)>,
 ) -> PathArg {
+    // An unresolvable fn-pointer Dynamic call may target any FunDecl
+    // used as a value. `Bookkeeper.consider_call_site` sees that
+    // `SomePBC` and unions unknown arguments; a smaller closed set is
+    // unsound.
+    if inputs.unresolved_fnptr_dynamic && inputs.fn_defs_as_values.contains(fn_path) {
+        return PathArg::Unknown;
+    }
     let key = (fn_path.to_string(), arg_pos);
     if visiting.contains(&key) {
         return PathArg::ClosedCopy;
@@ -1083,11 +1160,11 @@ fn record_param_stores(
 /// `ClosedCopy` is a read of the same `(struct, field)` (`from_access`-style
 /// `x.f` stored into `y.f` of the same type): it adds no new target.
 /// `Params` is a constructor argument; `resolve_fnptr_field_families`
-/// unions Regular call sites of that FunDecl path (`FunctionDesc.pycall`).
-/// `Unknown` is any other non-FunDecl (a parameter whose Regular call
-/// sites do not close, a call, a different field). `FunctionReprBase.call`
-/// unions `s_pbc.descriptions`; an unknown store means the annotated set
-/// is not closed.
+/// unions call sites of that FunDecl path (`FunctionDesc.pycall`).
+/// `Unknown` is any other non-FunDecl (a parameter whose call sites do
+/// not close, a call, a different field). `FunctionReprBase.call` unions
+/// `s_pbc.descriptions`; an unknown store means the annotated set is
+/// not closed.
 enum StoreSource {
     Funs(std::collections::BTreeSet<u64>),
     Params(std::collections::BTreeSet<(u64, usize)>),
@@ -1211,14 +1288,16 @@ impl<'a> FnPtrStoreCx<'a> {
         let Some(rvalues) = assigns.rvalues.get(index) else {
             return StoreSource::Unknown;
         };
+        // Incoming parameter value reaches a use on the path that does
+        // not reassign it (`annrpython.py RPythonAnnotator.mergeinputargs`
+        // unions every value that reaches the variable).
+        let incoming =
+            (index >= 1 && (index as u64) <= arg_count).then(|| self.of_parameter(fun_id, index));
         if rvalues.is_empty() {
-            if index >= 1 && (index as u64) <= arg_count {
-                return self.of_parameter(fun_id, index);
-            }
-            return StoreSource::Unknown;
+            return incoming.unwrap_or(StoreSource::Unknown);
         }
         self.visiting.push(key);
-        let mut acc: Option<StoreSource> = None;
+        let mut acc = incoming;
         for rvalue in rvalues {
             let next = self.of_rvalue(fun_id, arg_count, assigns, rvalue);
             acc = Some(match acc {
