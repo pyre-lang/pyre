@@ -4709,7 +4709,13 @@ pub fn funccall_valuestack(
         let _roots = pyre_object::gc_roots::push_roots();
         let root_base = _roots.base();
         let _ = _roots.pin_root(code as PyObjectRef);
-        let args = unsafe { &*caller.live() }.make_arguments(nargs, false, func);
+        let args = match unsafe { &*caller.live() }.make_arguments(nargs, false, func) {
+            Ok(args) => args,
+            Err(e) => {
+                crate::call::set_call_error(e);
+                return pyre_object::PY_NULL;
+            }
+        };
         unsafe { &mut *caller.live() }.dropvalues(dropvalues);
         return match unsafe { crate::builtin_code_call(_roots.get(root_base), &args.arguments_w) } {
             Ok(v) => v,
@@ -4736,7 +4742,14 @@ pub fn funccall_valuestack(
     let _roots = pyre_object::gc_roots::push_roots();
     let root_base = _roots.base();
     let _ = _roots.pin_root(func);
-    let args = unsafe { &*caller.live() }.make_arguments(nargs, methodcall, _roots.get(root_base));
+    let args =
+        match unsafe { &*caller.live() }.make_arguments(nargs, methodcall, _roots.get(root_base)) {
+            Ok(args) => args,
+            Err(e) => {
+                crate::call::set_call_error(e);
+                return pyre_object::PY_NULL;
+            }
+        };
     let npos = args.arguments_w.len();
     let names_is_some = args.keyword_names_w.is_some();
     let nkw = crate::argument::arguments_keyword_count(&args);
@@ -4752,7 +4765,7 @@ pub fn funccall_valuestack(
     pyre_object::gc_roots::shadow_stack_copy_range_into_vec(names_base, &mut keyword_names_w);
     let mut keywords_w = vec![pyre_object::PY_NULL; nkw];
     pyre_object::gc_roots::shadow_stack_copy_range_into_vec(values_base, &mut keywords_w);
-    let args = crate::argument::Arguments::from_owned_vecs(
+    let args = match crate::argument::Arguments::from_owned_vecs(
         arguments_w,
         if names_is_some {
             Some(keyword_names_w)
@@ -4766,7 +4779,13 @@ pub fn funccall_valuestack(
         },
         jit_few_keywords,
         methodcall_flag,
-    );
+    ) {
+        Ok(args) => args,
+        Err(e) => {
+            crate::call::set_call_error(e);
+            return pyre_object::PY_NULL;
+        }
+    };
     match crate::call::function_call_args(_roots.get(root_base), &args) {
         Ok(v) => v,
         Err(e) => {

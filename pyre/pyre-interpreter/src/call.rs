@@ -2131,13 +2131,13 @@ fn arguments_from_call_kw(
             majit_rlib::jit::isconstant(&nkw),
         )
     };
-    Ok(crate::argument::Arguments::from_owned_vecs(
+    crate::argument::Arguments::from_owned_vecs(
         arguments_w,
         keyword_names_w,
         keywords_w,
         jit_few_keywords,
         has_receiver,
-    ))
+    )
 }
 
 /// Pin the incoming `Arguments` Vecs and read the flags `funcrun_obj`
@@ -2185,7 +2185,7 @@ fn arguments_from_funcrun_pins(
     jit_few_keywords: bool,
     methodcall: bool,
     names_is_some: bool,
-) -> crate::argument::Arguments {
+) -> Result<crate::argument::Arguments, crate::PyError> {
     let arguments_w = copy_shadow_slice(args_base, nargs);
     let keyword_names_w = if names_is_some {
         Some(copy_shadow_slice(names_base, nkw))
@@ -2407,6 +2407,14 @@ pub(crate) fn funcrun_obj(
     debug_assert!(!sig_ptr.is_null(), "PyCode._signature");
     let signature = unsafe { &*sig_ptr };
 
+    // `pycode.py PyCode.funcrun` / `funcrun_obj` pass `func.qualname` into
+    // `parse_into_scope`, so a binding TypeError is `C.m()` /
+    // `outer.<locals>.inner()` rather than the bare `co_name`. The lookup
+    // can allocate, so it runs before the defaults and the `Arguments`
+    // twins are read off the shadow stack.
+    let fnname =
+        unsafe { crate::function_get_qualname(pyre_object::gc_roots::shadow_stack_get(func_slot)) };
+    let defaults_w = copy_shadow_slice(defaults_base, ndef);
     let parsed = arguments_from_funcrun_pins(
         args_base,
         nargs,
@@ -2416,13 +2424,7 @@ pub(crate) fn funcrun_obj(
         jit_few_keywords,
         methodcall,
         names_is_some,
-    );
-    let defaults_w = copy_shadow_slice(defaults_base, ndef);
-    // `pycode.py PyCode.funcrun` / `funcrun_obj` pass `func.qualname` into
-    // `parse_into_scope`, so a binding TypeError is `C.m()` /
-    // `outer.<locals>.inner()` rather than the bare `co_name`.
-    let fnname =
-        unsafe { crate::function_get_qualname(pyre_object::gc_roots::shadow_stack_get(func_slot)) };
+    )?;
     // `pycode.py PyCode.funcrun` — `fresh_frame = jit.hint(frame,
     // access_directly=True, fresh_virtualizable=True)` then
     // `args.parse_into_scope(..., fresh_frame.locals_cells_stack_w, ...)`.
@@ -3865,7 +3867,7 @@ pub fn parse_builtin_signature(
             .map(|i| pyre_object::gc_roots::shadow_stack_get(base + i))
             .collect()
     });
-    let arguments = crate::argument::Arguments::with_kw(&pos_now, &names_now, &values_now);
+    let arguments = crate::argument::Arguments::with_kw(&pos_now, &names_now, &values_now)?;
     // `interp2app._getdefaults` → `Function.defs_w`. Required slots stay
     // absent so `_match_signature` raises `ArgErrMissing` (`argument.py`).
     let defaults = defaults_now.as_deref();
@@ -4204,30 +4206,30 @@ fn call_passthrough_wrapper(
 fn call_passthrough_maybe_profile(
     profile_frame: *mut PyFrame,
     current_callable: impl Fn() -> PyObjectRef,
-    make_args: impl Fn() -> crate::argument::Arguments,
+    make_args: impl Fn() -> Result<crate::argument::Arguments, crate::PyError>,
     body: impl FnOnce(&crate::argument::Arguments) -> PyResult,
 ) -> PyResult {
     let frame_ptr = c_profile_frame(profile_frame);
     if frame_ptr.is_null() {
-        let arguments = make_args();
+        let arguments = make_args()?;
         return body(&arguments);
     }
     let _roots = pyre_object::gc_roots::push_roots();
     let frame_anchor = unsafe { crate::eval::FrameAnchor::from_raw(frame_ptr) };
     let ec = getexecutioncontext() as *mut crate::PyExecutionContext;
-    let arguments = make_args();
+    let arguments = make_args()?;
     if !ec.is_null() {
         unsafe {
             (*ec).c_call_trace(frame_anchor.live(), current_callable(), Some(&arguments))?;
         }
     }
-    let arguments = make_args();
+    let arguments = make_args()?;
     match body(&arguments) {
         Ok(w_res) => {
             let result_slot = pyre_object::gc_roots::shadow_stack_len();
             let _ = pyre_object::gc_roots::pin_root(w_res);
             if !ec.is_null() {
-                let arguments = make_args();
+                let arguments = make_args()?;
                 unsafe {
                     (*ec).c_return_trace(
                         frame_anchor.live(),
@@ -4635,7 +4637,7 @@ pub(crate) fn call_with_kwargs_in_ctx_impl(
                         let names_now = rooted_names();
                         let values_now = rooted_values();
                         let arguments =
-                            crate::argument::Arguments::with_kw(&pos_now, &names_now, &values_now);
+                            crate::argument::Arguments::with_kw(&pos_now, &names_now, &values_now)?;
                         unsafe {
                             (*ec).c_call_trace(
                                 frame_anchor.live(),
@@ -4715,7 +4717,7 @@ pub(crate) fn call_with_kwargs_in_ctx_impl(
                         let names_now = rooted_names();
                         let values_now = rooted_values();
                         let arguments =
-                            crate::argument::Arguments::with_kw(&pos_now, &names_now, &values_now);
+                            crate::argument::Arguments::with_kw(&pos_now, &names_now, &values_now)?;
                         unsafe {
                             (*ec).c_return_trace(
                                 frame_anchor.live(),
@@ -5867,7 +5869,7 @@ fn descr_call_invoke(
         let pos_now = rooted_object_slice(pos_base, npos);
         let names_now = rooted_object_slice(names_base, nkw);
         let values_now = rooted_object_slice(values_base, nkw);
-        let forwarded = crate::argument::Arguments::with_kw(&pos_now, &names_now, &values_now);
+        let forwarded = crate::argument::Arguments::with_kw(&pos_now, &names_now, &values_now)?;
         call_args(
             pyre_object::gc_roots::shadow_stack_get(callable_slot),
             &forwarded,
@@ -6757,7 +6759,7 @@ mod function_call_args_tests {
         let w_1 = pyre_object::w_int_new(1);
         let w_name_c = pyre_object::w_str_new("c");
         let w_30 = pyre_object::w_int_new(30);
-        let args = crate::argument::Arguments::with_kw(&[w_1], &[w_name_c], &[w_30]);
+        let args = crate::argument::Arguments::with_kw(&[w_1], &[w_name_c], &[w_30]).unwrap();
         let result = super::function_call_args(f, &args).expect("function_call_args");
         unsafe {
             assert!(pyre_object::is_tuple(result));

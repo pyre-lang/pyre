@@ -6214,17 +6214,22 @@ mod tests {
 
     #[test]
     fn w_code_new_owned_releases_caches_when_wrapper_malloc_fails() {
-        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::cell::Cell;
         let _hook_lock = pyre_object::gc_hook::hook_test_guard();
         // `fetch_memory_error` builds `OperationError(w_MemoryError, w_None)`;
         // the class table is filled by `init_typeobjects`.
         let _ctx = crate::PyExecutionContext::default();
-        static PENDING: AtomicBool = AtomicBool::new(false);
+        // The occurred hook is process-global; a per-thread flag keeps a
+        // concurrently running test from reading this test's pending
+        // MemoryError and treating its own allocation as failed.
+        thread_local! {
+            static PENDING: Cell<bool> = const { Cell::new(false) };
+        }
         fn raise() {
-            PENDING.store(true, Ordering::SeqCst);
+            PENDING.with(|p| p.set(true));
         }
         fn occurred() -> bool {
-            PENDING.load(Ordering::SeqCst)
+            PENDING.with(Cell::get)
         }
         fn refuse_pycode(type_id: u32, payload_size: usize) -> pyre_object::gc_hook::GCREF {
             if type_id == W_CODE_GC_TYPE_ID {
@@ -6256,7 +6261,7 @@ mod tests {
                 majit_gc::set_active_exception_occurred(None);
             }
         }
-        PENDING.store(false, Ordering::SeqCst);
+        PENDING.with(|p| p.set(false));
         majit_gc::set_active_raise_memory_error(Some(raise));
         majit_gc::set_active_exception_occurred(Some(occurred));
         let _clear_raise = ClearRaise;
@@ -6265,7 +6270,7 @@ mod tests {
         let err = box_code_object(code).expect_err("PyCode malloc must fail");
         assert_eq!(err.kind, crate::PyErrorKind::MemoryError);
         pyre_object::gc_hook::clear_gc_alloc_hook();
-        PENDING.store(false, Ordering::SeqCst);
+        PENDING.with(|p| p.set(false));
         majit_gc::set_active_raise_memory_error(None);
         majit_gc::set_active_exception_occurred(None);
         let w_code =
@@ -6280,17 +6285,22 @@ mod tests {
     /// object for the GC.
     #[test]
     fn w_code_new_owned_frees_unattached_graph_when_wrapper_malloc_fails() {
-        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::cell::Cell;
         let _hook_lock = pyre_object::gc_hook::hook_test_guard();
         // `fetch_memory_error` builds `OperationError(w_MemoryError, w_None)`;
         // the class table is filled by `init_typeobjects`.
         let _ctx = crate::PyExecutionContext::default();
-        static PENDING: AtomicBool = AtomicBool::new(false);
+        // The occurred hook is process-global; a per-thread flag keeps a
+        // concurrently running test from reading this test's pending
+        // MemoryError and treating its own allocation as failed.
+        thread_local! {
+            static PENDING: Cell<bool> = const { Cell::new(false) };
+        }
         fn raise() {
-            PENDING.store(true, Ordering::SeqCst);
+            PENDING.with(|p| p.set(true));
         }
         fn occurred() -> bool {
-            PENDING.load(Ordering::SeqCst)
+            PENDING.with(Cell::get)
         }
         fn refuse_pycode(type_id: u32, payload_size: usize) -> pyre_object::gc_hook::GCREF {
             if type_id == W_CODE_GC_TYPE_ID {
@@ -6322,7 +6332,7 @@ mod tests {
                 majit_gc::set_active_exception_occurred(None);
             }
         }
-        PENDING.store(false, Ordering::SeqCst);
+        PENDING.with(|p| p.set(false));
         majit_gc::set_active_raise_memory_error(Some(raise));
         majit_gc::set_active_exception_occurred(Some(occurred));
         let _clear_raise = ClearRaise;
@@ -6352,7 +6362,7 @@ mod tests {
             .expect_err("PyCode malloc must fail");
         assert_eq!(err.kind, crate::PyErrorKind::MemoryError);
         pyre_object::gc_hook::clear_gc_alloc_hook();
-        PENDING.store(false, Ordering::SeqCst);
+        PENDING.with(|p| p.set(false));
         majit_gc::set_active_raise_memory_error(None);
         majit_gc::set_active_exception_occurred(None);
         {

@@ -17209,7 +17209,7 @@ pub fn call_args(
         let func_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(func);
         let receiver = pyre_object::gc_roots::pin_root(receiver);
-        let prepended = args.prepend(receiver);
+        let prepended = args.prepend(receiver)?;
         return call_args(
             pyre_object::gc_roots::shadow_stack_get(func_slot),
             &prepended,
@@ -17432,7 +17432,13 @@ pub fn call_args_and_c_profile(
     let args_base = roots.pin_roots(args);
     let mut rooted_args = vec![PY_NULL; nargs];
     pyre_object::gc_roots::shadow_stack_copy_range(args_base, &mut rooted_args);
-    let mut arguments = crate::argument::Arguments::positional_only(&rooted_args);
+    let mut arguments = match crate::argument::Arguments::positional_only(&rooted_args) {
+        Ok(arguments) => arguments,
+        Err(error) => {
+            crate::call::set_call_error(error);
+            return pyre_object::PY_NULL;
+        }
+    };
     pyre_object::gc_roots::shadow_stack_copy_range(args_base, &mut rooted_args);
     callable = roots.get(callable_slot);
     call_args_and_c_profile_args(&frame_anchor, callable, &mut arguments, &rooted_args)
@@ -17448,7 +17454,7 @@ fn refresh_arguments_from_roots(
     positional_base: usize,
     keyword_names_base: Option<usize>,
     keyword_base: Option<usize>,
-) {
+) -> Result<(), crate::PyError> {
     pyre_object::gc_roots::shadow_stack_copy_range(positional_base, &mut arguments.arguments_w);
     if let Some(base) = keyword_names_base {
         if let Some(ref mut keyword_names_w) = arguments.keyword_names_w {
@@ -17460,7 +17466,7 @@ fn refresh_arguments_from_roots(
             pyre_object::gc_roots::shadow_stack_copy_range(base, keywords_w);
         }
     }
-    arguments.freeze_gc_arrays();
+    arguments.freeze_gc_arrays()
 }
 
 /// `baseobjspace.py call_args_and_c_profile` with a
@@ -17516,7 +17522,12 @@ pub fn call_args_and_c_profile_args(
     };
     pyre_object::gc_roots::normalize_roots(callable_slot, 1 + npos + names_len + keyword_len);
 
-    refresh_arguments_from_roots(arguments, positional_base, keyword_names_base, keyword_base);
+    if let Err(error) =
+        refresh_arguments_from_roots(arguments, positional_base, keyword_names_base, keyword_base)
+    {
+        crate::call::set_call_error(error);
+        return pyre_object::PY_NULL;
+    }
     let ec = crate::call::getexecutioncontext() as *mut crate::PyExecutionContext;
     if !ec.is_null() {
         let traced = unsafe {
@@ -17531,7 +17542,12 @@ pub fn call_args_and_c_profile_args(
             return pyre_object::PY_NULL;
         }
     }
-    refresh_arguments_from_roots(arguments, positional_base, keyword_names_base, keyword_base);
+    if let Err(error) =
+        refresh_arguments_from_roots(arguments, positional_base, keyword_names_base, keyword_base)
+    {
+        crate::call::set_call_error(error);
+        return pyre_object::PY_NULL;
+    }
     let w_res = match call_args(
         pyre_object::gc_roots::shadow_stack_get(callable_slot),
         arguments,
@@ -17594,7 +17610,12 @@ pub fn call_args_and_c_profile_args(
     // Python, so the same slot is what the return hook reads back.
     let result_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(w_res);
-    refresh_arguments_from_roots(arguments, positional_base, keyword_names_base, keyword_base);
+    if let Err(error) =
+        refresh_arguments_from_roots(arguments, positional_base, keyword_names_base, keyword_base)
+    {
+        crate::call::set_call_error(error);
+        return pyre_object::PY_NULL;
+    }
     if !ec.is_null() {
         let traced = unsafe {
             (*ec).c_return_trace(

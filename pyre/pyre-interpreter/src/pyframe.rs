@@ -6731,7 +6731,7 @@ impl PyFrame {
         nargs: usize,
         methodcall: bool,
         w_function: PyObjectRef,
-    ) -> crate::argument::Arguments {
+    ) -> Result<crate::argument::Arguments, crate::PyError> {
         let args_w = self.peekvalues(nargs);
         let w_function = if w_function.is_null() {
             None
@@ -6739,7 +6739,6 @@ impl PyFrame {
             Some(w_function)
         };
         crate::argument::Arguments::new(&args_w, None, None, None, None, methodcall, w_function)
-            .expect("pyframe.py make_arguments has no star args")
     }
 
     /// PyPy-compatible argument list builder.
@@ -8392,10 +8391,12 @@ x = 7
         let code = crate::compile_exec("a = 1").expect("compile");
         let mut frame = super::PyFrame::new(code).expect("frame allocation");
         frame.push(pyre_object::w_int_new(1));
-        let method = frame.make_arguments(1, true, pyre_object::PY_NULL);
+        let method = frame.make_arguments(1, true, pyre_object::PY_NULL).unwrap();
         assert!(method.methodcall);
         assert_eq!(method.arguments_w.len(), 1);
-        let plain = frame.make_arguments(1, false, pyre_object::PY_NULL);
+        let plain = frame
+            .make_arguments(1, false, pyre_object::PY_NULL)
+            .unwrap();
         assert!(!plain.methodcall);
         assert_eq!(plain.arguments_w.len(), 1);
     }

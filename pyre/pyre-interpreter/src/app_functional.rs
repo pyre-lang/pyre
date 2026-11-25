@@ -314,7 +314,7 @@ fn call_published_args(which: usize, args: &crate::argument::Arguments) -> PyRes
     let pos_now: Vec<PyObjectRef> = (0..npos).map(|i| roots.get(pos_base + i)).collect();
     let names_now: Vec<PyObjectRef> = (0..nnames).map(|i| roots.get(names_base + i)).collect();
     let values_now: Vec<PyObjectRef> = (0..nnames).map(|i| roots.get(values_base + i)).collect();
-    let forwarded = crate::argument::Arguments::with_kw(&pos_now, &names_now, &values_now);
+    let forwarded = crate::argument::Arguments::with_kw(&pos_now, &names_now, &values_now)?;
     crate::call::call_args(
         pyre_object::gc_roots::shadow_stack_get(func_slot),
         &forwarded,
