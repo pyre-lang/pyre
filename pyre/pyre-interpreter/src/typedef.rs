@@ -7624,7 +7624,7 @@ fn set_descr_init_from_peel(
         .collect();
     let signature = crate::gateway::Signature::new(vec!["self", "iterable"], None, None, 0, 2);
     let arguments =
-        crate::argument::Arguments::with_kw(&positional_w, &keyword_names_w, &keywords_w);
+        crate::argument::Arguments::with_kw(&positional_w, &keyword_names_w, &keywords_w)?;
     let defaults = [pyre_object::w_none()];
     let mut scope_w = vec![pyre_object::PY_NULL; signature.scope_length()];
     arguments.parse_into_scope(
@@ -7679,7 +7679,7 @@ fn set_descr_init_bind(
         .collect();
     let signature = crate::gateway::Signature::new(vec!["self", "iterable"], None, None, 0, 2);
     let arguments =
-        crate::argument::Arguments::with_kw(&positional_w, &keyword_names_w, &keywords_w);
+        crate::argument::Arguments::with_kw(&positional_w, &keyword_names_w, &keywords_w)?;
     let defaults = [pyre_object::w_none()];
     let mut scope_w = vec![pyre_object::PY_NULL; signature.scope_length()];
     arguments.parse_into_scope(
@@ -36484,7 +36484,7 @@ fn itertools_constructor_scope_from_args_kwonly(
     };
     let signature = crate::gateway::Signature::new(names, None, None, kwonlyargcount, 0);
     let arguments =
-        crate::argument::Arguments::with_kw(&positional_w, &keyword_names_w, &keywords_w);
+        crate::argument::Arguments::with_kw(&positional_w, &keyword_names_w, &keywords_w)?;
     let mut scope_w = vec![PY_NULL; signature.scope_length()];
     let mut defaults_w = vec![PY_NULL; positional_default_count];
     pyre_object::gc_roots::shadow_stack_copy_range(defaults_base, &mut defaults_w);
@@ -36568,7 +36568,7 @@ fn itertools_constructor_scope_kwonly(
         .map(|index| pyre_object::gc_roots::shadow_stack_get(positional_base + index))
         .collect();
     let arguments =
-        crate::argument::Arguments::with_kw(&positional_w, &keyword_names_w, &keywords_w);
+        crate::argument::Arguments::with_kw(&positional_w, &keyword_names_w, &keywords_w)?;
     let mut scope_w = vec![PY_NULL; signature.scope_length()];
     let mut defaults_w = vec![PY_NULL; positional_default_count];
     pyre_object::gc_roots::shadow_stack_copy_range(defaults_base, &mut defaults_w);

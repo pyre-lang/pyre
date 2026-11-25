@@ -434,7 +434,7 @@ fn partial_call_impl(
         let values_now = copy_range(kw_values_base, kw_n);
         pyre_interpreter::call::call_args(
             pyre_object::gc_roots::shadow_stack_get(func_slot),
-            &pyre_interpreter::argument::Arguments::with_kw(&pos_now, &names_now, &values_now),
+            &pyre_interpreter::argument::Arguments::with_kw(&pos_now, &names_now, &values_now)?,
         )
     }
 }

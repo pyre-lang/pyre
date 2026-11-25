@@ -6471,7 +6471,9 @@ pub(crate) fn builtin_kwarg_entries(kwargs: Option<PyObjectRef>) -> Vec<(Wtf8Buf
 /// Wrap is positional. Keywords stay on `Arguments` for the `*_args`
 /// path, so `_jit_few_keywords` stays true and `unpack`'s
 /// `look_inside_iff` looks inside.
-fn arguments_from_builtin_rest(rest: &[PyObjectRef]) -> crate::argument::Arguments {
+fn arguments_from_builtin_rest(
+    rest: &[PyObjectRef],
+) -> Result<crate::argument::Arguments, crate::PyError> {
     crate::argument::Arguments::positional_only(rest)
 }
 
@@ -6746,7 +6748,7 @@ fn parse_single_required(
         .map(|index| pyre_object::gc_roots::shadow_stack_get(pos_base + index))
         .collect();
     let signature = crate::gateway::Signature::new(vec![name], None, None, 0, 0);
-    let arguments = crate::argument::Arguments::positional_only(&refreshed_pos);
+    let arguments = crate::argument::Arguments::positional_only(&refreshed_pos)?;
     let mut scope_w = vec![PY_NULL; signature.scope_length()];
     arguments.parse_into_scope(
         PY_NULL,
@@ -9548,7 +9550,7 @@ fn exc_os_error_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
             .map(|i| pyre_object::gc_roots::shadow_stack_get(base + i))
             .collect()
     };
-    let (positional, kwds_w) = arguments_from_builtin_rest(&rest).unpack()?;
+    let (positional, kwds_w) = arguments_from_builtin_rest(&rest)?.unpack()?;
     let w_self = pyre_object::gc_roots::shadow_stack_get(base);
     if !kwds_w.is_empty() {
         return Err(os_error_no_keywords_error(
@@ -11228,7 +11230,7 @@ macro_rules! exc_new_wrapper {
                     .map(|i| pyre_object::gc_roots::shadow_stack_get(base + i))
                     .collect()
             };
-            let (positional, _kwds_w) = arguments_from_builtin_rest(&rest).unpack()?;
+            let (positional, _kwds_w) = arguments_from_builtin_rest(&rest)?.unpack()?;
             let pn = positional.len();
             let pos_base = pyre_object::gc_roots::pin_roots(&positional);
             let cls = if n == 0 {
@@ -29811,7 +29813,7 @@ fn builtin_breakpoint_args(
     let pos_now: Vec<PyObjectRef> = (0..npos).map(|i| roots.get(pos_base + i)).collect();
     let names_now: Vec<PyObjectRef> = (0..nnames).map(|i| roots.get(names_base + i)).collect();
     let values_now: Vec<PyObjectRef> = (0..nnames).map(|i| roots.get(values_base + i)).collect();
-    let forwarded = crate::argument::Arguments::with_kw(&pos_now, &names_now, &values_now);
+    let forwarded = crate::argument::Arguments::with_kw(&pos_now, &names_now, &values_now)?;
     crate::call::call_args(roots.get(hook_slot), &forwarded)
 }
 

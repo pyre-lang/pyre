@@ -7298,13 +7298,19 @@ fn try_walker_descend_match_signature<Sym: WalkSym>(
     early.extend_from_slice(&keyword_name_objs);
     let early_base = _bind_roots.pin_roots(&early);
 
-    let parsed = pyre_interpreter::argument::Arguments::from_owned_vecs(
+    let parsed = match pyre_interpreter::argument::Arguments::from_owned_vecs(
         arguments_w,
         Some(keyword_names_w),
         Some(keywords_w),
         true,
         false,
-    );
+    ) {
+        Ok(parsed) => parsed,
+        Err(err) => {
+            crate::trace::set_walk_end_propagated_exception(err);
+            return Err(DispatchError::ConcreteShadowAllocationFailed { pc: op.pc });
+        }
+    };
     let resolved_callable = pyre_object::gc_roots::shadow_stack_get(early_base + 1);
     let args_box = Box::new(parsed);
     let args_ptr = args_box.as_ref() as *const pyre_interpreter::argument::Arguments as usize;

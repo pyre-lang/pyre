@@ -836,7 +836,8 @@ macro_rules! reload_gc_twins {
 /// `Arguments` struct. Empty is PyPy's `None` / `_ll_prebuilt_empty_array`.
 /// Non-empty uses the stable (non-moving) path so the pointer stays valid
 /// across later collections; a young collecting twin would leave a
-/// forwarded stub in the field.
+/// forwarded stub in the field. A refused malloc returns null with
+/// MemoryError pending.
 fn freeze_one_gc_array(values: &[PyObjectRef]) -> *mut pyre_object::FixedObjectArray {
     if values.is_empty() {
         pyre_object::object_array::prebuilt_empty_object_array()
@@ -930,7 +931,7 @@ impl Arguments {
             None => true,
             Some(names) => majit_rlib::jit::isconstant(&names.len()),
         };
-        arguments.freeze_gc_arrays();
+        arguments.freeze_gc_arrays()?;
         Ok(arguments)
     }
 
@@ -938,9 +939,11 @@ impl Arguments {
     /// The Vec words are published as one run before the first normalize
     /// (`framework.py` `push_roots`); each twin is published before the next
     /// malloc so a collecting allocation cannot drop a header this struct
-    /// holds only as a raw pointer.
+    /// holds only as a raw pointer. A refused twin malloc leaves MemoryError
+    /// pending (`allocated_or_raise`); this returns that error and does not
+    /// leave a usable `Arguments` with a null list.
     #[majit_macros::dont_look_inside]
-    pub fn freeze_gc_arrays(&mut self) {
+    pub fn freeze_gc_arrays(&mut self) -> Result<(), crate::PyError> {
         let _roots = pyre_object::gc_roots::push_roots();
         let names_is_some = self.keyword_names_w.is_some();
         let values_is_some = self.keywords_w.is_some();
@@ -970,18 +973,27 @@ impl Arguments {
             .map(|i| pyre_object::gc_roots::shadow_stack_get(args_live + i))
             .collect();
         self.arguments_w_gc = freeze_one_gc_array(&arguments_w);
+        if self.arguments_w_gc.is_null() {
+            return Err(crate::runtime_ops::fetch_memory_error());
+        }
         let args_gc_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::publish_roots(&[self.arguments_w_gc as PyObjectRef]);
         let keyword_names_w: Vec<PyObjectRef> = (0..n_names)
             .map(|i| pyre_object::gc_roots::shadow_stack_get(names_live + i))
             .collect();
         self.keyword_names_w_gc = freeze_one_gc_array(&keyword_names_w);
+        if self.keyword_names_w_gc.is_null() {
+            return Err(crate::runtime_ops::fetch_memory_error());
+        }
         let names_gc_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::publish_roots(&[self.keyword_names_w_gc as PyObjectRef]);
         let keywords_w: Vec<PyObjectRef> = (0..n_values)
             .map(|i| pyre_object::gc_roots::shadow_stack_get(values_live + i))
             .collect();
         self.keywords_w_gc = freeze_one_gc_array(&keywords_w);
+        if self.keywords_w_gc.is_null() {
+            return Err(crate::runtime_ops::fetch_memory_error());
+        }
         let keywords_gc_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::publish_roots(&[self.keywords_w_gc as PyObjectRef]);
         // Each header was published before the next `alloc_mro_block_gc`;
@@ -1011,6 +1023,7 @@ impl Arguments {
         } else {
             None
         };
+        Ok(())
     }
 
     /// Owned-Vec constructor used by CALL_KW packing (`arguments_from_call_kw`)
@@ -1021,7 +1034,7 @@ impl Arguments {
         keywords_w: Option<Vec<PyObjectRef>>,
         jit_few_keywords: bool,
         methodcall: bool,
-    ) -> Self {
+    ) -> Result<Self, crate::PyError> {
         let mut arguments = Self {
             arguments_w,
             keyword_names_w,
@@ -1032,8 +1045,8 @@ impl Arguments {
             keyword_names_w_gc: std::ptr::null_mut(),
             keywords_w_gc: std::ptr::null_mut(),
         };
-        arguments.freeze_gc_arrays();
-        arguments
+        arguments.freeze_gc_arrays()?;
+        Ok(arguments)
     }
 
     /// pypy/interpreter/argument.py `_combine_wrapped`.
@@ -1102,12 +1115,11 @@ impl Arguments {
     /// pypy/interpreter/argument.py `__init__` (positional-only shortcut).
     ///
     /// Used for call surfaces that have only positional args (no
-    /// kwargs, no star expansion).  Cannot fail because there are no
-    /// star args to unpack.
+    /// kwargs, no star expansion).  Star expansion cannot fail; a
+    /// refused twin malloc still raises MemoryError.
     #[inline]
-    pub fn positional_only(args_w: &[PyObjectRef]) -> Self {
+    pub fn positional_only(args_w: &[PyObjectRef]) -> Result<Self, crate::PyError> {
         Self::new(args_w, None, None, None, None, false, None)
-            .expect("positional_only cannot fail without star args")
     }
 
     /// pypy/interpreter/argument.py `__init__` (positional + kwargs shortcut).
@@ -1119,14 +1131,14 @@ impl Arguments {
     /// the kwargs separated from `arguments_w`, so `firstarg()`
     /// returns `arguments_w[0]` (or `None`) rather than surfacing
     /// the trailing kwargs dict that pyre's flat call surface
-    /// otherwise appends to the merged slice.  Cannot fail because
-    /// there are no star args to unpack.
+    /// otherwise appends to the merged slice.  Star expansion cannot
+    /// fail; a refused twin malloc still raises MemoryError.
     #[inline]
     pub fn with_kw(
         args_w: &[PyObjectRef],
         keyword_names_w: &[PyObjectRef],
         keywords_w: &[PyObjectRef],
-    ) -> Self {
+    ) -> Result<Self, crate::PyError> {
         Self::new(
             args_w,
             Some(keyword_names_w),
@@ -1136,21 +1148,21 @@ impl Arguments {
             false,
             None,
         )
-        .expect("with_kw cannot fail without star args")
     }
 
     /// pypy/interpreter/argument.py `__init__` shortcut with the
     /// `methodcall` flag explicit.  Use when the caller has both kwargs
     /// and the `methodcall` flag (e.g. CALL_METHOD lowering); when
     /// methodcall is false, `with_kw` is the lighter alternative.
-    /// Cannot fail because there are no star args to unpack.
+    /// Star expansion cannot fail; a refused twin malloc still raises
+    /// MemoryError.
     #[inline]
     pub fn full(
         args_w: &[PyObjectRef],
         keyword_names_w: Option<&[PyObjectRef]>,
         keywords_w: Option<&[PyObjectRef]>,
         methodcall: bool,
-    ) -> Self {
+    ) -> Result<Self, crate::PyError> {
         Self::new(
             args_w,
             keyword_names_w,
@@ -1160,7 +1172,6 @@ impl Arguments {
             methodcall,
             None,
         )
-        .expect("full cannot fail without star args")
     }
 
     /// pypy/interpreter/argument.py `fixedunpack`.
@@ -1328,8 +1339,9 @@ impl Arguments {
     /// PyPy passes the existing keyword lists straight through (they
     /// are immutable list references in RPython); pyre clones the
     /// owned Vecs because the new instance needs its own storage.
-    /// Cannot fail because no star args are passed.
-    pub fn replace_arguments(&self, args_w: Vec<PyObjectRef>) -> Self {
+    /// Star expansion cannot fail; a refused twin malloc still raises
+    /// MemoryError.
+    pub fn replace_arguments(&self, args_w: Vec<PyObjectRef>) -> Result<Self, crate::PyError> {
         let keyword_names_w = self.keyword_names_w.clone();
         let keywords_w = self.keywords_w.clone();
         // argument.py `replace_arguments` builds a new `Arguments`
@@ -1350,7 +1362,7 @@ impl Arguments {
     /// ```
     /// Residual: rtyping the copied `GCREF` words has no primitive repr.
     #[majit_macros::dont_look_inside]
-    pub fn prepend(&self, w_firstarg: PyObjectRef) -> Self {
+    pub fn prepend(&self, w_firstarg: PyObjectRef) -> Result<Self, crate::PyError> {
         let mut args_w = Vec::with_capacity(self.arguments_w.len() + 1);
         args_w.push(w_firstarg);
         args_w.extend_from_slice(&self.arguments_w);
@@ -3481,7 +3493,7 @@ mod tests {
     fn match_signature_positional_pass_through() {
         let sig = crate::gateway::Signature::new(vec!["a", "b"], None, None, 0, 0);
         let args = [pyre_object::w_int_new(1), pyre_object::w_int_new(2)];
-        let arguments = Arguments::positional_only(&args);
+        let arguments = Arguments::positional_only(&args).unwrap();
         let mut scope: Vec<PyObjectRef> = vec![pyre_object::PY_NULL; sig.scope_length()];
         assert!(matches!(
             arguments.match_signature(
@@ -3510,7 +3522,7 @@ mod tests {
             pyre_object::w_int_new(2),
             pyre_object::w_int_new(3),
         ];
-        let arguments = Arguments::positional_only(&args);
+        let arguments = Arguments::positional_only(&args).unwrap();
         let mut scope: Vec<PyObjectRef> = vec![pyre_object::PY_NULL; sig.scope_length()];
         match arguments.match_signature(
             pyre_object::PY_NULL,
@@ -3533,7 +3545,7 @@ mod tests {
     fn match_signature_missing_positional_raises() {
         let sig = crate::gateway::Signature::new(vec!["a", "b"], None, None, 0, 0);
         let args = [pyre_object::w_int_new(1)];
-        let arguments = Arguments::positional_only(&args);
+        let arguments = Arguments::positional_only(&args).unwrap();
         let mut scope: Vec<PyObjectRef> = vec![pyre_object::PY_NULL; sig.scope_length()];
         match arguments.match_signature(
             pyre_object::PY_NULL,
@@ -3564,7 +3576,7 @@ mod tests {
             pyre_object::w_int_new(2),
             pyre_object::w_int_new(3),
         ];
-        let arguments = Arguments::positional_only(&args);
+        let arguments = Arguments::positional_only(&args).unwrap();
         let mut scope: Vec<PyObjectRef> = vec![pyre_object::PY_NULL; sig.scope_length()];
         assert!(matches!(
             arguments.match_signature(
@@ -3592,7 +3604,7 @@ mod tests {
         let sig = crate::gateway::Signature::new(vec![], None, Some("kw"), 0, 0);
         let names = [pyre_object::w_str_new("a")];
         let values = [pyre_object::w_int_new(1)];
-        let arguments = Arguments::with_kw(&[], &names, &values);
+        let arguments = Arguments::with_kw(&[], &names, &values).unwrap();
         let mut scope: Vec<PyObjectRef> = vec![pyre_object::PY_NULL; sig.scope_length()];
         assert!(matches!(
             arguments.match_signature(
@@ -3629,7 +3641,7 @@ mod tests {
         let sig = crate::gateway::Signature::new(vec![], None, Some("kw"), 0, 0);
         let values = [pyre_object::w_int_new(1)];
         let names = [pyre_object::gc_roots::shadow_stack_get(subclass_slot)];
-        let arguments = Arguments::with_kw(&[], &names, &values);
+        let arguments = Arguments::with_kw(&[], &names, &values).unwrap();
         let mut scope: Vec<PyObjectRef> = vec![pyre_object::PY_NULL; sig.scope_length()];
         assert!(matches!(
             arguments.match_signature(
@@ -3873,9 +3885,9 @@ mod tests {
         let pos = [pyre_object::w_int_new(1)];
         let names = [pyre_object::w_str_new("k")];
         let values = [pyre_object::w_int_new(99)];
-        let arguments = Arguments::with_kw(&pos, &names, &values);
+        let arguments = Arguments::with_kw(&pos, &names, &values).unwrap();
         let new_pos = vec![pyre_object::w_int_new(2), pyre_object::w_int_new(3)];
-        let replaced = arguments.replace_arguments(new_pos);
+        let replaced = arguments.replace_arguments(new_pos).unwrap();
         assert_eq!(replaced.arguments_w.len(), 2);
         unsafe {
             assert_eq!(pyre_object::w_int_get_value(replaced.arguments_w[0]), 2);
@@ -3889,8 +3901,8 @@ mod tests {
     #[test]
     fn prepend_inserts_at_front() {
         let pos = [pyre_object::w_int_new(2), pyre_object::w_int_new(3)];
-        let arguments = Arguments::positional_only(&pos);
-        let prepended = arguments.prepend(pyre_object::w_int_new(1));
+        let arguments = Arguments::positional_only(&pos).unwrap();
+        let prepended = arguments.prepend(pyre_object::w_int_new(1)).unwrap();
         assert_eq!(prepended.arguments_w.len(), 3);
         unsafe {
             assert_eq!(pyre_object::w_int_get_value(prepended.arguments_w[0]), 1);
@@ -3906,7 +3918,7 @@ mod tests {
         let pos = [pyre_object::w_int_new(10)];
         let names = [pyre_object::w_str_new("k")];
         let values = [pyre_object::w_int_new(99)];
-        let arguments = Arguments::with_kw(&pos, &names, &values);
+        let arguments = Arguments::with_kw(&pos, &names, &values).unwrap();
         let (args_w, kwds_w) = arguments.unpack().expect("string keys are valid");
         assert_eq!(args_w.len(), 1);
         unsafe {
@@ -3928,7 +3940,7 @@ mod tests {
         let pos: [PyObjectRef; 0] = [];
         let names = [pyre_object::w_str_new("dup"), pyre_object::w_str_new("dup")];
         let values = [pyre_object::w_int_new(1), pyre_object::w_int_new(2)];
-        let arguments = Arguments::with_kw(&pos, &names, &values);
+        let arguments = Arguments::with_kw(&pos, &names, &values).unwrap();
         let (_, kwds_w) = arguments.unpack().expect("string keys are valid");
         assert_eq!(kwds_w.len(), 1, "duplicate keys must collapse");
         let v = kwds_w
@@ -3948,7 +3960,7 @@ mod tests {
         let pos: [PyObjectRef; 0] = [];
         let names = [pyre_object::w_int_new(7)];
         let values = [pyre_object::w_int_new(42)];
-        let arguments = Arguments::with_kw(&pos, &names, &values);
+        let arguments = Arguments::with_kw(&pos, &names, &values).unwrap();
         match arguments.unpack() {
             Ok(_) => panic!("non-string keyword name should TypeError"),
             Err(err) => {
@@ -3969,7 +3981,7 @@ mod tests {
         let pos: [PyObjectRef; 0] = [];
         let names = [pyre_object::w_str_from_wtf8(name.clone())];
         let values = [pyre_object::w_int_new(2)];
-        let arguments = Arguments::with_kw(&pos, &names, &values);
+        let arguments = Arguments::with_kw(&pos, &names, &values).unwrap();
         let (_, kwds_w) = arguments.unpack().expect("surrogate names stay WTF-8");
         assert_eq!(kwds_w.len(), 1);
         let v = kwds_w.get(&name).expect("surrogate key present");
@@ -3986,17 +3998,19 @@ mod tests {
     #[test]
     fn jit_few_keywords_follows_keyword_names_presence() {
         let pos = [pyre_object::w_int_new(1)];
-        let arguments = Arguments::positional_only(&pos);
+        let arguments = Arguments::positional_only(&pos).unwrap();
         assert!(arguments.jit_few_keywords);
-        let replaced = arguments.replace_arguments(vec![pyre_object::w_int_new(2)]);
+        let replaced = arguments
+            .replace_arguments(vec![pyre_object::w_int_new(2)])
+            .unwrap();
         assert!(replaced.jit_few_keywords);
 
         let pos: [PyObjectRef; 0] = [];
         let names = [pyre_object::w_str_new("k")];
         let values = [pyre_object::w_int_new(1)];
-        let arguments = Arguments::with_kw(&pos, &names, &values);
+        let arguments = Arguments::with_kw(&pos, &names, &values).unwrap();
         assert!(!arguments.jit_few_keywords);
-        let replaced = arguments.replace_arguments(Vec::new());
+        let replaced = arguments.replace_arguments(Vec::new()).unwrap();
         assert!(!replaced.jit_few_keywords);
     }
 
@@ -4009,7 +4023,7 @@ mod tests {
             .expect("empty keyword lists need no star expansion");
         assert!(arguments.keyword_names_w.is_some());
         assert!(!arguments.jit_few_keywords);
-        let replaced = arguments.replace_arguments(Vec::new());
+        let replaced = arguments.replace_arguments(Vec::new()).unwrap();
         assert!(replaced.keyword_names_w.is_some());
         assert!(!replaced.jit_few_keywords);
     }
@@ -4032,7 +4046,7 @@ mod tests {
     fn parse_into_scope_happy_path() {
         let sig = crate::gateway::Signature::new(vec!["a", "b"], None, None, 0, 0);
         let pos = [pyre_object::w_int_new(1), pyre_object::w_int_new(2)];
-        let arguments = Arguments::positional_only(&pos);
+        let arguments = Arguments::positional_only(&pos).unwrap();
         let mut scope: Vec<PyObjectRef> = vec![pyre_object::PY_NULL; sig.scope_length()];
         let scopelen = arguments
             .parse_into_scope(
@@ -4057,7 +4071,7 @@ mod tests {
     fn parse_into_scope_shape_error_formats_fnname_prefix() {
         let sig = crate::gateway::Signature::new(vec!["a"], None, None, 0, 0);
         let pos = [pyre_object::w_int_new(1), pyre_object::w_int_new(2)];
-        let arguments = Arguments::positional_only(&pos);
+        let arguments = Arguments::positional_only(&pos).unwrap();
         let mut scope: Vec<PyObjectRef> = vec![pyre_object::PY_NULL; sig.scope_length()];
         let err = arguments
             .parse_into_scope(
@@ -4079,7 +4093,7 @@ mod tests {
     fn parse_into_scope_keeps_a_surrogate_in_fnname() {
         let sig = crate::gateway::Signature::new(vec!["a"], None, None, 0, 0);
         let pos = [pyre_object::w_int_new(1), pyre_object::w_int_new(2)];
-        let arguments = Arguments::positional_only(&pos);
+        let arguments = Arguments::positional_only(&pos).unwrap();
         let mut scope: Vec<PyObjectRef> = vec![pyre_object::PY_NULL; sig.scope_length()];
         let mut fnname = Wtf8Buf::new();
         fnname.push_str("q");
@@ -4107,7 +4121,7 @@ mod tests {
         let pos = [pyre_object::w_int_new(1)];
         let names = [pyre_object::w_str_new("wibble")];
         let values = [pyre_object::w_int_new(2)];
-        let arguments = Arguments::with_kw(&pos, &names, &values);
+        let arguments = Arguments::with_kw(&pos, &names, &values).unwrap();
         let err = arguments
             .parse_obj(
                 pyre_object::PY_NULL,
@@ -4140,11 +4154,77 @@ mod tests {
         let pos = [pyre_object::w_int_new(1), pyre_object::w_int_new(2)];
         let names = [pyre_object::w_str_new("k")];
         let values = [pyre_object::w_int_new(99)];
-        let arguments = Arguments::with_kw(&pos, &names, &values);
+        let arguments = Arguments::with_kw(&pos, &names, &values).unwrap();
         let (w_args, w_kwds) = arguments.topacked().expect("topacked");
         unsafe {
             assert_eq!(pyre_object::w_tuple_len(w_args), 2);
             assert!(pyre_object::is_dict(w_kwds));
         }
+    }
+
+    /// A refused `alloc_mro_block_gc` leaves MemoryError pending; freeze
+    /// returns that error instead of a usable `Arguments` with a null list.
+    #[test]
+    fn freeze_gc_arrays_returns_memory_error_when_gc_array_malloc_fails() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let _hook_lock = pyre_object::gc_hook::hook_test_guard();
+        // `fetch_memory_error` builds `OperationError(w_MemoryError, w_None)`;
+        // the class table is filled by `init_typeobjects`.
+        crate::typedef::init_typeobjects();
+        let _ctx = crate::PyExecutionContext::default();
+        static PENDING: AtomicBool = AtomicBool::new(false);
+        fn raise() {
+            PENDING.store(true, Ordering::SeqCst);
+        }
+        fn occurred() -> bool {
+            PENDING.load(Ordering::SeqCst)
+        }
+        fn refuse_object_array(type_id: u32, payload_size: usize) -> pyre_object::gc_hook::GCREF {
+            if type_id == pyre_object::object_array::PY_OBJECT_ARRAY_GC_TYPE_ID {
+                return std::ptr::null_mut();
+            }
+            // `fetch_memory_error` mallocs the `PyError` wrapper through the
+            // nursery hook while MemoryError is already pending. Fail only
+            // the object-array request; every other type gets a headered
+            // host block so that wrapper can be built.
+            let header = majit_gc::header::GcHeader::SIZE;
+            let total = header.saturating_add(payload_size.max(1));
+            let layout =
+                std::alloc::Layout::from_size_align(total, majit_gc::header::GcHeader::ALIGN)
+                    .expect("object-array refuse-hook host layout");
+            unsafe {
+                let raw = std::alloc::alloc_zeroed(layout);
+                if raw.is_null() {
+                    std::alloc::handle_alloc_error(layout);
+                }
+                *(raw as *mut majit_gc::header::GcHeader) =
+                    majit_gc::header::GcHeader::new(type_id);
+                raw.add(header) as pyre_object::gc_hook::GCREF
+            }
+        }
+        struct ClearRaise;
+        impl Drop for ClearRaise {
+            fn drop(&mut self) {
+                majit_gc::set_active_raise_memory_error(None);
+                majit_gc::set_active_exception_occurred(None);
+            }
+        }
+        PENDING.store(false, Ordering::SeqCst);
+        majit_gc::set_active_raise_memory_error(Some(raise));
+        majit_gc::set_active_exception_occurred(Some(occurred));
+        let _clear_raise = ClearRaise;
+        let value = pyre_object::w_int_new(1);
+        pyre_object::gc_hook::register_gc_alloc_stable_hook(refuse_object_array);
+        pyre_object::gc_hook::register_gc_alloc_hook(refuse_object_array);
+        let err = match Arguments::from_owned_vecs(vec![value], None, None, true, false) {
+            Err(err) => err,
+            Ok(_) => panic!("object-array malloc must fail"),
+        };
+        assert_eq!(err.kind, crate::PyErrorKind::MemoryError);
+        pyre_object::gc_hook::clear_gc_alloc_stable_hook();
+        pyre_object::gc_hook::clear_gc_alloc_hook();
+        PENDING.store(false, Ordering::SeqCst);
+        majit_gc::set_active_raise_memory_error(None);
+        majit_gc::set_active_exception_occurred(None);
     }
 }
