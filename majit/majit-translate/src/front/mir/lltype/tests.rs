@@ -3331,6 +3331,146 @@ fn register_std_cell_instantiation_keys_match_lowering_after_duplicate_payload_l
     );
 }
 
+fn owner_refcell_f64_llbc(owner_before_cell: bool) -> Llbc {
+    let f64_ty = serde_json::json!({"Scalar": {"Float": "F64"}});
+    let (owner_id, cell_id) = if owner_before_cell {
+        (0u64, 1u64)
+    } else {
+        (1, 0)
+    };
+    let refcell_ty = named_adt(cell_id, vec![f64_ty.clone()]);
+    let refcell = type_decl_struct(
+        cell_id,
+        &["core", "cell", "RefCell"],
+        vec![
+            named_copy_field("borrow", i64_ty()),
+            named_copy_field("value", f64_ty),
+        ],
+    );
+    let owner = type_decl_struct(
+        owner_id,
+        &["fixture", "Owner"],
+        vec![named_copy_field("cell", refcell_ty)],
+    );
+    let types = if owner_before_cell {
+        vec![owner, refcell]
+    } else {
+        vec![refcell, owner]
+    };
+    llbc_with_types("fixture", types, vec![])
+}
+
+fn owner_cell_struct_field_attr(llbc: &Llbc) -> ValueType {
+    let (_, _, _, _, _, attrs, _, _) = super::derive_program_metadata(
+        llbc,
+        &super::harvest_declared_gc_facts(llbc).gc_struct_ids(),
+        super::no_immutable_fields(),
+        &std::collections::HashSet::new(),
+        &[],
+    );
+    let owner_attrs = attrs.get("Owner").unwrap_or_else(|| {
+        panic!(
+            "Owner FORCE attrs missing; keys={:?}",
+            attrs.keys().collect::<Vec<_>>()
+        )
+    });
+    owner_attrs
+        .iter()
+        .find(|(name, _)| name == "cell")
+        .map(|(_, ty)| ty.clone())
+        .unwrap_or_else(|| panic!("Owner.cell attr missing; owner_attrs={owner_attrs:?}"))
+}
+
+fn owner_cell_attr_is_cell_class(attr: &ValueType) -> bool {
+    matches!(
+        attr,
+        ValueType::Ref(Some(root))
+            if root.starts_with("cell::RefCell<") && root.contains("f64")
+    )
+}
+
+/// TypeDecl order must not change FORCE attrs of `Owner.cell: RefCell<f64>`.
+/// `bookkeeper.py` `Bookkeeper.getuniqueclassdef` returns one ClassDef;
+/// `classdesc.py` `ClassDesc._init_classdef` attaches the cell class.
+#[test]
+fn struct_field_attrs_of_refcell_f64_are_order_independent() {
+    let owner_first = owner_cell_struct_field_attr(&owner_refcell_f64_llbc(true));
+    let cell_first = owner_cell_struct_field_attr(&owner_refcell_f64_llbc(false));
+    assert_eq!(
+        owner_first, cell_first,
+        "Owner.cell FORCE attr must not depend on TypeDecl order; owner-first={owner_first:?} cell-first={cell_first:?}"
+    );
+    assert!(
+        owner_cell_attr_is_cell_class(&owner_first),
+        "Owner.cell is the cell class, got {owner_first:?}"
+    );
+}
+
+/// Crate 2's Opaque `RefCell<Payload>` publishes `cell::RefCell<Payload>`
+/// from crate 1's layout rows (`bookkeeper.py` `Bookkeeper.getuniqueclassdef`).
+#[test]
+fn opaque_refcell_of_new_payload_instantiates_from_prior_crate_layout_rows() {
+    use crate::codewriter::call::FuncObjDeclarations;
+    use crate::front::graph_body::GraphBodyProvider;
+    use std::collections::HashMap;
+
+    let i64 = i64_ty();
+    let layout_llbc = llbc_with_types(
+        "layout",
+        vec![type_decl_struct(
+            0,
+            &["core", "cell", "RefCell"],
+            vec![
+                named_copy_field("borrow", i64.clone()),
+                named_copy_field("value", i64.clone()),
+            ],
+        )],
+        vec![],
+    );
+    let payload_ty = named_adt(1, vec![]);
+    let refcell_ty = named_adt(0, vec![payload_ty.clone()]);
+    let opaque_llbc = llbc_with_types(
+        "caller",
+        vec![
+            opaque_type_decl(0, &["core", "cell", "RefCell"]),
+            type_decl_struct(1, &["caller", "Payload"], vec![named_copy_field("x", i64)]),
+        ],
+        vec![window_opaque_fun(
+            0,
+            &["caller", "takes_cell"],
+            vec![refcell_ty.clone()],
+            i64_ty(),
+        )],
+    );
+    let mut provider = GraphBodyProvider::new(
+        crate::HostStaticAddrs::default(),
+        &[],
+        HashMap::new(),
+        FuncObjDeclarations::default(),
+        Default::default(),
+    );
+    provider.lower_named_for_test(layout_llbc, &[]);
+    let program = provider.lower_named_for_test(opaque_llbc, &["takes_cell"]);
+    let instantiated: Vec<_> = program
+        .struct_fields
+        .fields
+        .keys()
+        .filter(|k| k.starts_with("cell::RefCell<") && k.contains("Payload"))
+        .cloned()
+        .collect();
+    assert_eq!(
+        instantiated.len(),
+        1,
+        "Opaque RefCell<Payload> must publish one instantiated key from the prior crate's layout rows; keys={:?}",
+        program
+            .struct_fields
+            .fields
+            .keys()
+            .filter(|k| k.contains("RefCell"))
+            .collect::<Vec<_>>()
+    );
+}
+
 /// `RefCell::borrow` dest is `Ref<Vec<_>>`. The FieldRead of inline
 /// `value` is the Vec; the dest must not recast onto `cell::Ref<…>`.
 #[test]

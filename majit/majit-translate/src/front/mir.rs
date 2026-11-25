@@ -3328,6 +3328,27 @@ pub(crate) struct CrateLowering<'l> {
     root_stack: RootStackAnalyzer<'l>,
 }
 
+/// Union harvested intern rows from an earlier crate. `or_insert` keeps
+/// the first row (`absorb_struct_fields`).
+fn absorb_struct_field_registry(
+    dst: &mut crate::front::semantic::StructFieldRegistry,
+    other: &crate::front::semantic::StructFieldRegistry,
+) {
+    for (key, fields) in other.fields.iter() {
+        dst.fields
+            .entry(key.clone())
+            .or_insert_with(|| fields.clone());
+    }
+    for root in &other.foreign_body_roots {
+        dst.note_foreign_body_crate_root(root);
+    }
+    for (crate_root, stripped) in &other.foreign_callables {
+        dst.note_foreign_body_callable(crate_root, stripped);
+    }
+    dst.gc_struct_ids
+        .extend(other.gc_struct_ids.iter().copied());
+}
+
 impl CrateLoweringState {
     pub(crate) fn new(
         llbc: &Llbc,
@@ -3339,6 +3360,35 @@ impl CrateLoweringState {
         module_filter: Option<&std::collections::HashSet<String>>,
         function_filter: Option<&std::collections::HashSet<String>>,
         struct_layouts: crate::codewriter::call::StructLayoutTable,
+    ) -> Self {
+        Self::new_with_prior_struct_fields(
+            llbc,
+            cross_tombstoned_leaves,
+            func_hints,
+            skipped,
+            gc_struct_ids,
+            program_raw_alloc_flavor_structs,
+            module_filter,
+            function_filter,
+            struct_layouts,
+            &[],
+        )
+    }
+
+    /// `new` after previous crates' intern rows are in this registry.
+    /// Instantiation keys (`register_std_cell_instantiation_rows`) read
+    /// those rows (`bookkeeper.py` `Bookkeeper.getuniqueclassdef`).
+    pub(crate) fn new_with_prior_struct_fields(
+        llbc: &Llbc,
+        cross_tombstoned_leaves: &std::collections::HashSet<String>,
+        func_hints: std::collections::HashMap<String, Vec<String>>,
+        skipped: LoweringSkips,
+        gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+        program_raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+        module_filter: Option<&std::collections::HashSet<String>>,
+        function_filter: Option<&std::collections::HashSet<String>>,
+        struct_layouts: crate::codewriter::call::StructLayoutTable,
+        prior_struct_fields: &[&crate::front::semantic::StructFieldRegistry],
     ) -> Self {
         // Fill `value_type_inputs` before the stack walk. `render_adt_type_args`
         // reads that OnceLock with `get` (it cannot `get_or_init`: harvest
@@ -3408,6 +3458,14 @@ impl CrateLoweringState {
         // collected without those tombstones would intern `Layout` for
         // both `alloc::layout::Layout` and `typeobject::Layout`.
         tombstoned_leaves.extend(cross_tombstoned_leaves.iter().cloned());
+        // Previous crates' intern rows belong in this registry before
+        // any reader (`bookkeeper.py` `Bookkeeper.getuniqueclassdef`).
+        // An Opaque `RefCell<T>` here plus a T whose layout came from an
+        // earlier crate publishes no instantiated key unless those rows
+        // are already here.
+        for prior in prior_struct_fields {
+            absorb_struct_field_registry(&mut struct_fields, prior);
+        }
         // Cell instantiation keys use this same set
         // (`bookkeeper.py` `Bookkeeper.getuniqueclassdef`). Harvest ran
         // with an empty set, so a duplicated payload leaf would publish
@@ -3619,27 +3677,12 @@ impl CrateLoweringState {
     /// Union `other`'s harvested rows into this crate's registry. Later
     /// crates see earlier ones so an Opaque projection can name a field
     /// the defining crate registered. `or_insert` keeps the first row.
-    #[cfg(any(test, feature = "mir-frontend"))]
+    #[cfg(test)]
     pub(crate) fn absorb_struct_fields(
         &mut self,
         other: &crate::front::semantic::StructFieldRegistry,
     ) {
-        for (key, fields) in other.fields.iter() {
-            self.struct_fields
-                .fields
-                .entry(key.clone())
-                .or_insert_with(|| fields.clone());
-        }
-        for root in &other.foreign_body_roots {
-            self.struct_fields.note_foreign_body_crate_root(root);
-        }
-        for (crate_root, stripped) in &other.foreign_callables {
-            self.struct_fields
-                .note_foreign_body_callable(crate_root, stripped);
-        }
-        self.struct_fields
-            .gc_struct_ids
-            .extend(other.gc_struct_ids.iter().copied());
+        absorb_struct_field_registry(&mut self.struct_fields, other);
     }
 
     #[cfg(any(test, feature = "mir-frontend"))]
@@ -7070,6 +7113,121 @@ fn register_exception_class_variant_fields(
     }
 }
 
+/// FORCE attr work recorded while intern rows are still being harvested.
+/// `classdesc.py` `ClassDesc._init_classdef` attaches attributes after the
+/// class exists (`bookkeeper.py` `Bookkeeper.getuniqueclassdef`).
+/// `row_fields` is the intern harvest's field list, so the second pass
+/// annotates those same slots against the completed registry.
+struct PendingStructFieldAttrs {
+    canonical_name: String,
+    owner_def_id: u64,
+    layout_def_id: u64,
+    handle_field_index: Option<usize>,
+    handle_attr: Option<ValueType>,
+    row_fields: Vec<(String, TyRef)>,
+}
+
+fn struct_decl_field_attr_rows(
+    row_fields: &[(String, TyRef)],
+    owner: &TypeDecl,
+    layout_td: &TypeDecl,
+    handle_field_index: Option<usize>,
+    handle_attr: Option<ValueType>,
+    canonical_name: &str,
+    llbc: &Llbc,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+    struct_fields: &crate::front::semantic::StructFieldRegistry,
+) -> Vec<(String, ValueType)> {
+    row_fields
+        .iter()
+        .enumerate()
+        .flat_map(|(i, (fname, ty))| {
+            if tyref_pair_field_kind(ty, llbc).is_some() {
+                let len = pair_len_field_name(fname);
+                return vec![
+                    (fname.clone(), ValueType::Unsigned),
+                    (len, ValueType::Unsigned),
+                ];
+            }
+            let handle_ty = if handle_field_index == Some(i) {
+                handle_attr.clone()
+            } else {
+                None
+            };
+            let attr_ty = handle_ty.unwrap_or_else(|| {
+                let attr_owner = if handle_field_index == Some(i) {
+                    owner
+                } else {
+                    layout_td
+                };
+                tyref_to_attr_value_type_for_struct_field(
+                    ty,
+                    attr_owner,
+                    llbc,
+                    gc_struct_ids,
+                    raw_alloc_flavor_structs,
+                    Some(struct_fields),
+                )
+            });
+            vec![(
+                fname.clone(),
+                crate::virtualizable_decl::overlay_virtualizable_llfield_value_type(
+                    canonical_name,
+                    fname,
+                    attr_ty,
+                ),
+            )]
+        })
+        .collect()
+}
+
+fn enum_variant_payload_attr_rows(
+    variant: &VariantDecl,
+    llbc: &Llbc,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+    struct_fields: &crate::front::semantic::StructFieldRegistry,
+) -> Vec<(String, ValueType)> {
+    let mut vattrs = Vec::new();
+    for (i, f) in variant.fields.iter().enumerate() {
+        if tyref_is_void_zst(&f.ty, llbc)
+            && !tyref_keeps_empty_class_instance(&f.ty, llbc, no_tombstoned_leaves())
+        {
+            continue;
+        }
+        let fname = field_decl_name(i, f);
+        if tyref_pair_field_kind(&f.ty, llbc).is_some() {
+            let len = pair_len_field_name(&fname);
+            vattrs.push((fname, ValueType::Unsigned));
+            vattrs.push((len, ValueType::Unsigned));
+            continue;
+        }
+        if !enum_variant_field_occupies_storage(&f.ty, llbc)
+            && !tyref_keeps_empty_class_instance(&f.ty, llbc, no_tombstoned_leaves())
+        {
+            if tyref_is_type_parameter(&f.ty, llbc) {
+                vattrs.push((fname, ValueType::Unknown));
+            }
+            continue;
+        }
+        let attr_ty = if tyref_is_bytecode_arg_marker(&f.ty, llbc) {
+            ValueType::Int
+        } else {
+            tyref_to_attr_value_type_with(
+                &f.ty,
+                llbc,
+                no_tombstoned_leaves(),
+                gc_struct_ids,
+                raw_alloc_flavor_structs,
+                Some(struct_fields),
+            )
+        };
+        vattrs.push((fname, attr_ty));
+    }
+    vattrs
+}
+
 fn derive_program_metadata(
     llbc: &Llbc,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
@@ -7112,6 +7270,8 @@ fn derive_program_metadata(
     let mut struct_field_attrs: std::collections::HashMap<String, Vec<(String, ValueType)>> =
         std::collections::HashMap::new();
     let ambiguous_leaves = ambiguous_adt_leaves(llbc);
+    let mut pending_struct_attrs: Vec<PendingStructFieldAttrs> = Vec::new();
+    let mut pending_enum_attrs: Vec<(String, u64, usize)> = Vec::new();
 
     for (path, kind) in discover_transparent_scalar_kinds(llbc) {
         struct_fields
@@ -7318,50 +7478,22 @@ fn derive_program_metadata(
                 // closest Rust-side stand-in for RPython's class-object key:
                 // same-leaf structs in distinct modules stay distinct, and
                 // the spelling matches the def-path convention used by
-                // `STRUCT_ORIGIN_REGISTRY`.
-                let attr_rows: Vec<(String, ValueType)> = row_fields
-                    .iter()
-                    .enumerate()
-                    .flat_map(|(i, f)| {
-                        let fname = f.name.clone().unwrap_or_else(|| {
-                            majit_charon_reader::ullbc::positional_field_name(i)
-                        });
-                        if tyref_pair_field_kind(&f.ty, llbc).is_some() {
-                            let len = pair_len_field_name(&fname);
-                            return vec![(fname, ValueType::Unsigned), (len, ValueType::Unsigned)];
-                        }
-                        let attr_ty = if handle_field_index == Some(i) {
-                            handle_attr.clone().unwrap_or_else(|| {
-                                tyref_to_attr_value_type_for_struct_field(
-                                    &f.ty,
-                                    td,
-                                    llbc,
-                                    gc_struct_ids,
-                                    raw_alloc_flavor_structs,
-                                    Some(&struct_fields),
-                                )
-                            })
-                        } else {
-                            tyref_to_attr_value_type_for_struct_field(
-                                &f.ty,
-                                layout_td,
-                                llbc,
-                                gc_struct_ids,
-                                raw_alloc_flavor_structs,
-                                Some(&struct_fields),
-                            )
-                        };
-                        vec![(
-                            fname.clone(),
-                            crate::virtualizable_decl::overlay_virtualizable_llfield_value_type(
-                                &canonical_name,
-                                &fname,
-                                attr_ty,
-                            ),
-                        )]
-                    })
-                    .collect();
-                struct_field_attrs.insert(canonical_name.clone(), attr_rows);
+                // `STRUCT_ORIGIN_REGISTRY`. Intern rows of every TypeDecl
+                // are in the registry first (`bookkeeper.py`
+                // `Bookkeeper.getuniqueclassdef`); attrs are filled after
+                // this loop (`ClassDesc._init_classdef`).
+                pending_struct_attrs.push(PendingStructFieldAttrs {
+                    canonical_name: canonical_name.clone(),
+                    owner_def_id: td.def_id,
+                    layout_def_id: layout_td.def_id,
+                    handle_field_index,
+                    handle_attr,
+                    row_fields: row_fields
+                        .iter()
+                        .enumerate()
+                        .map(|(i, f)| (field_decl_name(i, f), f.ty.clone()))
+                        .collect(),
+                });
                 known_struct_names.insert(name);
                 known_struct_names.insert(canonical_name);
                 known_struct_names.insert(leaf);
@@ -7652,8 +7784,6 @@ fn derive_program_metadata(
                         let variant_canon = format!("{canon_base}::{}", v.name);
                         let mut vrows: Vec<crate::front::semantic::FieldRow> =
                             Vec::with_capacity(v.fields.len());
-                        let mut vattrs: Vec<(String, ValueType)> =
-                            Vec::with_capacity(v.fields.len());
                         let mut voffsets: std::collections::HashMap<String, u64> =
                             std::collections::HashMap::new();
                         // `rclass.InstanceRepr._setup_repr` declares a subclass as
@@ -7719,8 +7849,6 @@ fn derive_program_metadata(
                                 if let Some(off) = len_off {
                                     voffsets.insert(len.clone(), off);
                                 }
-                                vattrs.push((fname.clone(), ValueType::Unsigned));
-                                vattrs.push((len.clone(), ValueType::Unsigned));
                                 vrows.push(field_decl_row(i, f, "usize"));
                                 vrows.push(crate::front::semantic::FieldRow::named(len, "usize"));
                                 continue;
@@ -7736,35 +7864,22 @@ fn derive_program_metadata(
                                 // `Option<T>::Some.0` annotates from writes.
                                 // The STRUCT itself has no Void/TypeVar slot
                                 // (`heaptracker.all_fielddescrs` / `lltype.Void`).
-                                if tyref_is_type_parameter(&f.ty, llbc) {
-                                    vattrs.push((fname.clone(), ValueType::Unknown));
-                                }
                                 continue;
                             }
                             // A bytecode-arg marker reads as a `u32` at runtime
                             // and annotates as an integer — keep the row string
                             // and the FORCE attr type in agreement so the
                             // projection refines the same shell.
-                            let (row_ty, attr_ty) = if tyref_is_bytecode_arg_marker(&f.ty, llbc) {
-                                ("u32".to_string(), ValueType::Int)
+                            let row_ty = if tyref_is_bytecode_arg_marker(&f.ty, llbc) {
+                                "u32".to_string()
                             } else {
-                                (
-                                    annotation_struct_field_type(
-                                        &f.ty,
-                                        llbc,
-                                        gc_struct_ids,
-                                        raw_alloc_flavor_structs,
-                                        &ambiguous_leaves,
-                                        Some(&struct_fields),
-                                    ),
-                                    tyref_to_attr_value_type_with(
-                                        &f.ty,
-                                        llbc,
-                                        no_tombstoned_leaves(),
-                                        gc_struct_ids,
-                                        raw_alloc_flavor_structs,
-                                        Some(&struct_fields),
-                                    ),
+                                annotation_struct_field_type(
+                                    &f.ty,
+                                    llbc,
+                                    gc_struct_ids,
+                                    raw_alloc_flavor_structs,
+                                    &ambiguous_leaves,
+                                    Some(&struct_fields),
                                 )
                             };
                             let field_offset = if explicit_sum_shell {
@@ -7776,7 +7891,6 @@ fn derive_program_metadata(
                             if let Some(off) = field_offset {
                                 voffsets.insert(fname.clone(), off);
                             }
-                            vattrs.push((fname.clone(), attr_ty));
                             // `rtuple.py TupleRepr` / `rclass.py InstanceRepr`
                             // lowleveltype of an instance-typed item is
                             // `Ptr(GcStruct)`. The explicit sum shell is `New`
@@ -7872,8 +7986,9 @@ fn derive_program_metadata(
                         // key `_init_classdef` derives for the variant classdef
                         // whether the narrowing or the constructor minted it, so
                         // the payload attrs are forced onto the one variant
-                        // class.  Mirrors the struct arm above.
-                        struct_field_attrs.insert(variant_canon, vattrs);
+                        // class.  Mirrors the struct arm above: filled after
+                        // every TypeDecl has published intern rows.
+                        pending_enum_attrs.push((variant_canon, td.def_id, vidx));
                     }
                 }
                 // discriminant → variant name, published under both the
@@ -8171,6 +8286,53 @@ fn derive_program_metadata(
     struct_fields
         .gc_struct_ids
         .extend(gc_struct_ids.iter().copied());
+
+    // FORCE attributes after every TypeDecl has published intern rows.
+    // `bookkeeper.py` `Bookkeeper.getuniqueclassdef` returns one ClassDef
+    // regardless of discovery order; `classdesc.py` `ClassDesc._init_classdef`
+    // attaches attributes against that class. Reading `std_cell_layout_present`
+    // while the harvest loop is still inserting rows would paint
+    // `RefCell<f64>` as Float or as the cell class depending on TypeDecl order.
+    for pending in pending_struct_attrs {
+        let Some(owner) = llbc.type_by_id(pending.owner_def_id) else {
+            continue;
+        };
+        let Some(layout_td) = llbc.type_by_id(pending.layout_def_id) else {
+            continue;
+        };
+        let attr_rows = struct_decl_field_attr_rows(
+            &pending.row_fields,
+            owner,
+            layout_td,
+            pending.handle_field_index,
+            pending.handle_attr,
+            &pending.canonical_name,
+            llbc,
+            gc_struct_ids,
+            raw_alloc_flavor_structs,
+            &struct_fields,
+        );
+        struct_field_attrs.insert(pending.canonical_name, attr_rows);
+    }
+    for (variant_canon, enum_def_id, variant_index) in pending_enum_attrs {
+        let Some(td) = llbc.type_by_id(enum_def_id) else {
+            continue;
+        };
+        let TypeDeclKind::Enum(variants) = &td.kind else {
+            continue;
+        };
+        let Some(variant) = variants.get(variant_index) else {
+            continue;
+        };
+        let vattrs = enum_variant_payload_attr_rows(
+            variant,
+            llbc,
+            gc_struct_ids,
+            raw_alloc_flavor_structs,
+            &struct_fields,
+        );
+        struct_field_attrs.insert(variant_canon, vattrs);
+    }
 
     (
         known_struct_names,
