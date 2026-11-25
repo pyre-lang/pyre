@@ -6986,6 +6986,12 @@ impl<M: Clone> MetaInterp<M> {
             has_greenargs,
         );
         let green_key = marked.cell_key.get().unwrap_or(green_key);
+        // warmstate.py `bound_reached`: `force_finish_trace=bool(cell.flags
+        // & JC_FORCE_FINISH)` on the marked cell.
+        let force_finish = marked
+            .flags
+            .get()
+            .contains(crate::warmstate::JcFlags::JC_FORCE_FINISH);
         self.finish_force_start_tracing(
             green_key,
             target_pc,
@@ -6994,6 +7000,7 @@ impl<M: Clone> MetaInterp<M> {
             live_values,
             &mut typed_values,
             finish_pin,
+            force_finish,
         )
     }
 
@@ -7006,6 +7013,7 @@ impl<M: Clone> MetaInterp<M> {
         live_values: &[Value],
         typed_values: &mut majit_ir::GreenKey,
         pin: &crate::warmstate::GreenRefPin,
+        force_finish: bool,
     ) -> BackEdgeAction {
         // The commit marked this cell. Carry that cell's identity into
         // the TraceCtx, JitCellToken and the unconditional
@@ -7067,17 +7075,6 @@ impl<M: Clone> MetaInterp<M> {
         // keeps `jd_no`; electing a vinfo-bearing sibling would
         // stamp leftover compiling onto this function-entry token.
         self.active_jitdriver_sd = Some(jd_no);
-        // `prepare_trace_segmenting` writes `JC_FORCE_FINISH` through
-        // `current_merge_points[0]`. The seed copies `green_key_values`
-        // so `should_force_finish_tracing_for_key` reads the cell
-        // `bound_reached` marked.
-        // warmstate.py `bound_reached`: `force_finish_trace=bool(cell.flags
-        // & JC_FORCE_FINISH)` on the cell `maybe_compile_and_run` already
-        // matched.
-        live_greenkey_after_collect(pin, typed_values);
-        let force_finish = self
-            .warm_state_for_driver(jd_no)
-            .should_force_finish_tracing_for_key(pin, typed_values);
         live_greenkey_after_collect(pin, typed_values);
         ctx.set_green_key_values(typed_values.clone());
         // Store the ctx before `initialize_virtualizable`.
@@ -7225,6 +7222,12 @@ impl<M: Clone> MetaInterp<M> {
             has_greenargs,
         );
         let green_key = marked.cell_key.get().unwrap_or(green_key);
+        // warmstate.py `bound_reached`: `force_finish_trace=bool(cell.flags
+        // & JC_FORCE_FINISH)` on the marked cell.
+        let force_finish = marked
+            .flags
+            .get()
+            .contains(crate::warmstate::JcFlags::JC_FORCE_FINISH);
         self.finish_bound_reached(
             green_key,
             target_pc,
@@ -7232,6 +7235,7 @@ impl<M: Clone> MetaInterp<M> {
             live_values,
             &mut typed_values,
             finish_pin,
+            force_finish,
         )
     }
 
@@ -7243,6 +7247,7 @@ impl<M: Clone> MetaInterp<M> {
         live_values: &[Value],
         typed_values: &mut majit_ir::GreenKey,
         pin: &crate::warmstate::GreenRefPin,
+        force_finish: bool,
     ) -> BackEdgeAction {
         pin.reload(typed_values);
         self.prepare_trace_start_runtime();
@@ -7258,6 +7263,7 @@ impl<M: Clone> MetaInterp<M> {
             driver_descriptor,
             live_values,
             pin,
+            force_finish,
         )
     }
 
@@ -7463,7 +7469,7 @@ impl<M: Clone> MetaInterp<M> {
     fn mark_matched_tracing_cell(
         &mut self,
         jd_no: usize,
-        matched: Option<std::rc::Rc<crate::warmstate::BaseJitCell>>,
+        matched: crate::warmstate::ResolvedJitCell,
         pin: &crate::warmstate::GreenRefPin,
         live: &mut majit_ir::GreenKey,
         has_greenargs: bool,
@@ -7471,9 +7477,9 @@ impl<M: Clone> MetaInterp<M> {
         let mut warm = self.warm_state_for_driver(jd_no);
         if has_greenargs {
             pin.reload(live);
-            warm.start_tracing_cell(matched.as_ref(), pin, live)
+            warm.start_tracing_cell(&matched, pin, live)
         } else {
-            let cell = matched.expect(
+            let cell = matched.cell.expect(
                 "the hash form names an installed cell; a tracing start without one needs greens, \
                  warmstate.py bound_reached JitCell(*greenargs)",
             );
@@ -7491,15 +7497,14 @@ impl<M: Clone> MetaInterp<M> {
         matched: Option<crate::warmstate::ResolvedJitCell>,
         pin: &crate::warmstate::GreenRefPin,
         live: &mut majit_ir::GreenKey,
-    ) -> Option<std::rc::Rc<crate::warmstate::BaseJitCell>> {
+    ) -> crate::warmstate::ResolvedJitCell {
         match matched {
-            Some(resolved) => resolved.cell,
+            Some(resolved) => resolved,
             None => {
                 pin.reload(live);
                 let hash = live.get_uhash();
                 pin.reload(live);
                 self.resolve_jit_cell_on_driver(jd_no, hash, &live.values, &live.types)
-                    .cell
             }
         }
     }
@@ -7519,7 +7524,7 @@ impl<M: Clone> MetaInterp<M> {
         target_pc: usize,
         matched: Option<crate::warmstate::ResolvedJitCell>,
     ) -> (
-        Option<std::rc::Rc<crate::warmstate::BaseJitCell>>,
+        crate::warmstate::ResolvedJitCell,
         majit_ir::GreenKey,
         Option<crate::warmstate::GreenRefPin>,
         bool,
@@ -7552,15 +7557,21 @@ impl<M: Clone> MetaInterp<M> {
                 };
                 let has_greenargs = !live.types.is_empty();
                 let matched = match matched {
-                    Some(resolved) => resolved.cell,
+                    Some(resolved) => resolved,
                     None if has_greenargs => {
                         let pin = crate::warmstate::GreenRefPin::pin_one(0);
                         let mut resolved_live = pin.live_clone(&live);
                         self.matched_or_resolve(jd_no, None, &pin, &mut resolved_live)
                     }
-                    None => self
-                        .warm_state_ref_for_driver(jd_no)
-                        .and_then(|warm| warm.cell_by_key(green_key)),
+                    None => {
+                        let cell = self
+                            .warm_state_ref_for_driver(jd_no)
+                            .and_then(|warm| warm.cell_by_key(green_key));
+                        crate::warmstate::ResolvedJitCell {
+                            cell,
+                            hash: green_key,
+                        }
+                    }
                 };
                 (matched, live, None, has_greenargs)
             }
@@ -7735,6 +7746,7 @@ impl<M: Clone> MetaInterp<M> {
         driver_descriptor: Option<std::sync::Arc<JitDriverStaticData>>,
         live_values: &[Value],
         pin: &crate::warmstate::GreenRefPin,
+        force_finish: bool,
     ) -> BackEdgeAction {
         // warmstate.py bound_reached: MetaInterp(...) then
         // compile_and_run_once. The long-lived object stays; attempt
@@ -7755,17 +7767,10 @@ impl<M: Clone> MetaInterp<M> {
             );
         }
 
-        // warmstate.py `bound_reached` reads `JC_FORCE_FINISH` off the cell
-        // `maybe_compile_and_run` matched. Do it before `green_key_values`
-        // moves into the trace. The typed cell is the one
-        // `mark_force_finish_tracing_for_key` wrote.
         let jd_no = self
             .elect_active_jitdriver_sd(driver_descriptor.as_deref())
             .unwrap_or(0);
         live_greenkey_after_collect(pin, &mut green_key_values);
-        let force_finish = self
-            .warm_state_for_driver(jd_no)
-            .should_force_finish_tracing_for_key(pin, &green_key_values);
         let mut ctx = TraceCtx::with_green_key(
             recorder,
             green_key,
@@ -7803,7 +7808,6 @@ impl<M: Clone> MetaInterp<M> {
         live_greenkey_after_collect(pin, &mut green_key_values);
         ctx.set_green_key_values(green_key_values);
         // Store the ctx before `initialize_virtualizable`.
-        // `force_finish` was read above, before `green_key_values` moved.
         // `clear_vable_token` can minor-collect, and
         // `walk_active_trace_refs` only sees `self.tracing`.
         self.publish_trace_start(ctx, live_values, force_finish);
