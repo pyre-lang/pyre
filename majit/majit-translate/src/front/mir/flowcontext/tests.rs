@@ -14242,14 +14242,30 @@ fn mut_ref_cell_param_input_names_the_cell_unless_residual() {
 fn gc_mut_ref_option_param_payload_and_reborrow_join_the_cell_set() {
     use majit_charon_reader::ullbc::{Place, Rvalue};
 
-    let llbc = llbc_with_types("fixture", vec![option_enum(0)], vec![]);
+    let handle = struct_decl(
+        1,
+        ident_path(&["fixture", "Handle"]),
+        serde_json::json!([{
+            "name": null,
+            "ty": {"RawPtr": [{"Adt": {"id": 2}}, "Mut"]},
+            "attr_info": null
+        }]),
+        true,
+    );
+    let payload = struct_decl(
+        2,
+        ident_path(&["fixture", "Payload"]),
+        serde_json::json!([]),
+        false,
+    );
+    let llbc = llbc_with_types("fixture", vec![option_enum(0), handle, payload], vec![]);
     let tomb = no_tombstoned_leaves();
-    let gc_struct_ids = std::collections::HashSet::new();
+    let gc_struct_ids = super::harvest_declared_gc_facts(&llbc).gc_struct_ids();
     let raw_alloc = std::collections::HashSet::<String>::new();
     let span = serde_json::json!({"data": {
         "file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}
     }});
-    let pointee = serde_json::json!({"RawPtr": [{"Adt": {"id": 7}}, "Mut"]});
+    let pointee = adt_node(1);
     let mut_ref = serde_json::json!({"Ref": ["Erased", pointee.clone(), "Mut"]});
     let option_ty = option_adt_node(0, mut_ref.clone());
     let i64_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}});

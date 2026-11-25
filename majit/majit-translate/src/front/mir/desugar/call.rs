@@ -372,7 +372,7 @@ impl<'a> Lowering<'a> {
                 // residual host call as a classdef-less instance, and
                 // `if let Some(s)` then could not return a `SomeString`.
                 if self.tyref_is_niche_option_ptr(dest_class_ty) {
-                    tyref_option_gc_mut_ref_cell_root(
+                    tyref_option_gc_mut_ref_or_slot_root(
                         dest_class_ty,
                         self.llbc,
                         self.tombstoned_leaves,
@@ -427,8 +427,10 @@ impl<'a> Lowering<'a> {
                 // payload class directly so a generated gateway wrapper's
                 // successful match arm can dispatch `self.method()`.
                 // A GC `&mut T` payload is the MutRef cell, not `T`.
+                // A remaining-pointer payload is the slot address
+                // (`rdict.py` `ll_get` / `llmemory.py` `GCREF`).
                 .or_else(|| {
-                    tyref_option_gc_mut_ref_cell_root(
+                    tyref_option_gc_mut_ref_or_slot_root(
                         dest_class_ty,
                         self.llbc,
                         self.tombstoned_leaves,
