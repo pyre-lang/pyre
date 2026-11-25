@@ -602,7 +602,7 @@ impl FnPtrFamilyInputs {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum PathArg {
     Funs(std::collections::BTreeSet<String>),
     Params(std::collections::BTreeSet<(String, usize)>),
@@ -661,6 +661,7 @@ pub(crate) fn collect_fnptr_family_inputs(llbc: &Llbc) -> FnPtrFamilyInputs {
 pub(crate) fn resolve_fnptr_field_families(
     inputs: &FnPtrFamilyInputs,
 ) -> Vec<(String, String, String)> {
+    let values = resolve_path_arg_fixpoint(inputs);
     let mut out = Vec::new();
     let mut unknown: Vec<(String, String)> = Vec::new();
     for store in &inputs.stores {
@@ -678,7 +679,7 @@ pub(crate) fn resolve_fnptr_field_families(
                 field,
                 fn_path,
                 arg_pos,
-            } => match resolve_param(inputs, fn_path, *arg_pos, &mut Vec::new()) {
+            } => match path_arg_value(&values, fn_path, *arg_pos) {
                 PathArg::Unknown => push_unknown(&mut unknown, struct_path, field),
                 PathArg::ClosedCopy => {}
                 PathArg::Funs(funs) => {
@@ -771,6 +772,9 @@ fn collect_path_call_args(llbc: &Llbc, inputs: &mut FnPtrFamilyInputs) {
         let Some(body) = fd.unstructured_transient() else {
             continue;
         };
+        let assigns = collect_local_assigns(llbc, &body);
+        let arg_count = body.locals.arg_count;
+        let fun_id = fd.def_id;
         let forward_blocks = forward_reachable_mask(llbc, &body);
         for (bb_idx, bb) in body.body().iter().enumerate() {
             if !forward_blocks[bb_idx] {
@@ -803,8 +807,7 @@ fn collect_path_call_args(llbc: &Llbc, inputs: &mut FnPtrFamilyInputs) {
                     _ => Vec::new(),
                 },
                 CallFunc::Dynamic(op, _) => {
-                    let mut cx = FnPtrStoreCx::new(llbc, u64::MAX, "");
-                    match cx.of_operand_in_fun(fd.def_id, op) {
+                    match operand_store_source(llbc, fun_id, arg_count, &assigns, op) {
                         StoreSource::Funs(funs) => funs.into_iter().collect(),
                         _ => {
                             if operand_is_fnptr(llbc, op) {
@@ -817,7 +820,9 @@ fn collect_path_call_args(llbc: &Llbc, inputs: &mut FnPtrFamilyInputs) {
                 _ => Vec::new(),
             };
             for callee_id in callee_ids {
-                record_path_call_args(llbc, inputs, fd.def_id, callee_id, &call.args);
+                record_path_call_args(
+                    llbc, inputs, fun_id, callee_id, &call.args, arg_count, &assigns,
+                );
             }
         }
     }
@@ -835,6 +840,8 @@ fn record_path_call_args(
     caller_id: u64,
     callee_id: u64,
     args: &[Operand],
+    arg_count: u64,
+    assigns: &LocalAssigns<'_>,
 ) {
     let Some(callee_path) = fun_decl_callpath(llbc, callee_id) else {
         return;
@@ -842,11 +849,23 @@ fn record_path_call_args(
     let args = args
         .iter()
         .map(|operand| {
-            let mut cx = FnPtrStoreCx::new(llbc, u64::MAX, "");
-            path_arg_from(llbc, cx.of_operand_in_fun(caller_id, operand))
+            path_arg_from(
+                llbc,
+                operand_store_source(llbc, caller_id, arg_count, assigns, operand),
+            )
         })
         .collect();
     inputs.call_args.entry(callee_path).or_default().push(args);
+}
+
+fn operand_store_source(
+    llbc: &Llbc,
+    fun_id: u64,
+    arg_count: u64,
+    assigns: &LocalAssigns<'_>,
+    operand: &Operand,
+) -> StoreSource {
+    FnPtrStoreCx::new(llbc, u64::MAX, "").of_operand(fun_id, arg_count, assigns, operand)
 }
 
 fn operand_is_fnptr(llbc: &Llbc, operand: &Operand) -> bool {
@@ -900,11 +919,120 @@ fn params_to_paths(
     Some(paths)
 }
 
-fn resolve_param(
+/// One value per `(fn_path, arg_pos)`, starting at `ClosedCopy` (bottom)
+/// and generalized by `merge_path_arg` until the worklist is empty.
+///
+/// `RPythonAnnotator.complete` / `addpendingblock` reflow a block after
+/// `mergeinputargs` unions the new cells with `unionof`; a cycle
+/// contributes only what enters it from outside.
+fn resolve_path_arg_fixpoint(
     inputs: &FnPtrFamilyInputs,
+) -> std::collections::HashMap<(String, usize), PathArg> {
+    let nodes = path_arg_nodes(inputs);
+    let dependents = path_arg_dependents(inputs, &nodes);
+    let mut values = std::collections::HashMap::new();
+    let mut work: std::collections::VecDeque<(String, usize)> = std::collections::VecDeque::new();
+    let mut queued = std::collections::HashSet::new();
+    for node in &nodes {
+        values.insert(node.clone(), PathArg::ClosedCopy);
+        queued.insert(node.clone());
+        work.push_back(node.clone());
+    }
+    while let Some(node) = work.pop_front() {
+        queued.remove(&node);
+        let computed = eval_path_arg(inputs, &values, &node.0, node.1);
+        let old = path_arg_value(&values, &node.0, node.1);
+        let joined = merge_path_arg(old.clone(), computed);
+        if joined == old {
+            continue;
+        }
+        values.insert(node.clone(), joined);
+        let Some(succ) = dependents.get(&node) else {
+            continue;
+        };
+        for next in succ {
+            if queued.insert(next.clone()) {
+                work.push_back(next.clone());
+            }
+        }
+    }
+    values
+}
+
+fn path_arg_nodes(inputs: &FnPtrFamilyInputs) -> Vec<(String, usize)> {
+    let mut nodes = std::collections::BTreeSet::new();
+    for store in &inputs.stores {
+        if let FieldStore::Param {
+            fn_path, arg_pos, ..
+        } = store
+        {
+            nodes.insert((fn_path.clone(), *arg_pos));
+        }
+    }
+    for args in inputs.call_args.values().flatten() {
+        for arg in args {
+            match arg {
+                PathArg::Params(params) | PathArg::Mixed { params, .. } => {
+                    nodes.extend(params.iter().cloned());
+                }
+                _ => {}
+            }
+        }
+    }
+    nodes.into_iter().collect()
+}
+
+fn path_arg_dependents(
+    inputs: &FnPtrFamilyInputs,
+    nodes: &[(String, usize)],
+) -> std::collections::HashMap<(String, usize), Vec<(String, usize)>> {
+    let node_set: std::collections::HashSet<(String, usize)> = nodes.iter().cloned().collect();
+    let mut dependents: std::collections::HashMap<
+        (String, usize),
+        std::collections::BTreeSet<(String, usize)>,
+    > = std::collections::HashMap::new();
+    for (callee, sites) in &inputs.call_args {
+        for args in sites {
+            for (arg_pos, arg) in args.iter().enumerate() {
+                let node = (callee.clone(), arg_pos);
+                if !node_set.contains(&node) {
+                    continue;
+                }
+                let params = match arg {
+                    PathArg::Params(params) | PathArg::Mixed { params, .. } => params,
+                    _ => continue,
+                };
+                for pred in params {
+                    dependents
+                        .entry(pred.clone())
+                        .or_default()
+                        .insert(node.clone());
+                }
+            }
+        }
+    }
+    dependents
+        .into_iter()
+        .map(|(pred, succs)| (pred, succs.into_iter().collect()))
+        .collect()
+}
+
+fn path_arg_value(
+    values: &std::collections::HashMap<(String, usize), PathArg>,
     fn_path: &str,
     arg_pos: usize,
-    visiting: &mut Vec<(String, usize)>,
+) -> PathArg {
+    values
+        .get(&(fn_path.to_string(), arg_pos))
+        .cloned()
+        .unwrap_or(PathArg::ClosedCopy)
+}
+
+fn eval_path_arg(
+    inputs: &FnPtrFamilyInputs,
+    values: &std::collections::HashMap<(String, usize), PathArg>,
+    fn_path: &str,
+    arg_pos: usize,
 ) -> PathArg {
     // An unresolvable fn-pointer Dynamic call may target any FunDecl
     // used as a value. `Bookkeeper.consider_call_site` sees that
@@ -913,17 +1041,12 @@ fn resolve_param(
     if inputs.unresolved_fnptr_dynamic && inputs.fn_defs_as_values.contains(fn_path) {
         return PathArg::Unknown;
     }
-    let key = (fn_path.to_string(), arg_pos);
-    if visiting.contains(&key) {
-        return PathArg::ClosedCopy;
-    }
     let Some(sites) = inputs.call_args.get(fn_path) else {
         return PathArg::Unknown;
     };
     if sites.is_empty() {
         return PathArg::Unknown;
     }
-    visiting.push(key);
     let mut acc: Option<PathArg> = None;
     for args in sites {
         let next = match args.get(arg_pos) {
@@ -931,10 +1054,10 @@ fn resolve_param(
             Some(PathArg::Unknown) => PathArg::Unknown,
             Some(PathArg::ClosedCopy) => PathArg::ClosedCopy,
             Some(PathArg::Funs(funs)) => PathArg::Funs(funs.clone()),
-            Some(PathArg::Params(params)) => flatten_params(inputs, params, visiting),
+            Some(PathArg::Params(params)) => join_param_nodes(values, params),
             Some(PathArg::Mixed { funs, params }) => merge_path_arg(
                 PathArg::Funs(funs.clone()),
-                flatten_params(inputs, params, visiting),
+                join_param_nodes(values, params),
             ),
         };
         acc = Some(match acc {
@@ -942,22 +1065,19 @@ fn resolve_param(
             Some(prev) => merge_path_arg(prev, next),
         });
         if matches!(acc, Some(PathArg::Unknown)) {
-            visiting.pop();
             return PathArg::Unknown;
         }
     }
-    visiting.pop();
     acc.unwrap_or(PathArg::Unknown)
 }
 
-fn flatten_params(
-    inputs: &FnPtrFamilyInputs,
+fn join_param_nodes(
+    values: &std::collections::HashMap<(String, usize), PathArg>,
     params: &std::collections::BTreeSet<(String, usize)>,
-    visiting: &mut Vec<(String, usize)>,
 ) -> PathArg {
     let mut acc: Option<PathArg> = None;
     for (fn_path, arg_pos) in params {
-        let next = resolve_param(inputs, fn_path, *arg_pos, visiting);
+        let next = path_arg_value(values, fn_path, *arg_pos);
         acc = Some(match acc {
             None => next,
             Some(prev) => merge_path_arg(prev, next),
@@ -1315,20 +1435,6 @@ impl<'a> FnPtrStoreCx<'a> {
 
     fn of_parameter(&mut self, fun_id: u64, arg_local: usize) -> StoreSource {
         StoreSource::Params(std::collections::BTreeSet::from([(fun_id, arg_local)]))
-    }
-
-    fn of_operand_in_fun(&mut self, fun_id: u64, operand: &Operand) -> StoreSource {
-        if let Some(fun) = operand_fundef(self.llbc, operand) {
-            return StoreSource::Funs(std::collections::BTreeSet::from([fun]));
-        }
-        let Some(fd) = self.llbc.fn_by_id(fun_id) else {
-            return StoreSource::Unknown;
-        };
-        let Some(body) = fd.unstructured_transient() else {
-            return StoreSource::Unknown;
-        };
-        let assigns = collect_local_assigns(self.llbc, &body);
-        self.of_operand(fun_id, body.locals.arg_count, &assigns, operand)
     }
 }
 
