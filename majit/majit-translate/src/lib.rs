@@ -860,6 +860,7 @@ fn lazy_graph_source(
             return_type: return_type.clone(),
             return_class_root: return_class_root.clone(),
             return_can_be_none,
+            return_result_layout: graph.header().return_result_layout,
             hints: hints.to_vec(),
         },
     }
