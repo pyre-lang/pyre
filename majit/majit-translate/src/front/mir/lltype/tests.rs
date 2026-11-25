@@ -2393,6 +2393,344 @@ fn std_cell_refcell_vec_gcref_borrow_any_annotates() {
         .unwrap_or_else(|e| panic!("arg_borrow_any annotate: {e}"));
 }
 
+/// Production accessor shape: a GC owner returns `&self.<RefCell field>`
+/// (`Assign` of `Rvalue::Ref` of the field, then a Deref reborrow into
+/// local 0) and a caller `.borrow()`s that result. RPython `getattr` of
+/// the attribute is the cell class (`classdesc.py` `ClassDef` /
+/// `unaryop.py` `SomeInstance.getattr`); returning it is that same
+/// annotation. The opaque-getter fixture above cannot see this body.
+#[test]
+fn std_cell_gc_owner_refcell_field_borrow_accessor_annotates() {
+    use crate::annotator::annrpython::RPythonAnnotator;
+    use crate::annotator::model::SomeValue;
+    use crate::flowspace::argument::Signature;
+    use crate::translator::rtyper::call_registry::{CallRegistry, FunctionPathKey};
+    use crate::translator::rtyper::cutover::lift_callee_to_pygraph;
+    use crate::translator::rtyper::flowspace_adapter::{
+        derive_subject_inputcells, function_graph_to_flowspace,
+    };
+    use std::rc::Rc;
+
+    let host_adt = named_adt(2, vec![]);
+    let host_ptr = serde_json::json!({"RawPtr": [host_adt.clone(), "Mut"]});
+    let vec_ty = named_adt(1, vec![host_ptr.clone()]);
+    let refcell_ty = named_adt(0, vec![vec_ty.clone()]);
+    let refcell_ref = serde_json::json!({"Ref": ["Erased", refcell_ty.clone(), "Shared"]});
+    let owner_adt = named_adt(3, vec![]);
+    let owner_ref = serde_json::json!({"Ref": ["Erased", owner_adt.clone(), "Shared"]});
+    let (unwind, ret) = window_unwind_and_return_blocks();
+
+    let refcell_decl = type_decl_struct(
+        0,
+        &["core", "cell", "RefCell"],
+        vec![
+            serde_json::json!({
+                "name": "borrow",
+                "ty": i64_ty(),
+                "attr_info": null
+            }),
+            serde_json::json!({
+                "name": "value",
+                "ty": vec_ty.clone(),
+                "attr_info": null
+            }),
+        ],
+    );
+    let vec_decl = type_decl_struct(1, &["alloc", "vec", "Vec"], vec![]);
+    let host_decl = type_decl_struct(2, &["fixture", "Host"], vec![]);
+    let owner_decl = type_decl_struct(
+        3,
+        &["fixture", "Owner"],
+        vec![serde_json::json!({
+            "name": "active",
+            "ty": refcell_ty.clone(),
+            "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true}
+        })],
+    );
+
+    let owner_deref = window_place(
+        serde_json::json!({"Projection": [
+            window_place(serde_json::json!({"Local": 1}), &owner_ref),
+            "Deref"
+        ]}),
+        &owner_adt,
+    );
+    let active_place = window_place(
+        serde_json::json!({"Projection": [
+            owner_deref,
+            {"Field": [null, 0]}
+        ]}),
+        &refcell_ty,
+    );
+    let tmp_ref_place = window_place(serde_json::json!({"Local": 2}), &refcell_ref);
+    let tmp_deref_place = window_place(
+        serde_json::json!({"Projection": [tmp_ref_place.clone(), "Deref"]}),
+        &refcell_ty,
+    );
+    let borrow_call = |arg_ty: &serde_json::Value, arg_local: u64, target: u64| {
+        serde_json::json!({"Call": {"call": {
+            "func": {"Regular": {
+                "kind": {"Fun": 2},
+                "generics": window_empty_generics()
+            }},
+            "args": [{"Read": window_place(serde_json::json!({"Local": arg_local}), arg_ty)}]
+        }, "dest": window_place(serde_json::json!({"Local": 0}), &vec_ty),
+            "target": target, "on_unwind": 1}})
+    };
+
+    let getter = serde_json::json!({
+        "def_id": 1,
+        "item_meta": window_meta(&["fixture", "Owner", "active_cell"], true),
+        "signature": {
+            "is_unsafe": false,
+            "inputs": [owner_ref.clone()],
+            "output": refcell_ref.clone()
+        },
+        "body": {"Unstructured": {
+            "span": window_span(),
+            "locals": {"arg_count": 1, "locals": [
+                window_local(0, &refcell_ref),
+                window_local(1, &owner_ref),
+                window_local(2, &refcell_ref)
+            ]},
+            "body": [{
+                "statements": [
+                    {
+                        "span": window_span(),
+                        "kind": {"Assign": [
+                            tmp_ref_place,
+                            {"Ref": {
+                                "place": active_place,
+                                "kind": "Shared",
+                                "ptr_metadata": null
+                            }}
+                        ]}
+                    },
+                    {
+                        "span": window_span(),
+                        "kind": {"Assign": [
+                            window_place(serde_json::json!({"Local": 0}), &refcell_ref),
+                            {"Ref": {
+                                "place": tmp_deref_place,
+                                "kind": "Shared",
+                                "ptr_metadata": null
+                            }}
+                        ]}
+                    }
+                ],
+                "kind": "Regular",
+                "terminator": {"span": window_span(), "kind": "Return"}
+            }]
+        }}
+    });
+    let borrow = window_opaque_fun(
+        2,
+        &["core", "cell", "RefCell", "borrow"],
+        vec![refcell_ref.clone()],
+        vec_ty.clone(),
+    );
+    let getter_caller = serde_json::json!({
+        "def_id": 0,
+        "item_meta": window_meta(&["fixture", "getter_borrow_any"], true),
+        "signature": {
+            "is_unsafe": false,
+            "inputs": [owner_ref.clone()],
+            "output": vec_ty.clone()
+        },
+        "body": {"Unstructured": {
+            "span": window_span(),
+            "locals": {"arg_count": 1, "locals": [
+                window_local(0, &vec_ty),
+                window_local(1, &owner_ref),
+                window_local(2, &refcell_ref)
+            ]},
+            "body": [
+                {
+                    "statements": [],
+                    "kind": "Regular",
+                    "terminator": {"span": window_span(), "kind": {"Call": {"call": {
+                        "func": {"Regular": {
+                            "kind": {"Fun": 1},
+                            "generics": window_empty_generics()
+                        }},
+                        "args": [{"Read": window_place(serde_json::json!({"Local": 1}), &owner_ref)}]
+                    }, "dest": window_place(serde_json::json!({"Local": 2}), &refcell_ref),
+                        "target": 2, "on_unwind": 1}}}
+                },
+                unwind.clone(),
+                {
+                    "statements": [],
+                    "kind": "Regular",
+                    "terminator": {"span": window_span(), "kind": borrow_call(&refcell_ref, 2, 3)}
+                },
+                ret
+            ]
+        }}
+    });
+
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": [refcell_decl, vec_decl, host_decl, owner_decl],
+            "fun_decls": [getter_caller, getter, borrow],
+            "global_decls": [],
+            "trait_decls": [{
+                "def_id": 0,
+                "item_meta": window_meta(&["majit_gc", "header", "GcType"], false)
+            }],
+            "trait_impls": [gctype_impl_for_adt(3)]
+        }
+    });
+    let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("accessor fixture parses");
+    let harvested = Rc::new(crate::front::mir::LowerContext::new(&llbc).struct_field_registry());
+    let program = crate::test_support::build_semantic_program_from_llbc(&llbc)
+        .unwrap_or_else(|e| panic!("semantic program: {e:?}"));
+    let (owner_key, owner_fields) = program
+        .struct_field_attrs
+        .iter()
+        .find(|(key, _)| key.rsplit("::").next() == Some("Owner"))
+        .expect("Owner FORCE fields are harvested");
+    let owner_layout: Vec<(String, String)> = program
+        .struct_fields
+        .fields
+        .get(owner_key)
+        .expect("Owner layout rows are harvested before FORCE")
+        .iter()
+        .map(|row| (row.name.clone(), row.ty.clone()))
+        .collect();
+    crate::annotator::classdesc::register_struct_fields_with_layout_and_registry(
+        owner_key,
+        owner_fields,
+        Some(&owner_layout),
+        &program.struct_fields,
+    );
+    let stamped = program
+        .functions
+        .iter()
+        .find(|f| f.name == "active_cell")
+        .expect("active_cell fixture is present");
+    let stamped_graph = stamped.graph();
+
+    // Production `build_decl` stamps this graph (`GraphStamp::apply`).
+    // `lower_function` does not, and would miss a header-token Integer.
+    let mut getter_graph = stamped_graph.clone();
+    // Looked-inside aggregate returns leave FUNC.RESULT unstamped; the
+    // declared signature token remains available for FunctionDesc.pycall.
+    getter_graph.return_type = None;
+    getter_graph.residual_return_type = Some("ref".to_string());
+    let getter_return = getter_graph
+        .blocks
+        .iter()
+        .find(|block| block.id == getter_graph.returnblock)
+        .and_then(|block| block.inputargs.first())
+        .cloned()
+        .expect("getter return block has its result variable");
+    let getter_dump = getter_graph.dump();
+
+    let ann = RPythonAnnotator::new(None, None, None, false);
+    ann.bookkeeper.set_struct_fields(harvested.clone());
+    let owner_classdef = ann
+        .bookkeeper
+        .classdef_for_known_struct_root(owner_key)
+        .expect("Owner ClassDef is interned from harvested rows");
+    let owner_attr = owner_classdef
+        .borrow()
+        .attrs
+        .get("active")
+        .expect("Owner.active FORCE attribute exists")
+        .s_value
+        .clone();
+    assert!(
+        matches!(
+            owner_attr,
+            SomeValue::Instance(ref inst) if inst.classdef.as_ref().is_some_and(|cd| {
+                cd.borrow().name.starts_with("cell::RefCell<")
+            })
+        ),
+        "Owner.active must be the cell class on its first annotation, got {owner_attr:?}"
+    );
+    assert!(
+        getter_return.annotation.borrow().is_none(),
+        "front lowering must not preseed the getter return: {:?}",
+        getter_return.annotation.borrow()
+    );
+    crate::translator::rtyper::legacy_annotator::annotate_with_bookkeeper(
+        &getter_graph,
+        Some(&ann.bookkeeper),
+    );
+    assert!(
+        matches!(
+            getter_return.annotation.borrow().as_deref(),
+            Some(SomeValue::Instance(inst)) if inst.classdef.as_ref().is_some_and(|cd| {
+                cd.borrow().name.starts_with("cell::RefCell<")
+            })
+        ),
+        "legacy getter return producer must stamp the cell class, got {:?}",
+        getter_return.annotation.borrow()
+    );
+    let registry = CallRegistry::new(ann.bookkeeper.clone());
+    let lifted_getter = function_graph_to_flowspace(&getter_graph, &registry)
+        .unwrap_or_else(|e| panic!("lift active_cell: {e:?}; {getter_dump}"));
+    crate::translator::simplify::simplify_graph(&lifted_getter.graph.borrow(), None);
+    let getter_cells = derive_subject_inputcells(&getter_graph, Some(&ann.bookkeeper))
+        .unwrap_or_else(|e| panic!("active_cell inputcells: {e:?}; {getter_dump}"));
+    let getter_start = lifted_getter.graph.borrow().startblock.clone();
+    let getter_opt: Vec<Option<SomeValue>> = getter_cells.into_iter().map(Some).collect();
+    ann.addpendingblock(&lifted_getter.graph, &getter_start, &getter_opt);
+    ann.complete_pending_blocks()
+        .unwrap_or_else(|e| panic!("active_cell annotate blocked: {e}; {getter_dump}"));
+    let getter_ret = lifted_getter.graph.borrow().getreturnvar();
+    let getter_s = ann.binding(&getter_ret);
+    let getter_is_cell = matches!(
+        &getter_s,
+        SomeValue::Instance(inst) if inst.classdef.as_ref().is_some_and(|cd| {
+            let name = cd.borrow().name.clone();
+            name.starts_with("cell::RefCell<") && name.contains("Vec<")
+        })
+    );
+    assert!(
+        getter_is_cell,
+        "accessor return must be the cell class, got {getter_s:?}; {getter_dump}"
+    );
+
+    let getter_sig = Signature::new(vec!["self".into()], None, None);
+    let getter_py = lift_callee_to_pygraph(&getter_graph, getter_sig.clone(), &registry)
+        .unwrap_or_else(|e| panic!("lift_callee active_cell: {e}; {getter_dump}"));
+    let crate::flowspace::model::Hlvalue::Variable(cached_return) =
+        getter_py.graph.borrow().getreturnvar()
+    else {
+        panic!("FunctionDesc cached return must be a Variable")
+    };
+    let cached_annotation = cached_return.annotation.borrow().clone();
+    assert!(
+        matches!(
+            cached_annotation.as_deref(),
+            Some(SomeValue::Instance(inst)) if inst.classdef.as_ref().is_some_and(|cd| {
+                cd.borrow().name.starts_with("cell::RefCell<")
+            })
+        ),
+        "FunctionDesc cached return must keep the field annotation, got {cached_annotation:?}"
+    );
+    let getter_key = FunctionPathKey::from_segments(["fixture", "Owner", "active_cell"]);
+    registry.register_callee(getter_key, getter_sig, getter_py);
+
+    let caller_graph = crate::front::mir::lower_function(&llbc, "getter_borrow_any")
+        .unwrap_or_else(|e| panic!("lower getter_borrow_any: {e:?}"));
+    let caller_dump = caller_graph.dump();
+    let lifted_caller = function_graph_to_flowspace(&caller_graph, &registry)
+        .unwrap_or_else(|e| panic!("lift getter_borrow_any: {e:?}; {caller_dump}"));
+    crate::translator::simplify::simplify_graph(&lifted_caller.graph.borrow(), None);
+    let caller_cells = derive_subject_inputcells(&caller_graph, Some(&ann.bookkeeper))
+        .unwrap_or_else(|e| panic!("getter_borrow_any inputcells: {e:?}; {caller_dump}"));
+    let caller_start = lifted_caller.graph.borrow().startblock.clone();
+    let caller_opt: Vec<Option<SomeValue>> = caller_cells.into_iter().map(Some).collect();
+    ann.addpendingblock(&lifted_caller.graph, &caller_start, &caller_opt);
+    ann.complete_pending_blocks()
+        .unwrap_or_else(|e| panic!("caller .borrow() blocked: {e}; {caller_dump}"));
+}
+
 /// `Ref<'b, T>` is `{ value: NonNull<T>, borrow }` — a pointer to T —
 /// so it occupies T's bank. `RefCell<T>` holds T inline and stays the
 /// cell class. Field / return / argument / class_root share that verdict.
