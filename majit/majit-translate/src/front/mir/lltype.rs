@@ -5151,6 +5151,34 @@ pub(in crate::front::mir) fn tyref_fieldless_enum_pointee<'l>(
     None
 }
 
+/// Physical call-result ABI of `output`: byte width and signedness of a
+/// narrow integer / fieldless-enum tag (`descr.py get_call_descr`
+/// `symbolic.get_size(RESULT)` / `get_type_flag(RESULT)`). `None` keeps
+/// the default 8-byte word. A `Result<T, E>` carrier projects to `T`
+/// the same way [`dont_look_inside_return_token`] does. A borrow or
+/// pointer of a fieldless enum stays pointer-width
+/// ([`tyref_is_fieldless_enum_free`], no Ref peel).
+pub(in crate::front::mir) fn tyref_call_result_layout(
+    output: &TyRef,
+    llbc: &Llbc,
+    spec: crate::ErrorCarrierSpec<'_>,
+) -> Option<(usize, bool)> {
+    let payload = crate::front::result_exc::result_exc_projected_ok(output, llbc, spec);
+    let kind_src = payload.as_ref().unwrap_or(output);
+    if is_unit_type(kind_src, llbc) {
+        return None;
+    }
+    if tyref_is_fieldless_enum_free(kind_src, llbc) {
+        if let Some((_, size, signed)) = fieldless_enum_raw_store_descr(kind_src, llbc) {
+            return (size < 8).then_some((size, signed));
+        }
+        return None;
+    }
+    let node = tyref_node(kind_src, llbc)?;
+    let spelling = json_ty_scalar_element_spelling(node, llbc)?;
+    crate::model::FunctionGraph::result_layout_from_return_token(&spelling)
+}
+
 /// Integer bank, byte width, and signedness of a fieldless enum's tag.
 pub(in crate::front::mir) fn fieldless_enum_raw_store_descr(
     ty: &TyRef,

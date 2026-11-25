@@ -10160,6 +10160,11 @@ pub struct FunctionGraph {
     /// `return_type` stays unstamped. A funcobj whose body cannot be built
     /// is called through this declared result (`rffi.llexternal`).
     pub residual_return_type: Option<String>,
+    /// Physical ABI of `FUNC.RESULT` when it is a narrow integer
+    /// (`descr.py get_call_descr`: `symbolic.get_size(RESULT)` /
+    /// `get_type_flag(RESULT) == FLAG_SIGNED`). `(size, signed)`; `None`
+    /// keeps the default word layout (`result_layout_key`).
+    pub return_result_layout: Option<(usize, bool)>,
     /// Per-graph JIT hints — the `_jit_*_` / `_elidable_function_`
     /// attributes RPython `policy.py look_inside_graph` reads off
     /// `graph.func`. Pyre carries them on the graph itself so
@@ -10330,6 +10335,7 @@ pub fn copygraph(graph: &FunctionGraph) -> FunctionGraph {
         return_is_str: graph.return_is_str,
         return_container_root: graph.return_container_root.clone(),
         residual_return_type: graph.residual_return_type.clone(),
+        return_result_layout: graph.return_result_layout,
         hints: graph.hints.clone(),
         access_directly: graph.access_directly,
         specialization: graph.specialization,
@@ -10484,6 +10490,7 @@ impl FunctionGraph {
             return_is_str: false,
             return_container_root: None,
             residual_return_type: None,
+            return_result_layout: None,
             owner_root: None,
             source_identity: None,
             funcobj_identity: None,
@@ -10506,7 +10513,32 @@ impl FunctionGraph {
     /// codewriter signature validator leaves the result un-validated for
     /// `None`-carrying graphs.
     pub fn with_return_type(mut self, rt: impl Into<String>) -> Self {
-        self.return_type = Some(rt.into());
+        let rt = rt.into();
+        self.return_result_layout = Self::result_layout_from_return_token(&rt);
+        self.return_type = Some(rt);
+        self
+    }
+
+    /// Byte width and signedness of a residual integer result whose
+    /// declared token is narrower than a word (`descr.py get_call_descr`).
+    /// `None` keeps the default 8-byte layout.
+    pub fn result_layout_from_return_token(token: &str) -> Option<(usize, bool)> {
+        match token {
+            "bool" | "u8" => Some((1, false)),
+            "i8" => Some((1, true)),
+            "u16" => Some((2, false)),
+            "i16" => Some((2, true)),
+            "u32" | "char" => Some((4, false)),
+            "i32" => Some((4, true)),
+            _ => None,
+        }
+    }
+
+    /// Builder-style setter for [`Self::return_result_layout`]. A fieldless
+    /// enum's tag is not recoverable from the `"i64"` residual token, so
+    /// the Charon layout is stored here beside `return_type`.
+    pub fn with_return_result_layout(mut self, size: usize, signed: bool) -> Self {
+        self.return_result_layout = Some((size, signed));
         self
     }
 

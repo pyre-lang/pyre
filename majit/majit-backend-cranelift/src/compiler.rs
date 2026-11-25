@@ -7502,20 +7502,53 @@ fn push_described_call_results(sig: &mut Signature, result_type: Type) {
         return;
     }
     // `CallBuilder64.load_result` reads one return word. A Ref result is
-    // that pointer.
+    // that pointer. The C ABI return register is still I64; a narrow
+    // `'i'` result is extended after the call (`load_result` MOVZX/MOVSX).
     sig.returns
         .push(AbiParam::new(cranelift_type_for(&result_type)));
+}
+
+/// `callbuilder.py` `CallBuilderX86.load_result`: MOVZX/MOVSX of a
+/// narrow `'i'` result into the 64-bit bank.
+fn extend_narrow_int_call_result(
+    builder: &mut FunctionBuilder,
+    value: CValue,
+    result_size: usize,
+    result_signed: bool,
+) -> CValue {
+    let narrow = match result_size {
+        1 => cl_types::I8,
+        2 => cl_types::I16,
+        4 => cl_types::I32,
+        _ => return value,
+    };
+    let reduced = builder.ins().ireduce(narrow, value);
+    if result_signed {
+        builder.ins().sextend(cl_types::I64, reduced)
+    } else {
+        builder.ins().uextend(cl_types::I64, reduced)
+    }
 }
 
 fn ref_result_from_call(
     builder: &mut FunctionBuilder,
     call: cranelift_codegen::ir::Inst,
-    result_type: Type,
+    call_descr: &dyn CallDescr,
 ) -> Option<CValue> {
+    let result_type = call_descr.result_type();
     if result_type == Type::Void {
         return None;
     }
-    Some(builder.inst_results(call)[0])
+    let mut value = builder.inst_results(call)[0];
+    if result_type == Type::Int {
+        value = extend_narrow_int_call_result(
+            builder,
+            value,
+            call_descr.result_size(),
+            call_descr.is_result_signed(),
+        );
+    }
+    Some(value)
 }
 
 /// `callbuilder.py` `AbstractCallBuilder.emit` sequence: spill /
@@ -7650,7 +7683,7 @@ fn emit_indirect_call_from_parts(
         },
     );
 
-    ref_result_from_call(builder, call, result_type)
+    ref_result_from_call(builder, call, call_descr)
 }
 
 /// x86/regalloc.py `consider_cond_call`: `assert 2 <= len(args) <= 4 + 2`
@@ -16500,7 +16533,7 @@ impl CraneliftBackend {
                         );
                     }
                     let call = builder.ins().call_indirect(sig_ref, func_ptr_val, &args);
-                    let result = ref_result_from_call(&mut builder, call, result_type);
+                    let result = ref_result_from_call(&mut builder, call, call_descr);
                     if save_err != 0 {
                         let save_err_val = builder.ins().iconst(cl_types::I64, save_err);
                         let _ = emit_host_call(
@@ -23512,6 +23545,8 @@ mod tests {
     struct TestCallDescr {
         arg_types: Vec<Type>,
         result_type: Type,
+        result_size: usize,
+        result_signed: bool,
         extra_info: EffectInfo,
     }
 
@@ -23529,7 +23564,10 @@ mod tests {
             self.result_type
         }
         fn result_size(&self) -> usize {
-            8
+            self.result_size
+        }
+        fn is_result_signed(&self) -> bool {
+            self.result_signed
         }
         fn get_extra_info(&self) -> &EffectInfo {
             &self.extra_info
@@ -23540,6 +23578,27 @@ mod tests {
         Arc::new(TestCallDescr {
             arg_types,
             result_type,
+            result_size: 8,
+            result_signed: result_type == Type::Int,
+            extra_info: EffectInfo {
+                extraeffect: ExtraEffect::CanRaise,
+                oopspecindex: majit_ir::OopSpecIndex::None,
+                ..Default::default()
+            },
+        })
+    }
+
+    fn make_call_descr_layout(
+        arg_types: Vec<Type>,
+        result_type: Type,
+        result_size: usize,
+        result_signed: bool,
+    ) -> majit_ir::DescrRef {
+        Arc::new(TestCallDescr {
+            arg_types,
+            result_type,
+            result_size,
+            result_signed,
             extra_info: EffectInfo {
                 extraeffect: ExtraEffect::CanRaise,
                 oopspecindex: majit_ir::OopSpecIndex::None,
@@ -23555,6 +23614,8 @@ mod tests {
         Arc::new(TestCallDescr {
             arg_types,
             result_type,
+            result_size: 8,
+            result_signed: result_type == Type::Int,
             extra_info: EffectInfo {
                 extraeffect: ExtraEffect::CanRaise,
                 oopspecindex: majit_ir::OopSpecIndex::None,
@@ -24810,6 +24871,8 @@ mod tests {
         let may_force_no_collect: majit_ir::DescrRef = Arc::new(TestCallDescr {
             arg_types: vec![],
             result_type: Type::Void,
+            result_size: 8,
+            result_signed: false,
             extra_info: EffectInfo {
                 extraeffect: ExtraEffect::CanRaise,
                 oopspecindex: majit_ir::OopSpecIndex::None,
@@ -29326,6 +29389,36 @@ mod tests {
 
         let frame = backend.execute_token(&token, &[Value::Int(40), Value::Int(2)]);
         assert_eq!(backend.get_int_value(&frame, 0), 42);
+    }
+
+    /// `callbuilder.py` `load_result`: a 1-byte unsigned `'i'` result is
+    /// zero-extended (`ireduce` I8 then `uextend` I64) so dirty upper bits
+    /// in the C return register do not survive.
+    #[test]
+    fn test_call_i_narrow_unsigned_zero_extends() {
+        extern "C" fn dirty_u8_bits() -> i64 {
+            0xFFFFFFFFFFFFFF04u64 as i64
+        }
+
+        let mut backend = CraneliftBackend::new();
+        let descr = make_call_descr_layout(vec![], Type::Int, 1, false);
+
+        let ops = vec![
+            mk_op(OpCode::Label, &[], OpRef::NONE.raw()),
+            mk_op_with_descr(
+                OpCode::CallI,
+                &[OpRef::const_int(dirty_u8_bits as *const () as i64)],
+                0,
+                descr,
+            ),
+            mk_op(OpCode::Finish, &[OpRef::int_op(0)], OpRef::NONE.raw()),
+        ];
+
+        let token = JitCellToken::new(20_101);
+        backend.compile_loop(&[], &ops, &token).unwrap();
+
+        let frame = backend.execute_token(&token, &[]);
+        assert_eq!(backend.get_int_value(&frame, 0), 4);
     }
 
     #[test]

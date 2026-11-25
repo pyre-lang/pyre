@@ -1855,9 +1855,20 @@ pub struct CallDescriptor {
 
 impl CallDescriptor {
     pub fn from_signature(arg_types: &[Type], result_type: Type, extra_info: EffectInfo) -> Self {
+        Self::from_signature_with_abi(arg_types, result_type, extra_info, None)
+    }
+
+    /// `cpu.calldescrof(FUNC, NON_VOID_ARGS, RESULT, effectinfo)` with
+    /// `RESULT`'s physical width (`descr.py get_call_descr`).
+    pub fn from_signature_with_abi(
+        arg_types: &[Type],
+        result_type: Type,
+        extra_info: EffectInfo,
+        abi: Option<(usize, bool)>,
+    ) -> Self {
         let arg_classes = arg_types.iter().map(|tp| type_to_argclass(*tp)).collect();
         let (result_type, result_signed, result_size, result_erased) =
-            result_layout_key(result_type);
+            result_layout_key_with_abi(result_type, abi);
         Self {
             arg_classes,
             result_type,
@@ -1952,11 +1963,26 @@ fn result_char_to_ir_type(c: char) -> Type {
 }
 
 fn result_layout_key(result_type: Type) -> (char, bool, usize, CallResultErasedKey) {
+    result_layout_key_with_abi(result_type, None)
+}
+
+/// `descr.py get_call_descr`: `result_size = symbolic.get_size(RESULT)`
+/// and `result_signed = get_type_flag(RESULT) == FLAG_SIGNED`. A narrow
+/// integer ABI (`bool` / `u8` / fieldless-enum tag) keeps result_type `'i'`
+/// and only changes size and signedness.
+fn result_layout_key_with_abi(
+    result_type: Type,
+    abi: Option<(usize, bool)>,
+) -> (char, bool, usize, CallResultErasedKey) {
     let result_char = type_to_argclass(result_type);
     let result_signed = result_type == Type::Int;
     let result_size = match result_type {
         Type::Int | Type::Ref | Type::Float => 8,
         Type::Void => 0,
+    };
+    let (result_signed, result_size) = match (result_type, abi) {
+        (Type::Int, Some((narrow, nsigned))) if narrow < 8 => (nsigned, narrow),
+        _ => (result_signed, result_size),
     };
     (
         result_char,
@@ -1964,6 +1990,33 @@ fn result_layout_key(result_type: Type) -> (char, bool, usize, CallResultErasedK
         result_size,
         CallResultErasedKey::from_ir_layout(result_type, result_signed, result_size),
     )
+}
+
+/// Physical residual-call result ABI stored on the callee graph.
+fn graph_result_abi_layout(graph: &FunctionGraph) -> Option<(usize, bool)> {
+    graph.return_result_layout.or_else(|| {
+        graph
+            .return_type
+            .as_deref()
+            .and_then(FunctionGraph::result_layout_from_return_token)
+    })
+}
+
+/// Indirect family: every resolvable member must agree, else keep the
+/// default word layout (`get_call_descr` of a mixed FUNC.RESULT family).
+fn family_result_abi_layout<'a>(
+    graphs: impl IntoIterator<Item = &'a FunctionGraph>,
+) -> Option<(usize, bool)> {
+    let mut agreed: Option<Option<(usize, bool)>> = None;
+    for graph in graphs {
+        let layout = graph_result_abi_layout(graph);
+        match agreed {
+            None => agreed = Some(layout),
+            Some(prev) if prev == layout => {}
+            Some(_) => return None,
+        }
+    }
+    agreed.flatten()
 }
 
 /// Call classification — RPython `guess_call_kind()` return values.
@@ -3103,6 +3156,7 @@ pub struct GraphTransform {
     pub return_type: Option<String>,
     pub return_class_root: Option<String>,
     pub return_can_be_none: bool,
+    pub return_result_layout: Option<(usize, bool)>,
     pub hints: Vec<String>,
 }
 
@@ -3115,6 +3169,14 @@ impl GraphTransform {
             if let Some(rt) = &self.return_type {
                 graph.return_type = Some(rt.clone());
             }
+        }
+        if let Some(layout) = self.return_result_layout {
+            graph.return_result_layout = Some(layout);
+        } else if graph.return_result_layout.is_none() {
+            graph.return_result_layout = self
+                .return_type
+                .as_deref()
+                .and_then(FunctionGraph::result_layout_from_return_token);
         }
         if let Some(root) = &self.return_class_root {
             graph.return_class_root = Some(root.clone());
@@ -3135,6 +3197,7 @@ struct FuncObjAttrs {
     return_type: Option<String>,
     return_class_root: Option<String>,
     return_can_be_none: bool,
+    return_result_layout: Option<(usize, bool)>,
 }
 
 /// A `func` attribute a decorator sets (`rlib/jit.py` `@elidable`,
@@ -3326,6 +3389,13 @@ impl FuncObjAttrs {
         if self.return_can_be_none {
             graph.return_can_be_none = true;
         }
+        if graph.return_result_layout.is_none() {
+            graph.return_result_layout = self.return_result_layout.or_else(|| {
+                self.return_type
+                    .as_deref()
+                    .and_then(FunctionGraph::result_layout_from_return_token)
+            });
+        }
     }
 }
 
@@ -3473,6 +3543,9 @@ impl<'a> AttrsMut<'a> {
                 if other.return_can_be_none {
                     attrs.return_can_be_none = true;
                 }
+                if attrs.return_result_layout.is_none() {
+                    attrs.return_result_layout = other.return_result_layout;
+                }
             }
         }
     }
@@ -3556,6 +3629,7 @@ impl StoreCore {
                     attrs.return_type = transform.return_type;
                     attrs.return_class_root = transform.return_class_root;
                     attrs.return_can_be_none = transform.return_can_be_none;
+                    attrs.return_result_layout = transform.return_result_layout;
                     std::rc::Rc::make_mut(slot).attrs_mut().fold(&attrs);
                 }
             }
@@ -3741,6 +3815,9 @@ impl StoreCore {
                 if graph.return_can_be_none {
                     existing.return_can_be_none = true;
                 }
+                if existing.return_result_layout.is_none() {
+                    existing.return_result_layout = graph.return_result_layout;
+                }
                 if existing.fun_decl_id.is_none() {
                     existing.fun_decl_id = graph.fun_decl_id;
                 }
@@ -3794,6 +3871,7 @@ impl StoreCore {
                     return_type: transform.return_type,
                     return_class_root: transform.return_class_root,
                     return_can_be_none: transform.return_can_be_none,
+                    return_result_layout: transform.return_result_layout,
                 };
                 slot.attrs_mut().fold(&attrs);
             }
@@ -14988,7 +15066,23 @@ impl CallControl {
         // Pyre's CallDescriptor stores the same structural cache key that
         // RPython's `cpu.calldescrof()` would use; the matching funcptr is
         // plumbed separately by callers.
-        CallDescriptor::from_signature(&arg_types, result_type, effectinfo)
+        // `get_call_descr` takes RESULT's physical size/signedness from
+        // the callee's declared type (`symbolic.get_size` /
+        // `get_type_flag`). A fieldless-enum tag is one unsigned byte.
+        let abi = match shape {
+            CallShape::Direct(target) => self
+                .target_to_path_and_graph(target)
+                .and_then(|(_, graph)| graph_result_abi_layout(&graph)),
+            CallShape::Indirect(graphs) => {
+                let members: Vec<_> = graphs
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|path| self.function_graphs.get(path))
+                    .collect();
+                family_result_abi_layout(members.iter().map(|graph| graph.as_ref()))
+            }
+        };
+        CallDescriptor::from_signature_with_abi(&arg_types, result_type, effectinfo, abi)
     }
 
     /// RPython: calldescr_canraise(calldescr) (call.py).
@@ -26566,6 +26660,94 @@ mod tests {
             &mut cache,
             None,
         );
+    }
+
+    /// `descr.py get_call_descr`: `Bool` is size 1 unsigned.
+    #[test]
+    fn getcalldescr_bool_result_is_one_byte_unsigned() {
+        let mut cc = CallControl::new();
+        let path = CallPath::from_segments(["returns_bool"]);
+        cc.register_function_graph(path, simple_graph("returns_bool").with_return_type("bool"));
+        cc.find_all_graphs_for_tests();
+        let mut cache = AnalysisCache::default();
+        let descr = cc.getcalldescr(
+            &direct_call_op(CallTarget::function_path(["returns_bool"])),
+            Vec::new(),
+            Type::Int,
+            OopSpecIndex::None,
+            None,
+            &mut cache,
+            None,
+        );
+        assert_eq!(descr.result_type, 'i');
+        assert_eq!(descr.result_size, 1);
+        assert!(!descr.result_signed);
+        assert_eq!(
+            descr.result_erased,
+            CallResultErasedKey::from_ir_layout(Type::Int, false, 1)
+        );
+    }
+
+    /// A fieldless enum residual token is `"i64"`; the Charon tag width
+    /// lives on `return_result_layout` (`StrategyKind` is 1 unsigned).
+    #[test]
+    fn getcalldescr_fieldless_enum_result_is_one_byte_unsigned() {
+        let mut cc = CallControl::new();
+        let path = CallPath::from_segments(["strategy_kind"]);
+        cc.register_function_graph(
+            path,
+            simple_graph("strategy_kind")
+                .with_return_type("i64")
+                .with_return_result_layout(1, false),
+        );
+        cc.find_all_graphs_for_tests();
+        let mut cache = AnalysisCache::default();
+        let descr = cc.getcalldescr(
+            &direct_call_op(CallTarget::function_path(["strategy_kind"])),
+            Vec::new(),
+            Type::Int,
+            OopSpecIndex::None,
+            None,
+            &mut cache,
+            None,
+        );
+        assert_eq!(descr.result_type, 'i');
+        assert_eq!(descr.result_size, 1);
+        assert!(!descr.result_signed);
+    }
+
+    /// An indirect family whose members disagree on result width keeps
+    /// the default 8-byte signed layout.
+    #[test]
+    fn getcalldescr_indirect_family_disagreement_keeps_word_layout() {
+        let mut cc = CallControl::new();
+        cc.register_trait_method(
+            "kind",
+            Some("S"),
+            "NarrowImpl",
+            simple_graph("NarrowImpl::kind").with_return_type("bool"),
+        );
+        cc.register_trait_method(
+            "kind",
+            Some("S"),
+            "WideImpl",
+            simple_graph("WideImpl::kind").with_return_type("i64"),
+        );
+        cc.find_all_graphs_for_tests();
+        let family = cc.all_impls_for_indirect("S", "kind");
+        let mut cache = AnalysisCache::default();
+        let descr = cc.getcalldescr(
+            &indirect_call_op(Some(family)),
+            Vec::new(),
+            Type::Int,
+            OopSpecIndex::None,
+            None,
+            &mut cache,
+            None,
+        );
+        assert_eq!(descr.result_type, 'i');
+        assert_eq!(descr.result_size, 8);
+        assert!(descr.result_signed);
     }
 
     #[test]

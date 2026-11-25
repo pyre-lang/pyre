@@ -13862,10 +13862,12 @@ fn dispatch_conditional_call_value_ir<Sym: WalkSym>(
         {
             let (result, concrete) = match dst_bank {
                 'i' => {
-                    let n = majit_metainterp::call_int_function_typed(
-                        func_addr as *const (),
+                    let n = majit_metainterp::executor::do_call_positional(
+                        descr_for_pure
+                            .as_call_descr()
+                            .expect("conditional_call_value descr is a CallDescr"),
+                        func_addr,
                         &concrete_args,
-                        &arg_types,
                     );
                     (recorded, ConcreteValue::Int(n))
                 }

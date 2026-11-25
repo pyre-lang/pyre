@@ -4470,6 +4470,7 @@ impl DeclaredSpec {
             return_type: lowered.return_type,
             return_class_root: lowered.return_class_root,
             return_can_be_none: lowered.return_can_be_none,
+            return_result_layout: graph.header().return_result_layout,
             hints: lowered.hints,
         };
         let mut declared = vec![crate::codewriter::call::DeclaredFuncObj {
@@ -4760,6 +4761,7 @@ pub(crate) struct SemanticFunctionHeader {
     name: String,
     return_type: Option<String>,
     residual_return_type: Option<String>,
+    return_result_layout: Option<(usize, bool)>,
     return_class_root: Option<String>,
     return_is_str: bool,
     return_container_root: Option<String>,
@@ -4911,6 +4913,7 @@ impl SemanticFunctionHeader {
             struct_fields,
         );
         let residual_return_type = signature_token.clone();
+        let return_result_layout = tyref_call_result_layout(&signature.output, llbc, error_carrier);
         let return_is_str = dont_look_inside_return_is_str(&signature.output, llbc, error_carrier);
         let return_container_root = dont_look_inside_return_container_root(
             &signature.output,
@@ -5005,6 +5008,7 @@ impl SemanticFunctionHeader {
             name,
             return_type,
             residual_return_type,
+            return_result_layout,
             return_class_root,
             return_is_str,
             return_container_root,
@@ -5069,6 +5073,7 @@ impl SemanticFunctionHeader {
             hints: self.hints.clone(),
             return_type: self.return_type.clone(),
             residual_return_type: self.residual_return_type.clone(),
+            return_result_layout: self.return_result_layout,
             return_class_root: self.return_class_root.clone(),
             return_is_str: self.return_is_str,
             return_container_root: self.return_container_root.clone(),
@@ -5160,6 +5165,10 @@ pub(crate) struct GraphStamp {
     /// carry it so `declared_result_type_for_*` can read Void for `()`.
     return_type: Option<String>,
     residual_return_type: Option<String>,
+    /// Physical ABI of `FUNC.RESULT` when it is a narrow integer
+    /// (`descr.py get_call_descr`). Stored beside `return_type` because
+    /// a fieldless enum residual token is `"i64"`.
+    return_result_layout: Option<(usize, bool)>,
     return_class_root: Option<String>,
     return_is_str: bool,
     return_container_root: Option<String>,
@@ -5190,6 +5199,7 @@ impl GraphStamp {
             }
         }
         graph.residual_return_type = self.residual_return_type.clone();
+        graph.return_result_layout = self.return_result_layout;
         graph.return_class_root = self.return_class_root.clone();
         graph.return_is_str = self.return_is_str;
         graph.return_container_root = self.return_container_root.clone();
