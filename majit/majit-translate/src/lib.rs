@@ -247,6 +247,7 @@ fn build_semantic_program_via_active_frontend(
                 std::collections::HashMap::new();
             let mut immutable_fields = std::collections::HashMap::new();
             let mut unsafe_fn_stubs = Vec::new();
+            let mut fun_decl_identity_aliases = Vec::new();
             let mut foreign_opaque_method_externals = Vec::new();
             let mut eval_hook_graphs = Vec::new();
             let mut eval_override_graphs = Vec::new();
@@ -462,6 +463,8 @@ fn build_semantic_program_via_active_frontend(
                 front::mir::attach_foldable_const_lits(&llbc, &foldable_cross);
                 front::mir::attach_foldable_const_lits(&llbc, &foldable_impl_by_ord[ord]);
                 front::mir::register_ambiguous_impl_foldable_const_lits(&llbc);
+                fun_decl_identity_aliases
+                    .extend(front::mir::collect_fun_decl_identity_aliases(&llbc));
                 // Stub FUNC.RESULT is computed after intern-row harvest
                 // inside `lower_prelinked_crate` so the classifier reads
                 // the same registry ordinary lowering uses.
@@ -499,6 +502,7 @@ fn build_semantic_program_via_active_frontend(
                 exact_layouts: std::collections::HashMap::new(),
                 struct_ids: std::collections::HashMap::new(),
                 unsafe_fn_stubs: Vec::new(),
+                fun_decl_identity_aliases: Vec::new(),
                 foreign_opaque_method_externals: Vec::new(),
                 atomic_load_decls: Vec::new(),
                 fnptr_field_families: Vec::new(),
@@ -513,6 +517,7 @@ fn build_semantic_program_via_active_frontend(
             program.harvested_hints = hints;
             program.immutable_fields = immutable_fields;
             program.unsafe_fn_stubs = unsafe_fn_stubs;
+            program.fun_decl_identity_aliases = fun_decl_identity_aliases;
             program.foreign_opaque_method_externals = foreign_opaque_method_externals;
             program.fnptr_field_families = fnptr_field_families;
             return (
@@ -2211,6 +2216,7 @@ fn analyze_pipeline_from_module_paths(
     // `CallControl::unsafe_fn_stubs`.  Sourced from Charon and populated on the
     // SemanticProgram in `build_semantic_program_via_active_frontend`.
     call_control.unsafe_fn_stubs = program.unsafe_fn_stubs.clone();
+    call_control.fun_decl_identity_aliases = program.fun_decl_identity_aliases.clone();
     call_control.atomic_load_decls = program.atomic_load_decls.clone();
     // `rpython.rtyper.extregistry.register_external` parity for the three
     // shadow-stack operations `eval::FrameAnchor` reaches.  `majit_gc` is not
@@ -2241,11 +2247,15 @@ fn analyze_pipeline_from_module_paths(
             Some("u64".into()),
             None,
             None,
+            None,
+            None,
         ),
         (
             vec!["majit_gc".into(), "shadow_stack".into(), "get".into()],
             Signature::new(vec!["depth".into()], None, None),
             Some("gcref".into()),
+            None,
+            None,
             None,
             None,
         ),
@@ -2256,6 +2266,8 @@ fn analyze_pipeline_from_module_paths(
                 "try_pop_to".into(),
             ],
             Signature::new(vec!["depth".into()], None, None),
+            None,
+            None,
             None,
             None,
             None,
@@ -2275,6 +2287,8 @@ fn analyze_pipeline_from_module_paths(
             Some("u64".into()),
             None,
             None,
+            None,
+            None,
         ),
         (
             vec![
@@ -2283,6 +2297,8 @@ fn analyze_pipeline_from_module_paths(
                 "release_owner_root".into(),
             ],
             Signature::new(vec!["index".into()], None, None),
+            None,
+            None,
             None,
             None,
             None,
@@ -2297,6 +2313,8 @@ fn analyze_pipeline_from_module_paths(
             Some("gcref".into()),
             None,
             None,
+            None,
+            None,
         ),
         (
             vec![
@@ -2308,6 +2326,8 @@ fn analyze_pipeline_from_module_paths(
             None,
             None,
             None,
+            None,
+            None,
         ),
         // `framework.py` keeps the GC as a prebuilt constant, so a nursery
         // request always has a route. This query is the port's stand-in and
@@ -2316,6 +2336,8 @@ fn analyze_pipeline_from_module_paths(
             vec!["majit_gc".into(), "gc_allocator_installed".into()],
             Signature::new(vec![], None, None),
             Some("bool".into()),
+            None,
+            None,
             None,
             None,
         ),
@@ -2332,6 +2354,8 @@ fn analyze_pipeline_from_module_paths(
             Some("ref".into()),
             None,
             None,
+            None,
+            None,
         ),
         // `executioncontext.py enter` writes `f_backref` through this
         // diagnostic store probe. `majit_gc` is not extracted, so the
@@ -2346,6 +2370,8 @@ fn analyze_pipeline_from_module_paths(
                 None,
                 None,
             ),
+            None,
+            None,
             None,
             None,
             None,
@@ -3073,6 +3099,11 @@ fn analyze_pipeline_from_module_paths(
                 .mark_canonical_path(&harvest);
         }
     }
+    // Residual FunDecls collected as signature-only stubs. Each
+    // producer has the FunDecl: bind identity onto its own harvest
+    // when harvest is free. A harvest occupant is another funcobj
+    // (`Bookkeeper.getdesc`); do not infer from call-site harvest.
+    call_control.publish_residual_fun_decl_identities();
     for &(full_path, fnaddr) in fnaddr_bindings {
         call_control.register_macro_helper_trace_fnaddr(full_path, fnaddr);
     }

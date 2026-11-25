@@ -1144,6 +1144,12 @@ pub struct FunctionDesc {
     /// [`Self::annsignature`]. `Some(sig)` means an `@enforceargs(...)`
     /// decoration was applied and `normalize_args` should invoke it.
     pub annenforceargs: Option<Rc<super::signature::Sig>>,
+    /// CallRegistry keys that name this desc: FunDecl identity and
+    /// harvest aliases of the same funcobj (`bookkeeper.py
+    /// Bookkeeper.getdesc` of the function object). Empty when the
+    /// desc was built without a FunDecl (`FunctionDesc::new` fixtures,
+    /// pure host-name stubs).
+    pub(crate) funcobj_keys: Vec<Vec<String>>,
 }
 
 /// Upstream `_signature_` tuple (params_s, result_s) attached to
@@ -1202,6 +1208,22 @@ impl FunctionDesc {
             source_graph: RefCell::new(None),
             annsignature: None,
             annenforceargs: None,
+            funcobj_keys: Vec::new(),
+        }
+    }
+
+    /// Record a CallRegistry spelling of this funcobj
+    /// (`bookkeeper.py Bookkeeper.getdesc`). Identity selection for
+    /// function-item constants reads these keys. Stores the registered
+    /// path and the crate-stripped spelling
+    /// [`crate::local_crates::call_registry_funcobj_spellings`] accepts,
+    /// the same set `fn_const_registered_host` and
+    /// `CallRegistry::lookup` compare through.
+    pub(crate) fn record_funcobj_key(&mut self, segments: &[String]) {
+        for spelling in crate::local_crates::call_registry_funcobj_spellings(segments) {
+            if !self.funcobj_keys.iter().any(|k| k == &spelling) {
+                self.funcobj_keys.push(spelling);
+            }
         }
     }
 
