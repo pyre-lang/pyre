@@ -914,9 +914,10 @@ fn unique_call_path_by_graph_key(
 }
 
 /// Bind `unique` as an alias of the harvest path this funcobj was just
-/// registered under. No-op when `unique` is already a spelling, when
+/// registered under. No-op when `unique` already names this funcobj, when
 /// `registered` names a different funcobj, or when `unique` is the harvest
-/// path itself.
+/// path itself. An identity that already names a different GraphKey is a
+/// FunDecl-identity collision (`bookkeeper.py Bookkeeper.getdesc`).
 fn alias_unique_call_path(
     call_control: &mut call::CallControl,
     unique: Option<&crate::parse::CallPath>,
@@ -930,7 +931,15 @@ fn alias_unique_call_path(
         return;
     }
     let graphs = call_control.function_graphs_mut();
-    if graphs.names_funcobj(unique) {
+    if let Some(occupant) = graphs.key_for(unique) {
+        if occupant != *expected_key {
+            panic!(
+                "FunDecl identity {} already names GraphKey {occupant:?}, \
+                 expected {expected_key:?} (bookkeeper.py Bookkeeper.getdesc: \
+                 two function objects must not share a desc)",
+                unique.display_name()
+            );
+        }
         return;
     }
     let Some(key) = graphs.key_for(registered) else {

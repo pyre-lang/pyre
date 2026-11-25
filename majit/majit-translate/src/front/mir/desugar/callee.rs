@@ -4771,14 +4771,34 @@ pub(in crate::front::mir) fn inherent_impl_self_identity(
     Some(spelling)
 }
 
+/// One Charon `NameSeg` of a FunDecl or TypeDecl identity walk.
+///
+/// `bookkeeper.py Bookkeeper.getdesc` keys on the function object, so
+/// the identity must be injective per FunDecl. Every segment of the
+/// Charon path is kept: Ident via `spec_ident_name`, Impl via
+/// `scope_owner_impl_seg` (inherent Self via `spec_type_name`, trait
+/// via `render_trait_impl`), other segments via `builtin_path_label`.
+/// Dropping a non-Ident segment (an enclosing Impl of a nested type)
+/// collides two FunDecls onto one spelling.
+fn identity_name_seg(llbc: &Llbc, seg: &NameSeg) -> Option<String> {
+    match seg {
+        NameSeg::Ident {
+            ident: (name, disambiguator),
+        } => Some(crate::front::clause_spec::spec_ident_name(
+            name,
+            *disambiguator,
+        )),
+        _ if seg.is_impl() => Some(scope_owner_impl_seg(llbc, seg)),
+        _ => majit_charon_reader::ullbc::builtin_path_label(seg),
+    }
+}
+
 /// Unique FunDecl walk (`Bookkeeper.getdesc` / the function object).
 ///
-/// One walk of `item_meta.template_name()`. Ident `#N`, every Impl from
-/// its payload, Idents after the last Impl (vtable `getitem` before
-/// `{vtable_method}`), and `FnDef` / `FnPtr` through
-/// `scope_owner_impl_seg` → `spec_type_name`. The last Impl before the
-/// leaf is `<Impl>` plus the trait identity, chosen by position and
-/// `trait_impl_id_for_fundecl`. Used by
+/// One walk of `item_meta.template_name()` through [`identity_name_seg`]
+/// for every non-last-Impl segment. The last Impl before the leaf is
+/// `<Impl>` plus the trait identity, or the Self TypeDecl's full path
+/// (every segment, same renderer) for an inherent impl. Used by
 /// [`identity_path_for_fun_decl`], [`registered_path_for_fun_decl`],
 /// and `SemanticFunction.call_segments`.
 pub(in crate::front::mir) fn identity_segments(
@@ -4803,50 +4823,52 @@ pub(in crate::front::mir) fn identity_segments(
     });
     let mut segments = Vec::new();
     for (i, seg) in segs.iter().enumerate() {
-        match seg {
-            NameSeg::Ident {
-                ident: (name, disambiguator),
-            } => {
-                let rendered = crate::front::clause_spec::spec_ident_name(name, *disambiguator);
-                if i == leaf_idx {
-                    segments.push(attach_leaf_arg(&rendered, Some(name.as_str()), leaf));
-                } else {
+        if last_impl == Some(i) && seg.is_impl() {
+            if let Some(identity) = identity_seg.as_ref() {
+                segments.push("<Impl>".to_string());
+                segments.push(identity.clone());
+            } else {
+                // Inherent last Impl. rustc E0592: a type's inherent
+                // associated items are unique across all inherent impl
+                // blocks of the crate, and Self of an inherent impl is
+                // local to that crate, so `<Self TypeDecl path>::<method>`
+                // (rustc's `<a::T>::make`) is injective per FunDecl;
+                // `bookkeeper.py Bookkeeper.getdesc` keys on the
+                // function object, which this stands in for. The impl's
+                // module prefix is replaced by that TypeDecl path.
+                if let Some(owner) = inherent_impl_self_type_decl_idents(llbc, seg) {
+                    segments = owner;
+                } else if let Some(owner_leaf) = inherent_impl_self_primitive_leaf(llbc, seg)
+                    && segments.last() != Some(&owner_leaf)
+                {
+                    // Primitive Self (no TypeDecl): walked impl module
+                    // plus `spec_type_name` leaf, as before 250. E0592
+                    // holds for those impls within their crate
+                    // (core/alloc/std lang impls).
+                    segments.push(owner_leaf);
+                }
+                // Generic Self (`Atomic<usize>` vs `Atomic<u32>`) is
+                // not that TypeDecl path. Occupancy keeps the impl type
+                // when `type_decl_ref_generics` has args (`spec_adt`).
+                if inherent_impl_self_has_args(llbc, seg)
+                    && let Some(rendered) = identity_name_seg(llbc, seg)
+                {
                     segments.push(rendered);
                 }
             }
-            _ if seg.is_impl() => {
-                if last_impl == Some(i)
-                    && let Some(identity) = identity_seg.as_ref()
-                {
-                    segments.push("<Impl>".to_string());
-                    segments.push(identity.clone());
-                } else if last_impl == Some(i) {
-                    // Inherent last Impl: Self's last Ident is the owner
-                    // leaf `for_impl_method` harvests from the TypeDecl.
-                    if let Some(owner_leaf) = inherent_impl_self_last_ident(llbc, seg)
-                        && segments.last() != Some(&owner_leaf)
-                    {
-                        segments.push(owner_leaf);
-                    }
-                    // Generic Self (`Atomic<usize>` vs `Atomic<u32>`) is
-                    // not that last Ident. Occupancy keeps the impl type
-                    // when `type_decl_ref_generics` has args (`spec_adt`).
-                    if inherent_impl_self_has_args(llbc, seg) {
-                        segments.push(scope_owner_impl_seg(llbc, seg));
-                    }
-                } else {
-                    segments.push(scope_owner_impl_seg(llbc, seg));
-                }
-            }
-            _ => {
-                if let Some(label) = majit_charon_reader::ullbc::builtin_path_label(seg) {
-                    if i == leaf_idx {
-                        segments.push(attach_leaf_arg(&label, None, leaf));
-                    } else {
-                        segments.push(label);
-                    }
-                }
-            }
+            continue;
+        }
+        let Some(rendered) = identity_name_seg(llbc, seg) else {
+            continue;
+        };
+        if i == leaf_idx {
+            let ident_name = match seg {
+                NameSeg::Ident { ident: (name, _) } => Some(name.as_str()),
+                _ => None,
+            };
+            segments.push(attach_leaf_arg(&rendered, ident_name, leaf));
+        } else {
+            segments.push(rendered);
         }
     }
     // `template_name` drops `Instantiated`. Foreign Opaque copies
@@ -4863,25 +4885,25 @@ pub(in crate::front::mir) fn identity_segments(
     segments
 }
 
-/// Last Ident of this inherent Impl's Self type (`TypeDecl.template_name`,
-/// or a primitive `spec_type_name` with no ADT).
-fn inherent_impl_self_last_ident(llbc: &Llbc, seg: &NameSeg) -> Option<String> {
-    if let Some(adt_def_id) = resolve_impl_owner_adt_def_id_free(llbc, seg)
-        && let Some(td) = llbc.type_by_id(adt_def_id)
-    {
-        let mut last = None;
-        for name_seg in td.item_meta.template_name() {
-            if let NameSeg::Ident {
-                ident: (name, disambiguator),
-            } = name_seg
-            {
-                last = Some(crate::front::clause_spec::spec_ident_name(
-                    name,
-                    *disambiguator,
-                ));
-            }
-        }
-        return last;
+/// Every segment of this inherent Impl's Self TypeDecl
+/// `template_name()`, each rendered with [`identity_name_seg`] — the
+/// same per-segment renderer `identity_segments` uses for the FunDecl's
+/// own non-leaf segments. Not `name_path_stripped` (harvest spelling).
+fn inherent_impl_self_type_decl_idents(llbc: &Llbc, seg: &NameSeg) -> Option<Vec<String>> {
+    let adt_def_id = resolve_impl_owner_adt_def_id_free(llbc, seg)?;
+    let td = llbc.type_by_id(adt_def_id)?;
+    let segs: Vec<String> = td
+        .item_meta
+        .template_name()
+        .filter_map(|name_seg| identity_name_seg(llbc, name_seg))
+        .collect();
+    (!segs.is_empty()).then_some(segs)
+}
+
+/// Primitive inherent Self (no ADT TypeDecl): `spec_type_name` leaf.
+fn inherent_impl_self_primitive_leaf(llbc: &Llbc, seg: &NameSeg) -> Option<String> {
+    if resolve_impl_owner_adt_def_id_free(llbc, seg).is_some() {
+        return None;
     }
     let ty = seg.impl_ty_skip_binder()?;
     let name = crate::front::clause_spec::spec_type_name(ty, llbc, 0, false);

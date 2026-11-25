@@ -856,8 +856,8 @@ fn fn_const_incoming(bookkeeper: Option<&Rc<Bookkeeper>>, kind: &OpKind) -> Opti
     if !args.is_empty() {
         return None;
     }
-    let segments = crate::model::fn_const_segments(target)?;
-    let host = fn_const_registered_host(bk, segments)?;
+    let path = crate::model::fn_const_resolved_path(target)?;
+    let host = fn_const_registered_host(bk, &path.segments)?;
     match bk.immutablevalue(&ConstValue::HostObject(host)) {
         Ok(sv @ SomeValue::PBC(_)) => Some(Incoming::Annotation(Rc::new(sv))),
         _ => None,
@@ -868,8 +868,8 @@ fn fn_const_name_matches(name: &str, segments: &[String]) -> bool {
     let Some(leaf) = segments.last() else {
         return false;
     };
-    if name == leaf {
-        return true;
+    if segments.len() == 1 {
+        return name == leaf;
     }
     let dotted = segments.join(".");
     let colon = segments.join("::");

@@ -1593,8 +1593,14 @@ pub(in crate::front::mir) enum DecodedConst {
     UniChar(u32),
     /// Constant function pointer (`FnDef`). Encoded as a synthetic
     /// `FunctionPath` so it shares the existing `Call` lowering path
-    /// when threaded into an indirect call site.
-    FnPath(Vec<String>),
+    /// when threaded into an indirect call site. `segments` are the
+    /// harvest display spelling; `resolved` is the FunDecl identity
+    /// (`registered_path_for_fun_decl` / spec leaf), the stand-in for
+    /// the function object (`bookkeeper.py Bookkeeper.getdesc`).
+    FnPath {
+        segments: Vec<String>,
+        resolved: crate::parse::CallPath,
+    },
 }
 
 /// Literal value tracked by [`const_eval_init_body`].
@@ -4349,6 +4355,23 @@ pub(in crate::front::mir) fn eval_offset_of(llbc: &Llbc, off: &serde_json::Value
     align_up_bytes(offset, fa.max(1))
 }
 
+/// Harvest display plus FunDecl identity of a function-item constant.
+/// `segments` keep `spec_segments` (display); `resolved` is the graph key
+/// (`identity_path_for_fun_decl` with that leaf).
+pub(in crate::front::mir) fn decoded_fn_item_const(
+    llbc: &Llbc,
+    fd: &FunDecl,
+    segments: Vec<String>,
+) -> DecodedConst {
+    let leaf = segments
+        .last()
+        .cloned()
+        .unwrap_or_else(|| registered_leaf(llbc, fd));
+    let resolved =
+        identity_path_for_fun_decl(llbc, fd, &leaf, crate::parse::GraphSpecialization::Regular);
+    DecodedConst::FnPath { segments, resolved }
+}
+
 /// `FnDef { kind: Fun(id), generics }` — a constant function item.
 pub(in crate::front::mir) fn decode_fn_def_const(
     llbc: &Llbc,
@@ -4365,15 +4388,19 @@ pub(in crate::front::mir) fn decode_fn_def_const(
             "FnDef constant references unknown FunDecl id {inner}"
         ))
     })?;
-    // Spell an impl-owned callee the way the registration side keys it
-    // (`CallPath::for_impl_method(self_ty_root, leaf)`), exactly as the
-    // Call terminator does (`call_target_segments`). A free function keeps
-    // `name_path()`: that is its registered spelling.
+    // Harvest `fundecl_fn_item_segments` is display (`spec_segments` /
+    // `name_path`). The FunDecl identity (`registered_path_for_fun_decl`)
+    // is the function object (`bookkeeper.py Bookkeeper.getdesc`) and
+    // the graph key a direct call stamps on `FunctionPath.resolved_path`.
     //
     // A generic fn item used as a value is not this template path:
     // `Lowering::fn_item_const_segments` enqueues `FunctionDesc.cachedgraph`
     // of the instantiation (`description.py` `getuniquegraph` / `specialize`).
-    Ok(DecodedConst::FnPath(fundecl_fn_item_segments(llbc, fd)))
+    Ok(decoded_fn_item_const(
+        llbc,
+        fd,
+        fundecl_fn_item_segments(llbc, fd),
+    ))
 }
 
 pub(in crate::front::mir) fn decode_literal(

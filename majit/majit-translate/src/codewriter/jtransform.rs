@@ -12085,9 +12085,7 @@ impl<'a> Transformer<'a> {
         // function's address (`rtyper.getcallable` / `getfunctionptr`), not
         // an invocation. Residualizing it with the callee's bound fnaddr
         // calls a multi-arg helper as `fn() -> i64` and faults.
-        if args.is_empty()
-            && let Some(segments) = crate::model::fn_const_segments(target)
-        {
+        if args.is_empty() && crate::model::fn_const_segments(target).is_some() {
             let binding = match self.callcontrol.as_deref() {
                 Some(cc) => cc.fnaddr_binding_for_target(target),
                 None => crate::codewriter::call::FnAddrBinding {
@@ -12099,7 +12097,8 @@ impl<'a> Transformer<'a> {
             if let Some(result) = op.result.clone() {
                 self.fn_const_results.insert(
                     result,
-                    CallTarget::function_path(segments.iter().map(String::as_str)),
+                    crate::model::fn_const_named_function(target)
+                        .expect("fn_const_segments is Some only for a FunctionPath"),
                 );
             }
             self.stamp_value_kind_from_value_type(graph, op.result.clone(), &ValueType::Int);
@@ -18821,8 +18820,12 @@ fn target_to_call_path(target: &CallTarget) -> crate::parse::CallPath {
         CallTarget::FunctionPath {
             segments,
             specialization,
+            resolved_path,
             ..
         } => {
+            if let Some(path) = resolved_path {
+                return path.clone();
+            }
             let segments = crate::model::fn_const_segments(target).unwrap_or(segments.as_slice());
             crate::parse::CallPath {
                 segments: segments.iter().map(|s| s.to_string()).collect(),

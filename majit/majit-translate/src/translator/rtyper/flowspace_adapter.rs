@@ -5780,6 +5780,7 @@ fn legacy_const_define_hlvalue(
             if args.is_empty() && crate::model::fn_const_segments(target).is_some() =>
         {
             let segments = crate::model::fn_const_segments(target).expect("guard checked");
+            let resolved = crate::model::fn_const_resolved_path(target).expect("guard checked");
             let call_registry = call_registry.ok_or_else(|| {
                 TyperError::message(format!(
                     "fn const {:?} requires a CallRegistry to materialise getfunctionptr",
@@ -5787,9 +5788,9 @@ fn legacy_const_define_hlvalue(
                 ))
             })?;
             let key = crate::translator::rtyper::call_registry::FunctionPathKey::from_segments(
-                segments.to_vec(),
+                resolved.segments.clone(),
             );
-            let entry = call_registry.lookup_with_leaf_match(&key).ok_or_else(|| {
+            let entry = call_registry.lookup(&key).ok_or_else(|| {
                 TyperError::message(format!(
                     "fn const {:?} did not resolve to a registered callee",
                     key.segments()

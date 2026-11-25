@@ -1199,7 +1199,7 @@ fn transduce_op(
             let func = callee_func_from_funcptr(&op.args[1]);
             // `call.py graphs_from` (`funcobj.graph`), same as `direct_call`.
             let callee = match func.graph_ref().and_then(|g| callee_path(&g)) {
-                Some(path) => CallTarget::from_call_path(&path),
+                Some(path) => CallTarget::from_call_path(&path).with_resolved_path(path),
                 None => {
                     let name = callee_name_from_funcptr(&op.args[1]);
                     CallTarget::function_path(name.split("::").filter(|s| !s.is_empty()))
@@ -1235,7 +1235,7 @@ fn transduce_op(
             let func = callee_func_from_funcptr(&op.args[1]);
             // `call.py graphs_from` (`funcobj.graph`), same as `direct_call`.
             let callee = match func.graph_ref().and_then(|g| callee_path(&g)) {
-                Some(path) => CallTarget::from_call_path(&path),
+                Some(path) => CallTarget::from_call_path(&path).with_resolved_path(path),
                 None => {
                     let name = callee_name_from_funcptr(&op.args[1]);
                     CallTarget::function_path(name.split("::").filter(|s| !s.is_empty()))
@@ -1550,14 +1550,14 @@ fn emit_conditional_call_oopspec_named(
     let fn_target = match callee {
         CallTarget::FunctionPath {
             mut segments,
-            resolved_path: _,
+            resolved_path,
             fun_decl_id,
             specialization,
         } => {
             segments.insert(0, FN_CONST_HEAD.to_string());
             CallTarget::FunctionPath {
                 segments,
-                resolved_path: None,
+                resolved_path,
                 fun_decl_id,
                 specialization,
             }

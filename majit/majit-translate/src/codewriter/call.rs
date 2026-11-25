@@ -8288,11 +8288,10 @@ impl CallControl {
         if let Some(path) = self.target_to_path(target) {
             return self.func_effects_with_crate_alias(&path);
         }
-        // `target_to_path` returns None for `__fn_const::path` so a
-        // residual function-pointer call would miss the
-        // `#[dont_look_inside_cannot_raise]` mark registered on `path`.
-        let segments = crate::model::fn_const_segments(target)?;
-        let path = CallPath::from_segments(segments.iter().map(String::as_str));
+        // `target_to_path` returns None for a `__fn_const` define (it is
+        // a Constant, not a call). Residual effect lookup still names
+        // the function object: identity → `GraphStore::canonical_path`.
+        let path = self.fn_const_canonical_path(target)?;
         self.func_effects_with_crate_alias(&path)
     }
 
@@ -12206,6 +12205,13 @@ impl CallControl {
             .or_else(|| self.target_to_path(target))
     }
 
+    /// Graph key of a function-item constant: FunDecl identity, then
+    /// this store's one spelling per graph (`GraphStore::canonical_path`).
+    fn fn_const_canonical_path(&self, target: &CallTarget) -> Option<CallPath> {
+        crate::model::fn_const_resolved_path(target)
+            .map(|path| self.function_graphs.canonical_path(&path))
+    }
+
     /// Convert a CallTarget to a CallPath for lookup.
     ///
     /// A direct call resolves by the canonical path the caller's FunDecl
@@ -12215,6 +12221,9 @@ impl CallControl {
         match target {
             CallTarget::FunctionPath { resolved_path, .. } => {
                 if crate::model::fn_const_segments(target).is_some() {
+                    // A function-item value is a Constant, not a
+                    // `direct_call`. Graph / fnaddr consumers use
+                    // `fn_const_canonical_path` (identity → canonical).
                     return None;
                 }
                 // Unique FunDecl key first, harvest `segments` fallback.
@@ -12303,10 +12312,10 @@ impl CallControl {
         // would have missed byte-identical to the unguarded result. Only a fire
         // that refuses a resolved address changes the constant, keeping that
         // change attributable to a real refusal.
-        let wrapper_path = crate::model::fn_const_segments(target)
-            .map(|segments| CallPath::from_segments(segments.iter().map(String::as_str)))
-            .or_else(|| self.target_to_path(target))
-            .map(|path| self.function_graphs.canonical_path(&path));
+        let wrapper_path = self.fn_const_canonical_path(target).or_else(|| {
+            self.target_to_path(target)
+                .map(|path| self.function_graphs.canonical_path(&path))
+        });
         if let Some(path) = &wrapper_path
             && path
                 .last_segment()
@@ -12316,8 +12325,7 @@ impl CallControl {
             return binding(path.clone(), addr, true);
         }
 
-        if let Some(segments) = crate::model::fn_const_segments(target) {
-            let path = CallPath::from_segments(segments.iter().map(String::as_str));
+        if let Some(path) = self.fn_const_canonical_path(target) {
             return from_table(path);
         }
         if let Some(path) = self.target_to_path(target) {
@@ -13056,10 +13064,8 @@ impl CallControl {
         // `target_to_path` drops `__fn_const` targets.  The residual for a
         // `dont_look_inside` helper is that fn-const trampoline, so effect
         // lookup has to see the path under the head.
-        self.target_to_path(target).or_else(|| {
-            crate::model::fn_const_segments(target)
-                .map(|segments| CallPath::from_segments(segments.iter().map(String::as_str)))
-        })
+        self.target_to_path(target)
+            .or_else(|| self.fn_const_canonical_path(target))
     }
 
     fn declares_cannot_raise(&self, target: &CallTarget) -> bool {
@@ -15094,16 +15100,14 @@ pub(crate) fn is_dont_look_inside_residual_helper(path: &CallPath) -> bool {
 }
 
 pub(crate) fn symbolic_fnaddr_path_for_target(target: &CallTarget) -> String {
-    if let Some(segments) = crate::model::fn_const_segments(target) {
-        let path = CallPath::from_segments(segments.iter().map(String::as_str));
+    if let Some(path) = crate::model::fn_const_resolved_path(target) {
         return path.canonical_key();
     }
     format!("target:{target}")
 }
 
 pub(crate) fn symbolic_fnaddr_for_target(target: &CallTarget) -> i64 {
-    if let Some(segments) = crate::model::fn_const_segments(target) {
-        let path = CallPath::from_segments(segments.iter().map(String::as_str));
+    if let Some(path) = crate::model::fn_const_resolved_path(target) {
         return symbolic_fnaddr_for_path(&path);
     }
     let symbolic = stable_symbolic_fnaddr(target);

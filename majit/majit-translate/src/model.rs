@@ -376,6 +376,42 @@ pub fn fn_const_segments(target: &CallTarget) -> Option<&[String]> {
     }
 }
 
+/// FunDecl identity a function-item constant names (`bookkeeper.py`
+/// `getdesc` of the function object). Stamped `resolved_path` when the
+/// FunDecl is known; harvest tail for a synthetic define that never
+/// saw one. One path: consumers then ask `GraphStore::canonical_path`.
+pub fn fn_const_resolved_path(target: &CallTarget) -> Option<crate::parse::CallPath> {
+    let segments = fn_const_segments(target)?;
+    match target.resolved_path() {
+        Some(path) => Some(path.clone()),
+        None => Some(crate::parse::CallPath::from_segments(
+            segments.iter().cloned(),
+        )),
+    }
+}
+
+/// Function a `__fn_const` define names: harvest display without the
+/// synthetic head, plus the stamped FunDecl identity. `jtransform`
+/// recovers this as the ConditionalCall / getfunctionptr callee
+/// (`fn_const_results`); the define op itself keeps the head.
+pub fn fn_const_named_function(target: &CallTarget) -> Option<CallTarget> {
+    let segments = fn_const_segments(target)?.to_vec();
+    match target {
+        CallTarget::FunctionPath {
+            resolved_path,
+            fun_decl_id,
+            specialization,
+            ..
+        } => Some(CallTarget::FunctionPath {
+            segments,
+            resolved_path: resolved_path.clone(),
+            fun_decl_id: *fun_decl_id,
+            specialization: *specialization,
+        }),
+        _ => None,
+    }
+}
+
 /// `true` iff `kind` is `front::mir`'s synthetic string-literal
 /// define-op (`Call(["__str_const", <text>])`, `mir.rs`).
 /// Upstream flowspace carries a string literal as a bare
