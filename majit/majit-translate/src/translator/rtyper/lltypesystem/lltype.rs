@@ -357,7 +357,7 @@ pub fn dissect_ll_instance() -> Result<(), TyperError> {
 /// carries the explicit field order, as in upstream `Struct.__init__`.
 #[derive(Clone, Debug)]
 pub struct frozendict<V> {
-    items: Vec<(String, V)>,
+    items: Arc<[(String, V)]>,
 }
 
 impl<V> frozendict<V> {
@@ -369,7 +369,9 @@ impl<V> frozendict<V> {
             }
             seen.push(key.clone());
         }
-        frozendict { items }
+        frozendict {
+            items: items.into(),
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -399,7 +401,7 @@ impl<V> frozendict<V> {
     where
         V: Clone,
     {
-        self.items.clone()
+        self.items.to_vec()
     }
 }
 

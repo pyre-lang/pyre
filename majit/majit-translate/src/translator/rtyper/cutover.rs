@@ -3069,8 +3069,9 @@ pub(crate) fn populate_call_registry_from_call_graphs(
     // gets exactly one row per distinct callable, with `aliases`
     // carrying the indirection.
     let mut by_canonical_path: HashMap<Vec<String>, FunctionPathKey> = HashMap::new();
-    for (path, graph) in function_graphs.iter_declared() {
-        let canonical_strip = canonical_dedup_key(&path, &foreign_callables);
+    let declared = function_graphs.iter_declared();
+    for (path, graph) in &declared {
+        let canonical_strip = canonical_dedup_key(path, &foreign_callables);
         // Decline before the declared-funcobj skip: a clause-spec header
         // (`GraphStore::declare`, `declared = true`) is still
         // `ConditionalCallEntry`, and `describe_declared_funcobj` is too
@@ -3086,7 +3087,7 @@ pub(crate) fn populate_call_registry_from_call_graphs(
         }
         // A funcobj the front end declared gets its entry on first lookup
         // (`describe_declared_funcobj`).
-        if function_graphs.declared_funcobj(&path).is_some() {
+        if function_graphs.declared_funcobj(path).is_some() {
             continue;
         }
         // An AccessDirect `CallPath` names `description.py cachedgraph`'s
@@ -3094,10 +3095,10 @@ pub(crate) fn populate_call_registry_from_call_graphs(
         // as an alias after this pass; inserting it as canonical would make
         // `CallRegistry.alias` panic and would give the copy its own desc.
         // The alt_name is display-only.
-        if crate::codewriter::call::is_access_directly_path(&path) {
+        if crate::codewriter::call::is_access_directly_path(path) {
             continue;
         }
-        let key = FunctionPathKey::from(&path);
+        let key = FunctionPathKey::from(path);
         let entry = if let Some(canonical_key) = by_canonical_path.get(&canonical_strip) {
             if canonical_key != &key {
                 registry.alias(key.clone(), canonical_key);
@@ -3105,7 +3106,7 @@ pub(crate) fn populate_call_registry_from_call_graphs(
             registry
                 .lookup(canonical_key)
                 .expect("canonical entry registered")
-        } else if let Some(existing) = existing_graphstore_entry(function_graphs, registry, &path) {
+        } else if let Some(existing) = existing_graphstore_entry(function_graphs, registry, path) {
             // GraphStore aliases of one GraphKey are one pyobj
             // (`bookkeeper.py Bookkeeper.getdesc`). `canonical_dedup_key`
             // only strips a crate root, so `for_impl_method` and
@@ -3141,9 +3142,9 @@ pub(crate) fn populate_call_registry_from_call_graphs(
         if should_store {
             let signature = crate::codewriter::call::StoreCore::signature_from_graph(&graph);
             let body = function_graphs
-                .body(&path)
+                .body(path)
                 .expect("a declared path names a funcobj");
-            pending.insert(entry_ptr, (key, graph, entry, signature, body));
+            pending.insert(entry_ptr, (key, Rc::clone(graph), entry, signature, body));
         }
     }
     // `function_graphs.iter_declared()` yields `CallPath.display_name` order,
@@ -3156,20 +3157,21 @@ pub(crate) fn populate_call_registry_from_call_graphs(
     // origin was never registered (a declined callable has no desc to
     // alias onto). `alias` panics if the AD key is already canonical,
     // which the skip in the loop above prevents.
-    for (path, _) in function_graphs.iter_declared() {
-        if !crate::codewriter::call::is_access_directly_path(&path) {
+    for (path, _) in &declared {
+        if !crate::codewriter::call::is_access_directly_path(path) {
             continue;
         }
-        let origin = function_graphs.access_directly_desc_origin(&path);
+        let origin = function_graphs.access_directly_desc_origin(path);
         let origin_strip = canonical_dedup_key(&origin, &foreign_callables);
         let Some(canonical_key) = by_canonical_path.get(&origin_strip) else {
             continue;
         };
-        let alias_key = FunctionPathKey::from(&path);
+        let alias_key = FunctionPathKey::from(path);
         if &alias_key != canonical_key {
             registry.alias(alias_key, canonical_key);
         }
     }
+    drop(declared);
     // Register `unsafe fn` stubs between Pass 1 (alias explosion) and
     // Pass 2 (callee lift).  A stub carries the crate-included
     // `name_path()` spelling that the pass above does not register; without

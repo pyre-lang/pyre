@@ -991,7 +991,7 @@ fn harvest_call_paths(func: &front::semantic::SemanticFunction) -> Vec<crate::pa
 }
 
 fn register_function_graph_alias(
-    graphs: &mut std::collections::HashMap<crate::parse::CallPath, call::GraphSource>,
+    graphs: &mut indexmap::IndexMap<crate::parse::CallPath, call::GraphSource>,
     sources: &mut std::collections::HashMap<crate::parse::CallPath, String>,
     path: crate::parse::CallPath,
     source_name: &str,
@@ -1024,7 +1024,7 @@ fn register_function_graph_alias(
 /// (`CallControl::lookup_function_fnaddr`); the host publishes the source
 /// path once (`support.py` `_ll_1_ll_math_ll_math_sqrt = ll_math.ll_math_sqrt`).
 fn pin_builtin_graphs(
-    graphs: &std::collections::HashMap<crate::parse::CallPath, call::GraphSource>,
+    graphs: &indexmap::IndexMap<crate::parse::CallPath, call::GraphSource>,
     bindings: &[(String, crate::parse::CallPath)],
     call_control: &mut call::CallControl,
 ) {
@@ -1890,10 +1890,10 @@ fn analyze_pipeline_from_module_paths(
         crate::model::LazyGraph,
         Option<u64>,
     )> = Vec::new();
-    let mut canonical_function_graphs: std::collections::HashMap<
+    let mut canonical_function_graphs: indexmap::IndexMap<
         crate::parse::CallPath,
         call::GraphSource,
-    > = std::collections::HashMap::new();
+    > = indexmap::IndexMap::new();
     // `bookkeeper.py getdesc` / `newfuncdesc` keys on the host
     // function-object identity, so two unrelated `crate_a::helper` and
     // `crate_b::helper` resolve to distinct `FunctionDesc` instances.

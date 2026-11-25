@@ -84,7 +84,7 @@ use crate::parse::{CallPath, GraphSpecialization};
 /// the display name.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct FunctionPathKey {
-    segments: Vec<String>,
+    segments: Rc<[String]>,
     pub specialization: GraphSpecialization,
 }
 
@@ -95,7 +95,11 @@ impl FunctionPathKey {
         S: Into<String>,
     {
         FunctionPathKey {
-            segments: segments.into_iter().map(Into::into).collect(),
+            segments: segments
+                .into_iter()
+                .map(Into::into)
+                .collect::<Vec<_>>()
+                .into(),
             specialization: GraphSpecialization::Regular,
         }
     }
@@ -112,7 +116,7 @@ impl FunctionPathKey {
 
     pub fn to_call_path(&self) -> CallPath {
         CallPath {
-            segments: self.segments.clone(),
+            segments: self.segments.to_vec(),
             specialization: self.specialization,
         }
     }
@@ -123,7 +127,11 @@ impl FunctionPathKey {
         S: Into<String>,
     {
         FunctionPathKey {
-            segments: segments.into_iter().map(Into::into).collect(),
+            segments: segments
+                .into_iter()
+                .map(Into::into)
+                .collect::<Vec<_>>()
+                .into(),
             specialization: self.specialization,
         }
     }
@@ -132,7 +140,7 @@ impl FunctionPathKey {
 impl From<&CallPath> for FunctionPathKey {
     fn from(path: &CallPath) -> Self {
         FunctionPathKey {
-            segments: path.segments.clone(),
+            segments: path.segments.clone().into(),
             specialization: path.specialization,
         }
     }
@@ -141,7 +149,7 @@ impl From<&CallPath> for FunctionPathKey {
 impl From<CallPath> for FunctionPathKey {
     fn from(path: CallPath) -> Self {
         FunctionPathKey {
-            segments: path.segments,
+            segments: path.segments.into(),
             specialization: path.specialization,
         }
     }
