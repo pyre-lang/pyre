@@ -7379,11 +7379,6 @@ pub fn jit_static_pytype_addrs() -> Vec<(&'static str, i64)> {
             iterobject::STR_ASCII_ITER_TYPE
         ),
         pytype_addr!("iterobject::STR_ITER_TYPE", iterobject::STR_ITER_TYPE),
-        pytype_addr!("iterobject::BYTES_ITER_TYPE", iterobject::BYTES_ITER_TYPE),
-        pytype_addr!(
-            "iterobject::BYTEARRAY_ITER_TYPE",
-            iterobject::BYTEARRAY_ITER_TYPE
-        ),
         pytype_addr!("iterobject::MEMORY_ITER_TYPE", iterobject::MEMORY_ITER_TYPE),
         pytype_addr!("iterobject::ARRAY_ITER_TYPE", iterobject::ARRAY_ITER_TYPE),
         pytype_addr!("iterobject::LIST_ITER_TYPE", iterobject::LIST_ITER_TYPE),
@@ -7518,6 +7513,14 @@ pub fn jit_static_pytype_addrs() -> Vec<(&'static str, i64)> {
         (
             "pycode::CODE_TYPE",
             &crate::pycode::CODE_TYPE as *const _ as i64,
+        ),
+        (
+            "iterobject::BYTES_ITER_TYPE",
+            &crate::objspace::std::iterobject::BYTES_ITER_TYPE as *const _ as i64,
+        ),
+        (
+            "iterobject::BYTEARRAY_ITER_TYPE",
+            &crate::objspace::std::iterobject::BYTEARRAY_ITER_TYPE as *const _ as i64,
         ),
         (
             "pytraceback::PYTRACEBACK_TYPE",
@@ -7738,6 +7741,22 @@ pub fn jit_static_ref_addrs() -> Vec<(&'static str, i64)> {
         (
             "objspace::std::mapdict::MAP_DICT_STRATEGY_REF",
             crate::objspace::std::mapdict::map_dict_strategy_ref() as *const _ as i64,
+        ),
+        // `mapdict.py` shared `DictTerminator` (`cache.py Cache.getorbuild`).
+        // The Global is a `OnceLock`; the refs row is the initialized
+        // `TerminatorForDicts` payload / `get_or_init` return
+        // (`bookkeeper.py immutablevalue` of that object).
+        (
+            "objspace::std::mapdict::TERMINATOR_FOR_DICTS",
+            crate::objspace::std::mapdict::terminator_for_dicts_payload_addr(),
+        ),
+        // `nestedscope.py` `DUMMY_FAMILY` (`cache.py Cache.getorbuild`).
+        // The Global is a `OnceLock<usize>`; the refs row is the
+        // initialized `CellFamily` payload address / `get_or_init`
+        // return (`bookkeeper.py immutablevalue` of that object).
+        (
+            "nestedscope::dummy_family::DUMMY_FAMILY",
+            pyre_object::nestedscope::dummy_family_payload_addr(),
         ),
         (
             "objspace::std::classdict::CLASS_DICT_STRATEGY_REF",
@@ -9697,6 +9716,14 @@ mod tests {
         assert_eq!(
             bindings["objspace::std::mapdict::MAP_DICT_STRATEGY_REF"],
             crate::objspace::std::mapdict::map_dict_strategy_ref() as *const _ as i64
+        );
+        assert_eq!(
+            bindings["objspace::std::mapdict::TERMINATOR_FOR_DICTS"],
+            crate::objspace::std::mapdict::terminator_for_dicts_payload_addr()
+        );
+        assert_eq!(
+            bindings["nestedscope::dummy_family::DUMMY_FAMILY"],
+            pyre_object::nestedscope::dummy_family_payload_addr()
         );
         assert_eq!(
             bindings["objspace::std::classdict::CLASS_DICT_STRATEGY_REF"],

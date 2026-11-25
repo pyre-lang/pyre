@@ -2597,6 +2597,7 @@ pub(in crate::front::mir) fn adt_variant_payload_type(
     tombstoned: &std::collections::HashSet<String>,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+    struct_fields: Option<&crate::front::semantic::StructFieldRegistry>,
 ) -> Option<ValueType> {
     let node = tyref_node(ty, llbc).and_then(|node| strip_ty_wrappers(node, llbc))?;
     let def_id = adt_node_def_id(node)?;
@@ -2622,6 +2623,7 @@ pub(in crate::front::mir) fn adt_variant_payload_type(
         tombstoned,
         gc_struct_ids,
         raw_alloc_flavor_structs,
+        struct_fields,
     );
     if value == ValueType::Void {
         None

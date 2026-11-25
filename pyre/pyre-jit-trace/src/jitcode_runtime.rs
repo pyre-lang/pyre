@@ -259,15 +259,25 @@ pub fn indirectcalltargets() -> &'static [Arc<majit_metainterp::jitcode::JitCode
     &INDIRECTCALLTARGETS
 }
 
-fn build_indirectcalltargets() -> Box<[Arc<majit_metainterp::jitcode::JitCode>]> {
+/// Build-time `(index, jitcode.fnaddr)` rows of `indirectcalltargets.bin`.
+///
+/// `codewriter.py setup_indirectcalltargets` records the assembler set; the
+/// prepass writes each target's dense index beside the shell `fnaddr` so
+/// `pyjitpl.py bytecode_for_address` can key the translated-mode dict
+/// without deserializing every body.
+fn decode_indirectcalltargets_bin() -> Vec<(usize, i64)> {
     const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/indirectcalltargets.bin"));
-    let entries: Vec<(usize, i64)> = bincode::deserialize(BYTES).unwrap_or_else(|e| {
+    bincode::deserialize(BYTES).unwrap_or_else(|e| {
         panic!(
             "pyre-jit-trace: failed to deserialize indirectcalltargets.bin \
              ({} bytes): {e}",
             BYTES.len(),
         )
-    });
+    })
+}
+
+fn build_indirectcalltargets() -> Box<[Arc<majit_metainterp::jitcode::JitCode>]> {
+    let entries = decode_indirectcalltargets_bin();
     let vec: Vec<Arc<majit_metainterp::jitcode::JitCode>> = entries
         .into_iter()
         .map(|(index, _)| {
@@ -294,14 +304,7 @@ fn build_indirectcalltargets() -> Box<[Arc<majit_metainterp::jitcode::JitCode>]>
 /// matched JitCode body is decoded.
 static INDIRECTCALLTARGET_BY_FNADDR: LazyLock<indexmap::IndexMap<usize, usize>> =
     LazyLock::new(|| {
-        const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/indirectcalltargets.bin"));
-        let entries: Vec<(usize, i64)> = bincode::deserialize(BYTES).unwrap_or_else(|e| {
-            panic!(
-                "pyre-jit-trace: failed to deserialize indirectcalltargets.bin \
-             ({} bytes): {e}",
-                BYTES.len(),
-            )
-        });
+        let entries = decode_indirectcalltargets_bin();
         let mut by_fnaddr = indexmap::IndexMap::with_capacity(entries.len());
         let mut declined: Vec<usize> = Vec::new();
         let path_names: Vec<String> = jitcode_index()
@@ -5682,20 +5685,41 @@ mod tests {
 
     #[test]
     fn indirect_target_lookup_decodes_only_the_matched_jitcode() {
-        let (&fnaddr, &index) = INDIRECTCALLTARGET_BY_FNADDR
-            .iter()
-            .next()
-            .expect("expected at least one frozen indirect-call target");
-        assert_eq!(indirectcalltarget_index_for_address(fnaddr), Some(index));
-        let jitcode = indirectcalltarget_by_index(index)
-            .expect("frozen indirect-call target index must resolve");
-        // The map is keyed by runtime address, while `JitCode.fnaddr`
-        // stays the build-time one; translate before comparing.
-        assert_eq!(
-            crate::runtime_fnaddr_patch::runtime_fnaddr(jitcode.fnaddr) as usize,
-            fnaddr
+        // `codewriter.py setup_indirectcalltargets` / `pyjitpl.py
+        // bytecode_for_address` key one address per jitcode (`jitcode.fnaddr`).
+        // The runtime map also binds alias / vtable addresses
+        // (`runtime_fnaddr`, `runtime_fnaddr_by_path`, the rustc vtable slot)
+        // and may `shift_remove` a canonical address on an identical-code-
+        // folding collision, so the first surviving key is not always
+        // `runtime_fnaddr(jitcode.fnaddr)`.
+        const JITCODES_BIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/jitcodes.bin"));
+        let mut saw_canonical = false;
+        for (index, build_fnaddr) in decode_indirectcalltargets_bin() {
+            // `load_jitcode` rewrites `fnaddr` through `fnaddr_reloc`; the
+            // serialized shell still carries the build-time word stored in
+            // the bin (`setup_indirectcalltargets`).
+            let shell = jitcode_index()
+                .load(JITCODES_BIN, index)
+                .unwrap_or_else(|e| panic!("jitcodes.bin entry {index}: {e}"));
+            assert_eq!(
+                shell.fnaddr, build_fnaddr,
+                "indirectcalltargets.bin index {index} build_fnaddr \
+                 {build_fnaddr:#x} mismatches jitcode.fnaddr {:#x}",
+                shell.fnaddr,
+            );
+            let runtime = crate::runtime_fnaddr_patch::runtime_fnaddr(build_fnaddr) as usize;
+            if INDIRECTCALLTARGET_BY_FNADDR.contains_key(&runtime) {
+                assert_eq!(indirectcalltarget_index_for_address(runtime), Some(index));
+                indirectcalltarget_by_index(index)
+                    .expect("frozen indirect-call target index must resolve");
+                assert!(JITCODE_CELLS[index].get().is_some());
+                saw_canonical = true;
+            }
+        }
+        assert!(
+            saw_canonical,
+            "INDIRECTCALLTARGET_BY_FNADDR has no canonical jitcode.fnaddr key"
         );
-        assert!(JITCODE_CELLS[index].get().is_some());
     }
 
     #[test]

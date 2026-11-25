@@ -6574,6 +6574,10 @@ struct TerminatorForDicts(Cell<MapRef>);
 unsafe impl Send for TerminatorForDicts {}
 unsafe impl Sync for TerminatorForDicts {}
 
+/// Memo of `space.fromcache(get_terminator_for_dicts)`
+/// (`mapdict.py` `MapDictStrategy.get_empty_storage`). The translated
+/// interpreter has one object space, so that memo is a single prebuilt
+/// `DictTerminator`.
 static TERMINATOR_FOR_DICTS: OnceLock<TerminatorForDicts> = OnceLock::new();
 
 pub fn get_terminator_for_dicts() -> MapRef {
@@ -6581,6 +6585,15 @@ pub fn get_terminator_for_dicts() -> MapRef {
         .get_or_init(|| TerminatorForDicts(Cell::new(new_dict_terminator(pyre_object::PY_NULL))))
         .0
         .get()
+}
+
+/// Address of the initialized [`TERMINATOR_FOR_DICTS`] payload
+/// (`cache.py` `Cache.getorbuild` memo). The refs row is this object,
+/// not the `OnceLock` container.
+pub(crate) fn terminator_for_dicts_payload_addr() -> i64 {
+    TERMINATOR_FOR_DICTS
+        .get_or_init(|| TerminatorForDicts(Cell::new(new_dict_terminator(pyre_object::PY_NULL))))
+        as *const TerminatorForDicts as i64
 }
 
 /// Extra-root walk of [`TERMINATOR_FOR_DICTS`] (`mapdict.py` shared

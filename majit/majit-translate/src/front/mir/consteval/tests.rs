@@ -3079,6 +3079,517 @@ fn oncelock_usize_get_or_init_folds_to_prebuilt() {
     );
 }
 
+fn payload_struct_ty() -> serde_json::Value {
+    serde_json::json!({"Adt": {"id": 1, "generics": empty_generics()}})
+}
+
+fn payload_struct_type_decl() -> serde_json::Value {
+    serde_json::json!({
+        "def_id": 1,
+        "item_meta": item_meta_json(&["fixture", "Payload"], "", true),
+        "kind": {"Struct": [
+            {"name": "0", "ty": usize_scalar(), "attr_info": null}
+        ]}
+    })
+}
+
+fn oncelock_struct_payload_generics() -> serde_json::Value {
+    serde_json::json!({
+        "regions": [],
+        "types": [payload_struct_ty()],
+        "const_generics": [],
+        "trait_refs": []
+    })
+}
+
+fn oncelock_struct_payload_global_llbc() -> majit_charon_reader::Llbc {
+    let generics = oncelock_struct_payload_generics();
+    let cell_ty = serde_json::json!({"Adt": {"id": 0, "generics": generics}});
+    let funs = vec![serde_json::json!({
+        "def_id": 0,
+        "item_meta": item_meta_json(&["fixture", "read_cell"], "", true),
+        "signature": {"is_unsafe": false, "inputs": [], "output": cell_ty},
+        "body": {"Unstructured": {
+            "span": span_json(),
+            "locals": {"arg_count": 0, "locals": [
+                {"index": 0, "name": null, "span": span_json(), "ty": cell_ty}
+            ]},
+            "body": [{
+                "statements": [{
+                    "span": span_json(),
+                    "kind": {"Assign": [
+                        {"kind": {"Local": 0}, "ty": cell_ty},
+                        {"Use": [{"Read": {
+                            "kind": {"Global": {"generics": empty_generics(), "id": 1}},
+                            "ty": cell_ty
+                        }}, "No"]}
+                    ]}
+                }],
+                "kind": "Regular",
+                "terminator": {"span": span_json(), "kind": "Return"}
+            }]
+        }}
+    })];
+    let globals = vec![
+        serde_json::Value::Null,
+        serde_json::json!({
+            "def_id": 1,
+            "item_meta": item_meta_json(&["fixture", "CELL"], "", true),
+            "global_kind": "Static",
+            "ty": cell_ty
+        }),
+    ];
+    llbc_with_types_funs_globals(
+        "fixture",
+        vec![
+            oncelock_fn_type_decl(
+                serde_json::json!({"Struct": [
+                    {"name": "once", "ty": {"Tuple": []}, "attr_info": null},
+                    {"name": "value", "ty": payload_struct_ty(), "attr_info": null}
+                ]}),
+                Some(oncelock_fn_value_layout()),
+            ),
+            payload_struct_type_decl(),
+        ],
+        funs,
+        globals,
+    )
+}
+
+fn cast_instance_roots(graph: &crate::model::FunctionGraph) -> Vec<String> {
+    graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .filter_map(|op| crate::model::cast_instance_root(&op.kind).map(str::to_string))
+        .collect()
+}
+
+/// A refs-keyed `OnceLock<STRUCT>` Global is the initialized payload
+/// (`cache.py Cache.getorbuild` / `bookkeeper.py immutablevalue`
+/// `SomeInstance`). The pytypes lane shape: `ConstRefAddr` +
+/// `__cast_instance_intrinsic[<T>]`, never `SomeInstance(OnceLock)`.
+#[test]
+fn oncelock_struct_payload_global_emits_const_ref_addr_and_cast_instance() {
+    super::register_foldable_const_lits(Vec::new());
+    let graph = super::lower_function_with_static_addrs(
+        &oncelock_struct_payload_global_llbc(),
+        "read_cell",
+        fnptrcell_refs(),
+    )
+    .expect("OnceLock<STRUCT> Global lowers");
+    assert_eq!(const_ref_addrs(&graph), vec![0x1111]);
+    assert_eq!(
+        cast_instance_roots(&graph),
+        vec!["Payload".to_string()],
+        "payload STRUCT is SomeInstance(T), not OnceLock: {graph:?}"
+    );
+    assert_eq!(
+        nullary_calls_ending(&graph, "CELL"),
+        0,
+        "OnceLock<STRUCT> Global must not residualize: {graph:?}"
+    );
+}
+
+fn oncelock_struct_payload_get_or_init_llbc() -> majit_charon_reader::Llbc {
+    let generics = oncelock_struct_payload_generics();
+    let cell_ty = serde_json::json!({"Adt": {"id": 0, "generics": generics}});
+    let cell_ref = serde_json::json!({"Ref": ["Erased", cell_ty, "Shared"]});
+    let payload = payload_struct_ty();
+    let payload_ref = serde_json::json!({"Ref": ["Erased", payload, "Shared"]});
+    let init_ty = unit_fn_ptr();
+    let empty = empty_generics();
+    let funs = vec![
+        serde_json::json!({
+            "def_id": 0,
+            "item_meta": item_meta_json(&["fixture", "read_cell"], "", true),
+            "signature": {"is_unsafe": false, "inputs": [init_ty], "output": payload_ref},
+            "body": {"Unstructured": {
+                "span": span_json(),
+                "locals": {"arg_count": 1, "locals": [
+                    {"index": 0, "name": null, "span": span_json(), "ty": payload_ref},
+                    {"index": 1, "name": "init", "span": span_json(), "ty": init_ty},
+                    {"index": 2, "name": "cell", "span": span_json(), "ty": cell_ty}
+                ]},
+                "body": [
+                    {"statements": [{
+                        "span": span_json(),
+                        "kind": {"Assign": [
+                            {"kind": {"Local": 2}, "ty": cell_ty},
+                            {"Use": [{"Read": {
+                                "kind": {"Global": {"generics": empty.clone(), "id": 1}},
+                                "ty": cell_ty
+                            }}, "No"]}
+                        ]}
+                    }],
+                    "kind": "Regular",
+                    "terminator": {"span": span_json(), "kind": {"Call": {
+                        "call": {
+                            "func": {"Regular": {"kind": {"Fun": 1}, "generics": empty}},
+                            "args": [
+                                {"Read": {"kind": {"Local": 2}, "ty": cell_ref}},
+                                {"Read": {"kind": {"Local": 1}, "ty": init_ty}}
+                            ]}, "dest": {"kind": {"Local": 0}, "ty": payload_ref},
+                        "target": 1,
+                        "on_unwind": 2
+                    }}}},
+                    {"statements": [], "kind": "Regular", "terminator": {"span": span_json(), "kind": "Return"}},
+                    {"statements": [], "kind": "Regular", "terminator": {"span": span_json(), "kind": "UnwindResume"}}
+                ]
+            }}
+        }),
+        {
+            let mut get_or_init = std_once_lock_unstructured_get_or_init(1);
+            get_or_init["signature"] = serde_json::json!({
+                "is_unsafe": false,
+                "inputs": [cell_ref, init_ty],
+                "output": payload_ref
+            });
+            get_or_init
+        },
+    ];
+    let globals = vec![
+        serde_json::Value::Null,
+        serde_json::json!({
+            "def_id": 1,
+            "item_meta": item_meta_json(&["fixture", "CELL"], "", true),
+            "global_kind": "Static",
+            "ty": cell_ty
+        }),
+    ];
+    llbc_with_types_funs_globals(
+        "fixture",
+        vec![
+            oncelock_fn_type_decl(
+                serde_json::json!({"Struct": [
+                    {"name": "once", "ty": {"Tuple": []}, "attr_info": null},
+                    {"name": "value", "ty": payload_struct_ty(), "attr_info": null}
+                ]}),
+                Some(oncelock_fn_value_layout()),
+            ),
+            payload_struct_type_decl(),
+        ],
+        funs,
+        globals,
+    )
+}
+
+/// `ONCE.get_or_init(f)` on a refs-keyed `OnceLock<STRUCT>` aliases to
+/// the payload instance (`cache.py Cache.getorbuild`). The cast dest
+/// is still a refs-row receiver.
+#[test]
+fn oncelock_struct_payload_get_or_init_folds_to_prebuilt_instance() {
+    super::register_foldable_const_lits(Vec::new());
+    let llbc = oncelock_struct_payload_get_or_init_llbc();
+    assert!(llbc.has_body_under_crate_root("std"));
+    let graph = super::lower_function_with_static_addrs(&llbc, "read_cell", fnptrcell_refs())
+        .expect("OnceLock<STRUCT>::get_or_init lowers");
+    assert_eq!(const_ref_addrs(&graph), vec![0x1111]);
+    assert_eq!(
+        cast_instance_roots(&graph),
+        vec!["Payload".to_string()],
+        "get_or_init receiver is SomeInstance(T): {graph:?}"
+    );
+    assert!(
+        call_paths_in(&graph)
+            .iter()
+            .all(|segments| !segments.iter().any(|s| s == "get_or_init")),
+        "get_or_init must fold to the refs row: {graph:?}"
+    );
+}
+
+fn payload_ptr_ty() -> serde_json::Value {
+    serde_json::json!({"RawPtr": [payload_struct_ty(), "Const"]})
+}
+
+fn oncelock_usize_get_or_init_cast_to_struct_ptr_llbc(
+    rvalue_cast: bool,
+) -> majit_charon_reader::Llbc {
+    let generics = serde_json::json!({
+        "regions": [],
+        "types": [usize_scalar()],
+        "const_generics": [],
+        "trait_refs": []
+    });
+    let cell_ty = serde_json::json!({"Adt": {"id": 0, "generics": generics}});
+    let cell_ref = serde_json::json!({"Ref": ["Erased", cell_ty, "Shared"]});
+    let usize_ref = serde_json::json!({"Ref": ["Erased", usize_scalar(), "Shared"]});
+    let dest_ty = payload_ptr_ty();
+    let init_ty = unit_fn_ptr();
+    let empty = empty_generics();
+    let usize_place = serde_json::json!({
+        "kind": {"Projection": [
+            {"kind": {"Local": 3}, "ty": usize_ref},
+            "Deref"
+        ]},
+        "ty": usize_scalar()
+    });
+    let cast_rvalue = if rvalue_cast {
+        serde_json::json!({"Cast": [
+            "RawPtr",
+            {"Read": usize_place},
+            dest_ty.clone()
+        ]})
+    } else {
+        serde_json::json!({"UnaryOp": [
+            {"Cast": {"RawPtr": [usize_scalar(), dest_ty.clone()]}},
+            {"Read": usize_place}
+        ]})
+    };
+    let funs = vec![
+        serde_json::json!({
+            "def_id": 0,
+            "item_meta": item_meta_json(&["fixture", "read_cell"], "", true),
+            "signature": {"is_unsafe": false, "inputs": [init_ty], "output": dest_ty.clone()},
+            "body": {"Unstructured": {
+                "span": span_json(),
+                "locals": {"arg_count": 1, "locals": [
+                    {"index": 0, "name": null, "span": span_json(), "ty": dest_ty.clone()},
+                    {"index": 1, "name": "init", "span": span_json(), "ty": init_ty},
+                    {"index": 2, "name": "cell", "span": span_json(), "ty": cell_ty},
+                    {"index": 3, "name": "word", "span": span_json(), "ty": usize_ref.clone()}
+                ]},
+                "body": [
+                    {"statements": [{
+                        "span": span_json(),
+                        "kind": {"Assign": [
+                            {"kind": {"Local": 2}, "ty": cell_ty},
+                            {"Use": [{"Read": {
+                                "kind": {"Global": {"generics": empty.clone(), "id": 1}},
+                                "ty": cell_ty
+                            }}, "No"]}
+                        ]}
+                    }],
+                    "kind": "Regular",
+                    "terminator": {"span": span_json(), "kind": {"Call": {
+                        "call": {
+                            "func": {"Regular": {"kind": {"Fun": 1}, "generics": empty}},
+                            "args": [
+                                {"Read": {"kind": {"Local": 2}, "ty": cell_ref}},
+                                {"Read": {"kind": {"Local": 1}, "ty": init_ty}}
+                            ]}, "dest": {"kind": {"Local": 3}, "ty": usize_ref},
+                        "target": 1,
+                        "on_unwind": 2
+                    }}}},
+                    {"statements": [{
+                        "span": span_json(),
+                        "kind": {"Assign": [
+                            {"kind": {"Local": 0}, "ty": dest_ty},
+                            cast_rvalue
+                        ]}
+                    }], "kind": "Regular", "terminator": {"span": span_json(), "kind": "Return"}},
+                    {"statements": [], "kind": "Regular", "terminator": {"span": span_json(), "kind": "UnwindResume"}}
+                ]
+            }}
+        }),
+        {
+            let mut get_or_init = std_once_lock_unstructured_get_or_init(1);
+            get_or_init["signature"] = serde_json::json!({
+                "is_unsafe": false,
+                "inputs": [cell_ref, init_ty],
+                "output": usize_ref
+            });
+            get_or_init
+        },
+    ];
+    let globals = vec![
+        serde_json::Value::Null,
+        serde_json::json!({
+            "def_id": 1,
+            "item_meta": item_meta_json(&["fixture", "CELL"], "", true),
+            "global_kind": "Static",
+            "ty": cell_ty
+        }),
+    ];
+    llbc_with_types_funs_globals(
+        "fixture",
+        vec![
+            oncelock_fn_type_decl(
+                serde_json::json!({"Struct": [
+                    {"name": "once", "ty": {"Tuple": []}, "attr_info": null},
+                    {"name": "value", "ty": usize_scalar(), "attr_info": null}
+                ]}),
+                Some(oncelock_fn_value_layout()),
+            ),
+            payload_struct_type_decl(),
+        ],
+        funs,
+        globals,
+    )
+}
+
+/// A refs-keyed `OnceLock<usize>` payload is the prebuilt GC object
+/// (`cache.py Cache.getorbuild` / `baseobjspace.py fromcache`).
+/// `*ONCE.get_or_init(f) as *const STRUCT` is `ptr_cast_marker` →
+/// `__cast_instance_intrinsic[<T>]` (`rclass.py InstanceRepr.convert_const`).
+fn assert_oncelock_usize_cast_to_struct_ptr_is_instance(rvalue_cast: bool) {
+    super::register_foldable_const_lits(Vec::new());
+    let llbc = oncelock_usize_get_or_init_cast_to_struct_ptr_llbc(rvalue_cast);
+    assert!(llbc.has_body_under_crate_root("std"));
+    let graph = super::lower_function_with_static_addrs(&llbc, "read_cell", fnptrcell_refs())
+        .expect("OnceLock<usize> as *const STRUCT lowers");
+    assert_eq!(const_ref_addrs(&graph), vec![0x1111]);
+    assert_eq!(
+        cast_instance_roots(&graph),
+        vec!["Payload".to_string()],
+        "prebuilt OnceLock<usize> as *const STRUCT is SomeInstance(T): {graph:?}"
+    );
+    assert!(
+        call_paths_in(&graph)
+            .iter()
+            .all(|segments| !segments.iter().any(|s| s == "get_or_init")),
+        "get_or_init must fold to the refs row: {graph:?}"
+    );
+    assert!(
+        call_paths_in(&graph)
+            .iter()
+            .all(|segments| segments.last().map(String::as_str) != Some("cast_int_to_ptr")),
+        "as *const STRUCT is ptr_cast_marker / convert_const, not cast_int_to_ptr: {graph:?}"
+    );
+}
+
+#[test]
+fn oncelock_usize_unary_cast_to_struct_ptr_is_prebuilt_instance() {
+    assert_oncelock_usize_cast_to_struct_ptr_is_instance(false);
+}
+
+#[test]
+fn oncelock_usize_rvalue_cast_to_struct_ptr_is_prebuilt_instance() {
+    assert_oncelock_usize_cast_to_struct_ptr_is_instance(true);
+}
+
+fn generic_cell_payload_ty() -> serde_json::Value {
+    serde_json::json!({"Adt": {"id": 2, "generics": empty_generics()}})
+}
+
+fn generic_refcell_ty() -> serde_json::Value {
+    serde_json::json!({"Adt": {
+        "id": 1,
+        "generics": {
+            "regions": [],
+            "types": [generic_cell_payload_ty()],
+            "const_generics": [],
+            "trait_refs": []
+        }
+    }})
+}
+
+fn generic_refcell_type_decl() -> serde_json::Value {
+    serde_json::json!({
+        "def_id": 1,
+        "item_meta": item_meta_json(&["core", "cell", "RefCell"], "", false),
+        "kind": {"Struct": [
+            {"name": "borrow", "ty": usize_scalar(), "attr_info": null},
+            {"name": "value", "ty": generic_cell_payload_ty(), "attr_info": null}
+        ]}
+    })
+}
+
+fn generic_cell_payload_type_decl() -> serde_json::Value {
+    serde_json::json!({
+        "def_id": 2,
+        "item_meta": item_meta_json(&["fixture", "Payload"], "", true),
+        "kind": {"Struct": [
+            {"name": "0", "ty": usize_scalar(), "attr_info": null}
+        ]}
+    })
+}
+
+fn oncelock_generic_struct_payload_generics() -> serde_json::Value {
+    serde_json::json!({
+        "regions": [],
+        "types": [generic_refcell_ty()],
+        "const_generics": [],
+        "trait_refs": []
+    })
+}
+
+fn oncelock_generic_struct_payload_global_llbc() -> majit_charon_reader::Llbc {
+    let generics = oncelock_generic_struct_payload_generics();
+    let cell_ty = serde_json::json!({"Adt": {"id": 0, "generics": generics}});
+    let funs = vec![serde_json::json!({
+        "def_id": 0,
+        "item_meta": item_meta_json(&["fixture", "read_cell"], "", true),
+        "signature": {"is_unsafe": false, "inputs": [], "output": cell_ty},
+        "body": {"Unstructured": {
+            "span": span_json(),
+            "locals": {"arg_count": 0, "locals": [
+                {"index": 0, "name": null, "span": span_json(), "ty": cell_ty}
+            ]},
+            "body": [{
+                "statements": [{
+                    "span": span_json(),
+                    "kind": {"Assign": [
+                        {"kind": {"Local": 0}, "ty": cell_ty},
+                        {"Use": [{"Read": {
+                            "kind": {"Global": {"generics": empty_generics(), "id": 1}},
+                            "ty": cell_ty
+                        }}, "No"]}
+                    ]}
+                }],
+                "kind": "Regular",
+                "terminator": {"span": span_json(), "kind": "Return"}
+            }]
+        }}
+    })];
+    let globals = vec![
+        serde_json::Value::Null,
+        serde_json::json!({
+            "def_id": 1,
+            "item_meta": item_meta_json(&["fixture", "CELL"], "", true),
+            "global_kind": "Static",
+            "ty": cell_ty
+        }),
+    ];
+    llbc_with_types_funs_globals(
+        "fixture",
+        vec![
+            oncelock_fn_type_decl(
+                serde_json::json!({"Struct": [
+                    {"name": "once", "ty": {"Tuple": []}, "attr_info": null},
+                    {"name": "value", "ty": generic_refcell_ty(), "attr_info": null}
+                ]}),
+                Some(oncelock_fn_value_layout()),
+            ),
+            generic_refcell_type_decl(),
+            generic_cell_payload_type_decl(),
+        ],
+        funs,
+        globals,
+    )
+}
+
+/// A refs-keyed `OnceLock<RefCell<Payload>>` Global casts to the
+/// instantiated cell class ordinary value/input lowering uses
+/// (`tyref_std_cell_class_root`), not the bare `cell::RefCell`
+/// template (`rclass.py` `InstanceRepr.convert_const`).
+#[test]
+fn oncelock_generic_struct_payload_global_emits_instantiated_cast_root() {
+    super::register_foldable_const_lits(Vec::new());
+    let graph = super::lower_function_with_static_addrs(
+        &oncelock_generic_struct_payload_global_llbc(),
+        "read_cell",
+        fnptrcell_refs(),
+    )
+    .expect("OnceLock<RefCell<Payload>> Global lowers");
+    assert_eq!(const_ref_addrs(&graph), vec![0x1111]);
+    let roots = cast_instance_roots(&graph);
+    assert_eq!(
+        roots.len(),
+        1,
+        "one payload STRUCT cast, got {roots:?}: {graph:?}"
+    );
+    assert!(
+        roots[0].starts_with("cell::RefCell<") && roots[0].contains("Payload"),
+        "generic payload uses the instantiated root, got {roots:?}"
+    );
+    assert_eq!(
+        nullary_calls_ending(&graph, "CELL"),
+        0,
+        "OnceLock<RefCell<Payload>> Global must not residualize: {graph:?}"
+    );
+}
+
 fn oncelock_fn_get_llbc() -> majit_charon_reader::Llbc {
     oncelock_fn_get_llbc_with_layout(Some(oncelock_fn_value_layout()))
 }

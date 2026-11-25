@@ -857,6 +857,7 @@ mod tests {
                 crate::ErrorCarrierSpec::default(),
                 &empty_gc,
                 &empty_raw,
+                None,
             )
             .as_deref(),
             Some("ref"),

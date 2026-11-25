@@ -864,7 +864,7 @@ fn array_iter(args: &[PyObjectRef]) -> PyResult {
     require_array_receiver(args, "__iter__", false)?;
     check_arity(args, 1, "array.__iter__")?;
     let len = unsafe { arr::w_array_len(args[0]) };
-    Ok(pyre_object::w_seq_iter_new(args[0], len))
+    Ok(pyre_object::w_array_iter_new(args[0], len))
 }
 
 /// Preserve the exact positional signature that PyPy's interp2app gateway

@@ -604,6 +604,7 @@ fn result_branch_match_uses_int_payloads_from_the_type_decls() {
             &tombstoned,
             &super::harvest_declared_gc_facts(&llbc).gc_struct_ids(),
             &std::collections::HashSet::<String>::new(),
+            None,
         ),
         err: super::adt_variant_payload_type(
             &result_ty,
@@ -612,6 +613,7 @@ fn result_branch_match_uses_int_payloads_from_the_type_decls() {
             &tombstoned,
             &super::harvest_declared_gc_facts(&llbc).gc_struct_ids(),
             &std::collections::HashSet::<String>::new(),
+            None,
         ),
         continue_ty: super::adt_variant_payload_type(
             &flow_ty,
@@ -620,6 +622,7 @@ fn result_branch_match_uses_int_payloads_from_the_type_decls() {
             &tombstoned,
             &super::harvest_declared_gc_facts(&llbc).gc_struct_ids(),
             &std::collections::HashSet::<String>::new(),
+            None,
         ),
         break_ty: super::adt_variant_payload_type(
             &flow_ty,
@@ -628,6 +631,7 @@ fn result_branch_match_uses_int_payloads_from_the_type_decls() {
             &tombstoned,
             &super::harvest_declared_gc_facts(&llbc).gc_struct_ids(),
             &std::collections::HashSet::<String>::new(),
+            None,
         ),
         ..Default::default()
     };
@@ -640,6 +644,223 @@ fn result_branch_match_uses_int_payloads_from_the_type_decls() {
     let (reads, writes) = payload_field_tys(&graph);
     assert_eq!(reads, vec![ValueType::Int, ValueType::Unsigned]);
     assert_eq!(writes, vec![ValueType::Int, ValueType::Unsigned]);
+}
+
+/// `Result<RefCell<i64>, _>::Ok` with harvested intern rows of the cell:
+/// [`adt_variant_payload_type`] and ordinary payload classification share
+/// the cell class (`Ref`), the same `lltypes[index]` both sites read
+/// (`rtuple.py` `TupleRepr.getitem_internal`).
+#[test]
+fn adt_variant_payload_type_shares_layout_present_refcell_with_ordinary_payload() {
+    let i64_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}});
+    let named_field = |name: &str| {
+        serde_json::json!({
+            "name": name,
+            "ty": i64_ty.clone(),
+            "attr_info": null
+        })
+    };
+    let llbc = llbc_with_types(
+        "fixture",
+        vec![
+            result_enum(0),
+            type_decl_struct(
+                1,
+                &["core", "cell", "RefCell"],
+                vec![named_field("borrow"), named_field("value")],
+            ),
+        ],
+        vec![],
+    );
+    let refcell_ty = TyRef::Other(named_adt(1, vec![i64_ty.clone()]).into());
+    let result_ty = branch_adt_ty(0, &[named_adt(1, vec![i64_ty.clone()]), i64_ty]);
+    let tombstoned = std::collections::HashSet::new();
+    let gc = super::harvest_declared_gc_facts(&llbc).gc_struct_ids();
+    let raw = std::collections::HashSet::<String>::new();
+    let mut registry = crate::front::semantic::StructFieldRegistry::default();
+    registry.fields.insert(
+        "cell::RefCell".to_string(),
+        rows(&[("borrow", "i64"), ("value", "i64")]),
+    );
+    let ordinary = super::tyref_enum_payload_value_type(
+        &refcell_ty,
+        &llbc,
+        &tombstoned,
+        &gc,
+        &raw,
+        Some(&registry),
+    );
+    let via_variant = super::adt_variant_payload_type(
+        &result_ty,
+        "Ok",
+        &llbc,
+        &tombstoned,
+        &gc,
+        &raw,
+        Some(&registry),
+    );
+    assert!(
+        matches!(ordinary, ValueType::Ref(_)),
+        "layout-present RefCell with registry is Ref, got {ordinary:?}"
+    );
+    assert_eq!(via_variant, Some(ordinary));
+}
+
+/// Harvested `RefCell<i64>` intern rows (`borrow`, `value`): the
+/// `dont_look_inside` FUNC.RESULT token and ordinary return lowering
+/// share the cell class (`Ref`). `call.py` `CallControl.getcalldescr`
+/// requires `RESULT == FUNC.RESULT`.
+#[test]
+fn dont_look_inside_return_token_shares_layout_present_refcell_with_ordinary_return() {
+    let i64_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}});
+    let named_field = |name: &str| {
+        serde_json::json!({
+            "name": name,
+            "ty": i64_ty.clone(),
+            "attr_info": null
+        })
+    };
+    let llbc = llbc_with_types(
+        "fixture",
+        vec![type_decl_struct(
+            0,
+            &["core", "cell", "RefCell"],
+            vec![named_field("borrow"), named_field("value")],
+        )],
+        vec![],
+    );
+    let refcell_ty = TyRef::Other(named_adt(0, vec![i64_ty]).into());
+    let tombstoned = std::collections::HashSet::new();
+    let gc = super::harvest_declared_gc_facts(&llbc).gc_struct_ids();
+    let raw = std::collections::HashSet::<String>::new();
+    let mut registry = crate::front::semantic::StructFieldRegistry::default();
+    registry.fields.insert(
+        "cell::RefCell".to_string(),
+        rows(&[("borrow", "i64"), ("value", "i64")]),
+    );
+    let ordinary = super::tyref_to_value_type_with(
+        &refcell_ty,
+        &llbc,
+        &tombstoned,
+        &gc,
+        &raw,
+        Some(&registry),
+    );
+    let token = dont_look_inside_return_token(
+        &refcell_ty,
+        &llbc,
+        crate::ErrorCarrierSpec::default(),
+        &gc,
+        &raw,
+        Some(&registry),
+    );
+    assert!(
+        matches!(&ordinary, ValueType::Ref(Some(root)) if root.contains("RefCell")),
+        "layout-present RefCell ordinary return is the cell class, got {ordinary:?}"
+    );
+    assert_eq!(
+        token.as_deref(),
+        Some("ref"),
+        "dont_look_inside FUNC.RESULT of a layout-present RefCell is Ref, got {token:?}"
+    );
+}
+
+/// Harvested intern rows: stub FUNC.RESULT (`collect_unsafe_fn_stubs`)
+/// and field-layout spelling of a `RefCell<i64>` agree with ordinary
+/// lowering (`Ref` / cell class). `call.py` `CallControl.getcalldescr`
+/// requires `RESULT == FUNC.RESULT`.
+#[test]
+fn harvested_refcell_stub_token_and_field_layout_agree_with_ordinary() {
+    let i64_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}});
+    let named_field = |name: &str| {
+        serde_json::json!({
+            "name": name,
+            "ty": i64_ty.clone(),
+            "attr_info": null
+        })
+    };
+    let refcell_output = named_adt(0, vec![i64_ty.clone()]);
+    let fun = serde_json::json!({
+        "def_id": 0,
+        "item_meta": {
+            "name": [{"Ident": ["fixture", 0]}, {"Ident": ["cell_result", 0]}],
+            "span": {"data": {"file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}}},
+            "source_text": null,
+            "attr_info": {"attributes": [], "inline": null, "rename": null, "public": false},
+            "is_local": true
+        },
+        "signature": {"is_unsafe": true, "inputs": [], "output": refcell_output},
+        "body": "Opaque"
+    });
+    let llbc = llbc_with_types(
+        "fixture",
+        vec![type_decl_struct(
+            0,
+            &["core", "cell", "RefCell"],
+            vec![named_field("borrow"), named_field("value")],
+        )],
+        vec![fun],
+    );
+    let refcell_ty = TyRef::Other(named_adt(0, vec![i64_ty]).into());
+    let tombstoned = std::collections::HashSet::new();
+    let gc = super::harvest_declared_gc_facts(&llbc).gc_struct_ids();
+    let raw = std::collections::HashSet::<String>::new();
+    let mut registry = crate::front::semantic::StructFieldRegistry::default();
+    registry.fields.insert(
+        "cell::RefCell".to_string(),
+        rows(&[("borrow", "i64"), ("value", "i64")]),
+    );
+    let ordinary = super::tyref_to_value_type_with(
+        &refcell_ty,
+        &llbc,
+        &tombstoned,
+        &gc,
+        &raw,
+        Some(&registry),
+    );
+    let token = dont_look_inside_return_token(
+        &refcell_ty,
+        &llbc,
+        crate::ErrorCarrierSpec::default(),
+        &gc,
+        &raw,
+        Some(&registry),
+    );
+    let layout =
+        super::tyref_to_field_layout_string(&refcell_ty, &llbc, &gc, &raw, Some(&registry));
+    let stubs = super::collect_unsafe_fn_stubs_from_llbc(
+        &llbc,
+        &gc,
+        crate::ErrorCarrierSpec::default(),
+        &raw,
+        Some(&registry),
+    );
+    assert!(
+        matches!(&ordinary, ValueType::Ref(Some(root)) if root.contains("RefCell")),
+        "layout-present RefCell ordinary return is the cell class, got {ordinary:?}"
+    );
+    assert_eq!(
+        token.as_deref(),
+        Some("ref"),
+        "dont_look_inside FUNC.RESULT of a layout-present RefCell is Ref, got {token:?}"
+    );
+    assert!(
+        layout.contains("RefCell"),
+        "field layout of a layout-present RefCell is the cell class, got {layout}"
+    );
+    let stub_token = stubs.iter().find_map(|(segments, _, tok, _, _)| {
+        segments
+            .last()
+            .is_some_and(|leaf| leaf == "cell_result")
+            .then_some(tok.as_deref())
+    });
+    if let Some(stub_token) = stub_token {
+        assert_eq!(
+            stub_token,
+            token.as_deref(),
+            "collected stub FUNC.RESULT matches ordinary dont_look_inside token"
+        );
+    }
 }
 
 #[test]
@@ -734,8 +955,16 @@ fn result_branch_break_pos0_uses_ensured_variant_struct_id() {
         "Break layout {break_row:?}"
     );
     let payloads = crate::model::ResultBranchPayloads {
-        ok: super::adt_variant_payload_type(&result_ty, "Ok", &llbc, &tombstoned, &gc, &raw),
-        err: super::adt_variant_payload_type(&result_ty, "Err", &llbc, &tombstoned, &gc, &raw),
+        ok: super::adt_variant_payload_type(&result_ty, "Ok", &llbc, &tombstoned, &gc, &raw, None),
+        err: super::adt_variant_payload_type(
+            &result_ty,
+            "Err",
+            &llbc,
+            &tombstoned,
+            &gc,
+            &raw,
+            None,
+        ),
         continue_ty: super::adt_variant_payload_type(
             &flow_ty,
             "Continue",
@@ -743,8 +972,17 @@ fn result_branch_break_pos0_uses_ensured_variant_struct_id() {
             &tombstoned,
             &gc,
             &raw,
+            None,
         ),
-        break_ty: super::adt_variant_payload_type(&flow_ty, "Break", &llbc, &tombstoned, &gc, &raw),
+        break_ty: super::adt_variant_payload_type(
+            &flow_ty,
+            "Break",
+            &llbc,
+            &tombstoned,
+            &gc,
+            &raw,
+            None,
+        ),
         continue_vsid: Some(continue_vsid),
         break_vsid: Some(break_vsid),
         ok_vsid: Some(ok_vsid),
@@ -942,8 +1180,16 @@ fn enum_variant_vec_u8_payload_gets_two_field_layout_and_owner_id() {
     );
 
     let payloads = crate::model::ResultBranchPayloads {
-        ok: super::adt_variant_payload_type(&result_ty, "Ok", &llbc, &tombstoned, &gc, &raw),
-        err: super::adt_variant_payload_type(&result_ty, "Err", &llbc, &tombstoned, &gc, &raw),
+        ok: super::adt_variant_payload_type(&result_ty, "Ok", &llbc, &tombstoned, &gc, &raw, None),
+        err: super::adt_variant_payload_type(
+            &result_ty,
+            "Err",
+            &llbc,
+            &tombstoned,
+            &gc,
+            &raw,
+            None,
+        ),
         continue_ty: super::adt_variant_payload_type(
             &flow_ty,
             "Continue",
@@ -951,8 +1197,17 @@ fn enum_variant_vec_u8_payload_gets_two_field_layout_and_owner_id() {
             &tombstoned,
             &gc,
             &raw,
+            None,
         ),
-        break_ty: super::adt_variant_payload_type(&flow_ty, "Break", &llbc, &tombstoned, &gc, &raw),
+        break_ty: super::adt_variant_payload_type(
+            &flow_ty,
+            "Break",
+            &llbc,
+            &tombstoned,
+            &gc,
+            &raw,
+            None,
+        ),
         continue_vsid: Some(continue_vsid),
         break_vsid: None,
         ok_vsid: Some(ok_vsid),
@@ -1220,6 +1475,7 @@ fn result_branch_break_of_infallible_result_builds_err() {
             &tombstoned,
             &super::harvest_declared_gc_facts(&llbc).gc_struct_ids(),
             &std::collections::HashSet::<String>::new(),
+            None,
         ),
         err: super::adt_variant_payload_type(
             &result_ty,
@@ -1228,6 +1484,7 @@ fn result_branch_break_of_infallible_result_builds_err() {
             &tombstoned,
             &super::harvest_declared_gc_facts(&llbc).gc_struct_ids(),
             &std::collections::HashSet::<String>::new(),
+            None,
         ),
         continue_ty: super::adt_variant_payload_type(
             &flow_ty,
@@ -1236,6 +1493,7 @@ fn result_branch_break_of_infallible_result_builds_err() {
             &tombstoned,
             &super::harvest_declared_gc_facts(&llbc).gc_struct_ids(),
             &std::collections::HashSet::<String>::new(),
+            None,
         ),
         break_ty: super::adt_variant_payload_type(
             &flow_ty,
@@ -1244,6 +1502,7 @@ fn result_branch_break_of_infallible_result_builds_err() {
             &tombstoned,
             &super::harvest_declared_gc_facts(&llbc).gc_struct_ids(),
             &std::collections::HashSet::<String>::new(),
+            None,
         ),
         ..Default::default()
     };
@@ -1315,6 +1574,7 @@ fn result_branch_match_emits_nothing_for_void_payloads() {
             &tombstoned,
             &super::harvest_declared_gc_facts(&llbc).gc_struct_ids(),
             &std::collections::HashSet::<String>::new(),
+            None,
         ),
         err: super::adt_variant_payload_type(
             &result_ty,
@@ -1323,6 +1583,7 @@ fn result_branch_match_emits_nothing_for_void_payloads() {
             &tombstoned,
             &super::harvest_declared_gc_facts(&llbc).gc_struct_ids(),
             &std::collections::HashSet::<String>::new(),
+            None,
         ),
         continue_ty: super::adt_variant_payload_type(
             &flow_ty,
@@ -1331,6 +1592,7 @@ fn result_branch_match_emits_nothing_for_void_payloads() {
             &tombstoned,
             &super::harvest_declared_gc_facts(&llbc).gc_struct_ids(),
             &std::collections::HashSet::<String>::new(),
+            None,
         ),
         break_ty: super::adt_variant_payload_type(
             &flow_ty,
@@ -1339,6 +1601,7 @@ fn result_branch_match_emits_nothing_for_void_payloads() {
             &tombstoned,
             &super::harvest_declared_gc_facts(&llbc).gc_struct_ids(),
             &std::collections::HashSet::<String>::new(),
+            None,
         ),
         ..Default::default()
     };
@@ -2668,6 +2931,7 @@ fn ordinary_raw_adt_pointer_stamps_raw_owner_func_result() {
                 "fixture::{}",
                 fd.item_meta.name_path_str().rsplit("::").next().unwrap()
             ),
+            None,
         )
     };
 
@@ -2679,6 +2943,7 @@ fn ordinary_raw_adt_pointer_stamps_raw_owner_func_result() {
             spec,
             &empty_gc,
             &std::collections::HashSet::<String>::new(),
+            None,
         )
         .as_deref(),
         Some("raw:Owner"),
@@ -2700,6 +2965,7 @@ fn ordinary_raw_adt_pointer_stamps_raw_owner_func_result() {
             spec,
             &empty_gc,
             &std::collections::HashSet::<String>::new(),
+            None,
         )
         .as_deref(),
         Some("i64")
@@ -9002,7 +9268,8 @@ fn atomic_field_layout_string_is_the_inner_scalar() {
             &usize_ty,
             &llbc,
             &gc_struct_ids,
-            &std::collections::HashSet::<String>::new()
+            &std::collections::HashSet::<String>::new(),
+            None
         ),
         "usize"
     );
@@ -9024,6 +9291,7 @@ fn atomic_field_layout_string_is_the_inner_scalar() {
         &llbc,
         &gc_struct_ids,
         &std::collections::HashSet::<String>::new(),
+        None,
     );
     assert_eq!(ptr_str, "*mut u8");
     assert_eq!(
@@ -9094,7 +9362,8 @@ fn fieldless_enum_field_layout_is_its_discriminant_scalar() {
             &enum_ty,
             &llbc,
             &gc_struct_ids,
-            &std::collections::HashSet::<String>::new()
+            &std::collections::HashSet::<String>::new(),
+            None
         ),
         "u8"
     );
@@ -9301,7 +9570,8 @@ fn closure_capturing_fieldless_enum_annotates() {
             &borrowed_ty,
             &llbc,
             &gc_struct_ids,
-            &std::collections::HashSet::<String>::new()
+            &std::collections::HashSet::<String>::new(),
+            None
         ),
         "u8",
         "a borrow of a fieldless enum is the discriminant scalar"
@@ -9317,7 +9587,8 @@ fn closure_capturing_fieldless_enum_annotates() {
             env,
             &llbc,
             &gc_struct_ids,
-            &std::collections::HashSet::<String>::new()
+            &std::collections::HashSet::<String>::new(),
+            None
         ),
         ValueType::Int,
         "closure-env FORCE rows match the Int-banked capture"
@@ -9597,8 +9868,12 @@ fn closure_env_upvar_read_annotates_through_function_path() {
     );
     let peeled =
         super::tyref_class_root_with(&borrowed_ty, &llbc, super::tombstoned_leaves_of(&llbc));
-    let input_root =
-        super::tyref_input_class_root(&borrowed_ty, &llbc, super::tombstoned_leaves_of(&llbc));
+    let input_root = super::tyref_input_class_root(
+        &borrowed_ty,
+        &llbc,
+        super::tombstoned_leaves_of(&llbc),
+        None,
+    );
     assert!(
         input_root.as_deref().is_some_and(|root| {
             root.contains("getattr_surrogate") && root.contains("closure#2")
@@ -9874,7 +10149,8 @@ fn closure_capturing_borrowed_transparent_scalar_annotates() {
             &borrowed_ty,
             &llbc,
             &gc_struct_ids,
-            &std::collections::HashSet::<String>::new()
+            &std::collections::HashSet::<String>::new(),
+            None
         ),
         "usize",
         "a borrow of a transparent scalar wrapper is the inner word"
@@ -9890,7 +10166,8 @@ fn closure_capturing_borrowed_transparent_scalar_annotates() {
             env,
             &llbc,
             &gc_struct_ids,
-            &std::collections::HashSet::<String>::new()
+            &std::collections::HashSet::<String>::new(),
+            None
         ),
         ValueType::Unsigned,
         "closure-env FORCE rows match the Int-banked capture"
@@ -13878,6 +14155,7 @@ fn mut_ref_cell_param_input_names_the_cell_unless_residual() {
         tomb,
         &gc_struct_ids,
         &std::collections::HashSet::<String>::new(),
+        None,
     )
     .expect("raw GC pointer behind &mut is a cell");
     let slot = |graph: &FunctionGraph| {
@@ -13897,6 +14175,7 @@ fn mut_ref_cell_param_input_names_the_cell_unless_residual() {
         &gc_struct_ids,
         false,
         &std::collections::HashSet::<String>::new(),
+        None,
     );
     assert!(cells.contains(&1));
     let mut graph = FunctionGraph::new("c::holder");
@@ -13913,6 +14192,7 @@ fn mut_ref_cell_param_input_names_the_cell_unless_residual() {
         &std::collections::HashSet::<String>::new(),
         &[],
         crate::ErrorCarrierSpec::default(),
+        None,
     );
     let OpKind::Input { ty, class_root, .. } = &slot(&graph).kind else {
         panic!("slot op is an input");
@@ -13927,6 +14207,7 @@ fn mut_ref_cell_param_input_names_the_cell_unless_residual() {
         &gc_struct_ids,
         true,
         &std::collections::HashSet::<String>::new(),
+        None,
     );
     assert!(residual.is_empty());
     let mut residual_graph = FunctionGraph::new("c::holder");
@@ -13943,6 +14224,7 @@ fn mut_ref_cell_param_input_names_the_cell_unless_residual() {
         &std::collections::HashSet::<String>::new(),
         &[],
         crate::ErrorCarrierSpec::default(),
+        None,
     );
     let OpKind::Input { class_root, .. } = &slot(&residual_graph).kind else {
         panic!("slot op is an input");
@@ -13999,13 +14281,21 @@ fn gc_mut_ref_option_param_payload_and_reborrow_join_the_cell_set() {
         &gc_struct_ids,
         false,
         &raw_alloc,
+        None,
     );
     assert!(
         option_cells.contains(&1),
         "Option<&mut GC-handle> is an Option-cell source"
     );
-    let cells =
-        super::gc_mut_ref_param_locals(&gc_locals, &llbc, tomb, &gc_struct_ids, false, &raw_alloc);
+    let cells = super::gc_mut_ref_param_locals(
+        &gc_locals,
+        &llbc,
+        tomb,
+        &gc_struct_ids,
+        false,
+        &raw_alloc,
+        None,
+    );
     assert!(
         !cells.contains(&1),
         "the Option parameter itself is not a cell"
@@ -14027,6 +14317,7 @@ fn gc_mut_ref_option_param_payload_and_reborrow_join_the_cell_set() {
         &gc_struct_ids,
         false,
         &raw_alloc,
+        None,
     );
     assert!(
         i64_option_cells.is_empty(),
@@ -14039,6 +14330,7 @@ fn gc_mut_ref_option_param_payload_and_reborrow_join_the_cell_set() {
         &gc_struct_ids,
         true,
         &raw_alloc,
+        None,
     );
     assert!(residual.is_empty());
 
@@ -15289,7 +15581,8 @@ fn concrete_i64_entry_rows_publish_one_qualified_spelling() {
                 &llbc,
                 &std::collections::HashSet::new(),
                 &gc,
-                &std::collections::HashSet::<String>::new()
+                &std::collections::HashSet::<String>::new(),
+                None
             ),
             ValueType::Ref(_)
         ),

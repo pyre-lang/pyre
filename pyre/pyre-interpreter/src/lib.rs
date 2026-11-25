@@ -1414,6 +1414,51 @@ pub fn all_subclass_range_aliases() -> Vec<pyre_object::pyobject::SubclassRangeA
             },
             typed::<pyre_object::W_LazyImportObject>(),
         ),
+        // `iterobject.py W_FastUnicodeIterObject` — appended after
+        // `lazy_import` so earlier interpreter ids stay put.  `str_ascii_iterator`
+        // shares the payload the way the six dict view iterators share tid 110.
+        subclass_range_alias(
+            if cfg!(target_arch = "wasm32") {
+                223
+            } else if WINDOWS_CONSOLE_IO {
+                227
+            } else {
+                225
+            },
+            typed::<pyre_object::W_FastUnicodeIterObject>(),
+        ),
+        subclass_range_alias(
+            if cfg!(target_arch = "wasm32") {
+                223
+            } else if WINDOWS_CONSOLE_IO {
+                227
+            } else {
+                225
+            },
+            &pyre_object::iterobject::STR_ASCII_ITER_TYPE,
+        ),
+        // `iterobject.py W_StringIterObject` — after `W_FastUnicodeIterObject`.
+        // `bytearray_iterator` shares the payload.
+        subclass_range_alias(
+            if cfg!(target_arch = "wasm32") {
+                224
+            } else if WINDOWS_CONSOLE_IO {
+                228
+            } else {
+                226
+            },
+            typed::<crate::objspace::std::iterobject::W_StringIterObject>(),
+        ),
+        subclass_range_alias(
+            if cfg!(target_arch = "wasm32") {
+                224
+            } else if WINDOWS_CONSOLE_IO {
+                228
+            } else {
+                226
+            },
+            &crate::objspace::std::iterobject::BYTEARRAY_ITER_TYPE,
+        ),
     ];
     aliases.extend(module_subclass_range_aliases());
     aliases.push(pyre_object::pyobject::subclass_range_alias(
@@ -1451,11 +1496,11 @@ const WINDOWS_CONSOLE_IO: bool = cfg!(all(windows, feature = "host_env", not(fea
 /// not depend on which modules are linked; the module classes follow in the
 /// order [`module_gc_types`] lists them.
 pub const MODULE_FIRST_TYPE_ID: u32 = if cfg!(target_arch = "wasm32") {
-    223
-} else if WINDOWS_CONSOLE_IO {
-    227
-} else {
     225
+} else if WINDOWS_CONSOLE_IO {
+    229
+} else {
+    227
 };
 
 /// The GC classes of builtin modules, in `build_gc` order: those of this
@@ -1520,6 +1565,10 @@ pub fn active_subclass_range_hierarchy() -> Vec<(u32, Option<u32>)> {
     // so platform-gated posix/console ids stay put (`build_gc` order).
     active.push((instancemethod_id + 1, Some(0)));
     active.push((instancemethod_id + 2, Some(0)));
+    // `iterobject.py W_FastUnicodeIterObject` — after `lazy_import`.
+    active.push((instancemethod_id + 3, Some(0)));
+    // `iterobject.py W_StringIterObject` — after `W_FastUnicodeIterObject`.
+    active.push((instancemethod_id + 4, Some(0)));
     let module_types = module_gc_types();
     active.extend(
         module_types

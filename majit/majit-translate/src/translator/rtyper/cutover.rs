@@ -2913,55 +2913,28 @@ fn install_source_graph(
     if entry.function_desc.borrow().is_memo() {
         return;
     }
+    // `extregistry.lookup`: a second `register_external` of the same
+    // key is `AutoRegisteringType._register` `duplicate extregistry
+    // entry`. The existing External registration stands.
+    if entry.function_desc.borrow().has_external_registration() {
+        return;
+    }
     let residualize = entry
         .function_desc
         .borrow()
         .residualizes_as_signature_stub()
         || annotator_residual_raw_method(key);
     if residualize {
-        // The materialisers' raw `*mut PyObject` return is only their
-        // residual-call ABI.  Their FunctionDesc carries the orthodox
-        // `_signature_`-style SomeInstance result, so the synthetic
-        // annotator graph must carry that same result on its return link.
-        // Leaving the generic OBJECTPTR/SomePtr shell here makes Phase B
-        // insert a PtrRepr -> InstanceRepr conversion that upstream never
-        // has, then the first failed specialization replaces the shared
-        // stub and strands every later caller on an unbound return var.
-        let semantic_key = graph
-            .source_identity
-            .as_deref()
-            .map(|identity| FunctionPathKey::from_segments(identity.split("::")))
-            .unwrap_or_else(|| key.clone());
-        // Exception materialisers keep their `_signature_` instance
-        // (`residual_stub_result_shell`). Every other residual prefers
-        // `declared_return_annotation` when the graph carries a class
-        // root (`rlib/signature.py` `returns=types.instance(...)`), so
-        // a `ref` token with `return_class_root` is `SomeInstance`
-        // of that classdef rather than the classdef-less shell.
-        // A declared Void / `()` result is `s_None` through
-        // `residual_return_annotation` → `default_someshell_for_lltype`
-        // (`extfunc.py` `register_external` result `None` → `s_None`).
-        // Look-inside graphs leave `return_type` unstamped
-        // (`func_result_kind` follows the CFG) while
-        // `residual_return_type` still holds the FUNC.RESULT token;
-        // fall back to that token the same way
-        // [`declared_return_annotation`] does. A missing token
-        // (Unknown) falls through that helper.
-        let return_token = graph
-            .return_type
-            .as_deref()
-            .or(graph.residual_return_type.as_deref());
-        let result_shell = if is_exception_object_materializer(&semantic_key) {
-            residual_stub_result_shell(&semantic_key, return_token, Some(registry.bookkeeper()))
-        } else {
-            raw_ptr_token_annotation(registry, return_token)
-                .or_else(|| declared_return_annotation(registry, graph))
-                .or_else(|| residual_return_annotation(return_token, Some(registry.bookkeeper())))
-        };
-        if let Some(result_shell) = result_shell {
+        // One residual signature for this GraphStore funcobj
+        // ([`residual_registration_from_graph`]): startblock formals
+        // plus the result shell. `register_unsafe_fn_stubs` uses the
+        // same helper so the first `register_external` matches Pass 2.
+        if let Some((signature, result_shell)) =
+            residual_registration_from_graph(registry, key, graph)
+        {
             let stub = build_stub_pygraph_with_result_shell(
                 graph.name.clone(),
-                signature.clone(),
+                signature,
                 result_shell.clone(),
             );
             entry.install_external_stub(stub, result_shell);
@@ -4120,6 +4093,67 @@ fn residual_return_annotation(
         .and_then(|ll| default_someshell_for_lltype(&ll))
 }
 
+/// Residual formals and result shell of a GraphStore funcobj.
+///
+/// Formals are startblock inputargs (`StoreCore::signature_from_graph`),
+/// which already splice a host `&[u8]` into `(ptr, len)` the way
+/// call-site lowering does. `ResidualStubSpec` formals come from Charon
+/// `FunDecl.signature.inputs` (unspliced) and must not be the
+/// registration of a GraphStore body.
+///
+/// The result is the shell Pass 2 residualize already computed:
+/// exception materialisers keep their `_signature_` instance
+/// (`residual_stub_result_shell`); every other residual prefers
+/// `declared_return_annotation` when the graph carries a class root
+/// (`rlib/signature.py` `returns=types.instance(...)`), else
+/// `raw_ptr_token_annotation` / `residual_return_annotation`. A
+/// declared Void / `()` result is `s_None` (`extfunc.py`
+/// `register_external` result `None` → `s_None`).
+///
+/// `register_unsafe_fn_stubs` and Pass 2 `install_source_graph` share
+/// this so the first `register_external` is the graph-derived stub
+/// that last-writer-wins used to overwrite with
+/// (`extfunc.py` `register_external` / `ExtFuncEntry` one `s_result`;
+/// `annrpython.py` `RPythonAnnotator.build_types` / `recursivecall`
+/// walks the graph before `rtyper.py` `RPythonTyper.specialize` types
+/// it). A bodyless declaration with no GraphStore still uses
+/// `ResidualStubSpec` (`register_external` of a function without a
+/// graph).
+fn residual_registration_from_graph(
+    registry: &CallRegistry,
+    key: &FunctionPathKey,
+    graph: &LegacyGraph,
+) -> Option<(Signature, crate::annotator::model::SomeValue)> {
+    let signature = crate::codewriter::call::StoreCore::signature_from_graph(graph);
+    // The materialisers' raw `*mut PyObject` return is only their
+    // residual-call ABI. Their FunctionDesc carries the orthodox
+    // `_signature_`-style SomeInstance result, so the synthetic
+    // annotator graph must carry that same result on its return link.
+    let semantic_key = graph
+        .source_identity
+        .as_deref()
+        .map(|identity| FunctionPathKey::from_segments(identity.split("::")))
+        .unwrap_or_else(|| key.clone());
+    // Look-inside graphs leave `return_type` unstamped
+    // (`func_result_kind` follows the CFG) while
+    // `residual_return_type` still holds the FUNC.RESULT token;
+    // fall back to that token the same way
+    // [`declared_return_annotation`] does. A missing token
+    // (Unknown) falls through that helper.
+    let return_token = graph
+        .return_type
+        .as_deref()
+        .or(graph.residual_return_type.as_deref());
+    let result_shell = if is_exception_object_materializer(&semantic_key) {
+        residual_stub_result_shell(&semantic_key, return_token, Some(registry.bookkeeper()))
+    } else {
+        raw_ptr_token_annotation(registry, return_token)
+            .or_else(|| declared_return_annotation(registry, graph))
+            .or_else(|| residual_return_annotation(return_token, Some(registry.bookkeeper())))
+    };
+    Some((signature, result_shell?))
+}
+
 /// Choose the annotation carried by a `dont_look_inside` stub's return link.
 ///
 /// Normally the front-end's FUNC.RESULT token is the semantic annotation
@@ -4720,6 +4754,15 @@ pub(crate) fn register_unsafe_fn_stubs(
                 Some(bk.project_struct_field_type(root))
             })
             .or_else(|| residual_return_annotation(declared_token, Some(registry.bookkeeper())));
+        // GraphStore body: Pass 2 residualizes through
+        // `residual_registration_from_graph` (spliced startblock
+        // formals + graph result shell). Use that here so the first
+        // `register_external` is the same stub last-writer-wins used
+        // to overwrite with. ResidualStubSpec is the declaration of a
+        // function without a graph (`extfunc.py` `register_external`).
+        let graph_residual = store_graph
+            .as_ref()
+            .and_then(|graph| residual_registration_from_graph(registry, &key, graph));
         if alias_existing_lookup(registry, &key) {
             // Already registered via the function_graphs pass (e.g. a
             // safe fn with the same path).  Don't overwrite; alias
@@ -4727,25 +4770,35 @@ pub(crate) fn register_unsafe_fn_stubs(
             // FunctionDesc.
             if let Some(entry) = registry.lookup_registered(&key) {
                 alias_graphstore_spellings(function_graphs, registry, &key, &entry);
-                // A bodyless residual already registered (`alias_opaque`)
-                // without `_signature_` still takes FUNC.RESULT from the
-                // declared lltype (`extfunc.py`
-                // `ExtFuncEntry.compute_result_annotation`). A look-inside
-                // wrapper keeps its GraphStore body (`annrpython.py`
-                // `recursivecall`).
+                // A look-inside wrapper keeps its GraphStore body
+                // (`annrpython.py` `recursivecall`). `extregistry.lookup`:
+                // skip when External already stands. Annsig-only without
+                // a GraphStore is the first registration via
+                // ResidualStubSpec.
                 if !has_look_inside_body
                     && entry
                         .host_object
                         .user_function()
                         .is_some_and(|func| func._jit_look_inside_ == Some(false))
-                    && let Some(result_shell) = result_shell
+                    && !entry.function_desc.borrow().has_external_registration()
                 {
-                    let stub_pygraph = build_stub_pygraph_with_result_shell(
-                        segments.last().cloned().unwrap_or_default(),
-                        signature.clone(),
-                        result_shell.clone(),
-                    );
-                    entry.install_external_stub(stub_pygraph, result_shell);
+                    let residual = if store_graph.is_some() {
+                        graph_residual
+                    } else {
+                        result_shell.clone().map(|s| (signature.clone(), s))
+                    };
+                    if let Some((stub_sig, stub_result)) = residual {
+                        let stub_name = store_graph
+                            .as_ref()
+                            .map(|g| g.name.clone())
+                            .unwrap_or_else(|| segments.last().cloned().unwrap_or_default());
+                        let stub_pygraph = build_stub_pygraph_with_result_shell(
+                            stub_name,
+                            stub_sig,
+                            stub_result.clone(),
+                        );
+                        entry.install_external_stub(stub_pygraph, stub_result);
+                    }
                 }
             }
             continue;
@@ -4764,14 +4817,16 @@ pub(crate) fn register_unsafe_fn_stubs(
             }
             continue;
         }
-        let Some(result_shell) = result_shell else {
+        let residual = graph_residual.or_else(|| result_shell.map(|s| (signature.clone(), s)));
+        let Some((stub_sig, stub_result)) = residual else {
             continue;
         };
-        let stub_pygraph = build_stub_pygraph_with_result_shell(
-            segments.last().cloned().unwrap_or_default(),
-            signature.clone(),
-            result_shell.clone(),
-        );
+        let stub_name = store_graph
+            .as_ref()
+            .map(|g| g.name.clone())
+            .unwrap_or_else(|| segments.last().cloned().unwrap_or_default());
+        let stub_pygraph =
+            build_stub_pygraph_with_result_shell(stub_name, stub_sig.clone(), stub_result.clone());
         let mut graph_func =
             declared_source_graph_func(function_graphs, segments, &foreign_callables)
                 .unwrap_or_else(|| {
@@ -4788,8 +4843,8 @@ pub(crate) fn register_unsafe_fn_stubs(
         // `register_external` residual: the JIT has no body to look inside
         // (`dont_look_inside` sets `_jit_look_inside_ = False`).
         graph_func._jit_look_inside_ = Some(false);
-        let entry = registry.get_or_register_with_func(key.clone(), signature.clone(), graph_func);
-        entry.install_external_stub(stub_pygraph, result_shell);
+        let entry = registry.get_or_register_with_func(key.clone(), stub_sig, graph_func);
+        entry.install_external_stub(stub_pygraph, stub_result);
         alias_graphstore_spellings(function_graphs, registry, &key, &entry);
     }
 }
@@ -5224,6 +5279,7 @@ fn register_residual_signature_external(
                 .host_object
                 .user_function()
                 .is_some_and(|func| func._jit_look_inside_ == Some(false))
+            && !entry.function_desc.borrow().has_external_registration()
         {
             entry.install_external_stub(stub_pygraph, result_shell);
         }
@@ -5338,6 +5394,7 @@ fn register_opaque_external_argtype_with_result(
                 .host_object
                 .user_function()
                 .is_some_and(|func| func._jit_look_inside_ == Some(false))
+            && !entry.function_desc.borrow().has_external_registration()
         {
             entry.install_external_stub(stub_pygraph.clone(), s_result);
         }
@@ -13059,6 +13116,91 @@ mod tests {
                 .function_desc
                 .borrow()
                 .residualizes_as_signature_stub()
+        );
+    }
+
+    /// `extregistry.lookup`: a second `install_source_graph` of an
+    /// already-External entry keeps the first stub.
+    #[test]
+    fn install_source_graph_keeps_existing_external_stub() {
+        let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
+        let registry = std::rc::Rc::new(CallRegistry::new(ann.bookkeeper.clone()));
+        let mut graph = empty_return_graph("opaque");
+        graph.func.jit_look_inside = Some(false);
+        graph.return_type = Some("bool".into());
+        let path = crate::parse::CallPath::from_segments(["opaque"]);
+        let mut graphs = crate::codewriter::call::GraphStore::default();
+        graphs.insert(path.clone(), graph.clone());
+        populate_call_registry_from_call_graphs(&graphs, &[], &[], &[], &registry).unwrap();
+        let key = FunctionPathKey::from_segments(["opaque"]);
+        let entry = registry.lookup(&key).expect("registered");
+        let first = entry
+            .function_desc
+            .borrow()
+            .built_source_template()
+            .expect("first stub");
+        let signature = crate::codewriter::call::StoreCore::signature_from_graph(&graph);
+        let body = graphs.body(&path).expect("body");
+        install_source_graph(&registry, &key, &graph, &entry, &signature, &body);
+        let after = entry
+            .function_desc
+            .borrow()
+            .built_source_template()
+            .expect("kept stub");
+        assert!(
+            Rc::ptr_eq(&first, &after),
+            "install_source_graph must keep the first External stub"
+        );
+    }
+
+    /// GraphStore startblock already has the spliced host pair
+    /// (`signature_from_graph`); ResidualStubSpec formals are Charon
+    /// `FunDecl.signature.inputs` (unspliced `&[u8]` = 1). The first
+    /// `register_external` must use the graph formals
+    /// (`extfunc.py` `register_external` / `ExtFuncEntry`;
+    /// `annrpython.py` walks the graph before `rtyper.py` `specialize`).
+    #[test]
+    fn register_unsafe_fn_stubs_graphstore_formals_are_signature_from_graph() {
+        use crate::annotator::bookkeeper::Bookkeeper;
+        use crate::translator::rtyper::call_registry::CallRegistry;
+
+        let mut graph = empty_return_graph("hash_str_hooked_bytes");
+        graph.func.jit_look_inside = Some(false);
+        graph.return_type = Some("i64".into());
+        let vars = mint_vars(&mut graph, 2);
+        graph.block_mut(graph.startblock).inputargs = vars;
+        let path = crate::parse::CallPath::from_segments(["hash_str_hooked_bytes"]);
+        let mut graphs = crate::codewriter::call::GraphStore::default();
+        graphs.insert(path, graph.clone());
+
+        let registry = CallRegistry::new(std::rc::Rc::new(Bookkeeper::new()));
+        let key = FunctionPathKey::from_segments(["hash_str_hooked_bytes"]);
+        let graph_sig = crate::codewriter::call::StoreCore::signature_from_graph(&graph);
+        assert_eq!(graph_sig.argnames.len(), 2, "spliced startblock pair");
+        let entry =
+            registry.get_or_register_with_func(key.clone(), graph_sig, source_graph_func(&graph));
+        let specs = vec![(
+            vec!["hash_str_hooked_bytes".to_string()],
+            Signature::new(vec!["bytes".to_string()], None, None),
+            Some("i64".to_string()),
+            None,
+            None,
+        )];
+        register_unsafe_fn_stubs(&registry, &specs, Some(&graphs));
+        assert_eq!(
+            entry.function_desc.borrow().signature.argnames.len(),
+            2,
+            "FunctionDesc keeps signature_from_graph"
+        );
+        let stub = entry
+            .function_desc
+            .borrow()
+            .built_source_template()
+            .expect("graph-derived residual stub");
+        assert_eq!(
+            stub.signature.borrow().argnames.len(),
+            2,
+            "stub pygraph formals are signature_from_graph, not ResidualStubSpec"
         );
     }
 

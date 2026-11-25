@@ -2765,15 +2765,14 @@ fn build_gc() -> Box<MiniMarkGC> {
         <pyre_object::iterobject::W_SeqIterObject
             as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
     );
-    // The producer-specific str / bytes / bytearray / memoryview / array
-    // iterator identities carry the same `W_SeqIterObject` payload and traced
-    // `seq` edge, so they alias its vtable rather than minting ids of their
-    // own — the shape the six dict view iterators use below.
+    // The producer-specific memoryview / array iterator identities
+    // carry the same `W_SeqIterObject` payload and traced `seq` edge, so
+    // they alias its vtable rather than minting ids of their own — the
+    // shape the six dict view iterators use below.
+    // `str_iterator` / `str_ascii_iterator` use `W_FastUnicodeIterObject`.
+    // `bytes_iterator` / `bytearray_iterator` use interpreter
+    // `iterobject.py W_StringIterObject`.
     for tp in [
-        &pyre_object::iterobject::STR_ASCII_ITER_TYPE,
-        &pyre_object::iterobject::STR_ITER_TYPE,
-        &pyre_object::iterobject::BYTES_ITER_TYPE,
-        &pyre_object::iterobject::BYTEARRAY_ITER_TYPE,
         &pyre_object::iterobject::MEMORY_ITER_TYPE,
         &pyre_object::iterobject::ARRAY_ITER_TYPE,
     ] {
@@ -5293,6 +5292,54 @@ fn build_gc() -> Box<MiniMarkGC> {
         <pyre_object::lazyimport::W_LazyImportObject
             as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
     );
+    // `iterobject.py W_FastUnicodeIterObject` — AUTO-ID at the interpreter
+    // tail so earlier ids do not move.  `str_ascii_iterator` shares the
+    // payload and traced `seq` edge.
+    let fast_unicode_iter_tid = register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        <pyre_object::iterobject::W_FastUnicodeIterObject
+            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+    );
+    {
+        let tp = &pyre_object::iterobject::STR_ASCII_ITER_TYPE;
+        majit_gc::GcAllocator::register_vtable_for_type(
+            &mut gc,
+            tp as *const _ as usize,
+            fast_unicode_iter_tid,
+        );
+        pytype_to_tid.insert(tp as *const _ as usize, fast_unicode_iter_tid);
+        pyre_object::gc_hook::register_pyre_class_offsets(
+            tp as *const _ as usize,
+            <pyre_object::iterobject::W_FastUnicodeIterObject
+                as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR
+                .ptr_offsets,
+        );
+    }
+    // `iterobject.py W_StringIterObject` — AUTO-ID after
+    // `W_FastUnicodeIterObject`.  `bytearray_iterator` shares the payload
+    // and traced `seq` edge.
+    let string_iter_tid = register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        <pyre_interpreter::objspace::std::iterobject::W_StringIterObject
+            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+    );
+    {
+        let tp = &pyre_interpreter::objspace::std::iterobject::BYTEARRAY_ITER_TYPE;
+        majit_gc::GcAllocator::register_vtable_for_type(
+            &mut gc,
+            tp as *const _ as usize,
+            string_iter_tid,
+        );
+        pytype_to_tid.insert(tp as *const _ as usize, string_iter_tid);
+        pyre_object::gc_hook::register_pyre_class_offsets(
+            tp as *const _ as usize,
+            <pyre_interpreter::objspace::std::iterobject::W_StringIterObject
+                as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR
+                .ptr_offsets,
+        );
+    }
     // The classes `pyre-module` registers close the rclass census, numbered
     // from `MODULE_FIRST_TYPE_ID` in the order its hooks list them.
     assert_eq!(

@@ -715,6 +715,7 @@ pub fn collect_unsafe_fn_stubs_from_llbc(
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     error_carrier: crate::ErrorCarrierSpec<'_>,
     raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+    struct_fields: Option<&crate::front::semantic::StructFieldRegistry>,
 ) -> Vec<crate::translator::rtyper::cutover::ResidualStubSpec> {
     collect_fn_stubs_from_llbc_if(
         llbc,
@@ -723,6 +724,7 @@ pub fn collect_unsafe_fn_stubs_from_llbc(
         |fd| fd.signature.is_unsafe,
         false,
         raw_alloc_flavor_structs,
+        struct_fields,
     )
 }
 
@@ -756,6 +758,7 @@ pub(crate) fn collect_policy_opaque_fn_stubs_from_llbc(
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     error_carrier: crate::ErrorCarrierSpec<'_>,
     raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+    struct_fields: Option<&crate::front::semantic::StructFieldRegistry>,
 ) -> Vec<crate::translator::rtyper::cutover::ResidualStubSpec> {
     let marked = policy_opaque_fn_set_of(llbc);
     collect_fn_stubs_from_llbc_if(
@@ -765,6 +768,7 @@ pub(crate) fn collect_policy_opaque_fn_stubs_from_llbc(
         |fd| crate::front::llbc_hints::fun_decl_has_harvested_hint(llbc, fd, &marked),
         true,
         raw_alloc_flavor_structs,
+        struct_fields,
     )
 }
 
@@ -775,6 +779,7 @@ pub(in crate::front::mir) fn declined_atomic_load_fun_decl(
     llbc: &Llbc,
     fd: &FunDecl,
     decline_reason: String,
+    struct_fields: Option<&crate::front::semantic::StructFieldRegistry>,
 ) -> crate::translator::rtyper::lltypesystem::module::ll_extaccessor::DeclinedFunDecl {
     use crate::translator::rtyper::lltypesystem::module::ll_extaccessor::DeclinedFunDecl;
     let segments: Vec<String> = fd
@@ -789,9 +794,9 @@ pub(in crate::front::mir) fn declined_atomic_load_fun_decl(
             .signature
             .inputs
             .iter()
-            .map(|ty| tyref_to_external_lltype(ty, llbc))
+            .map(|ty| tyref_to_external_lltype(ty, llbc, struct_fields))
             .collect(),
-        result_lltype: tyref_to_external_lltype(&fd.signature.output, llbc),
+        result_lltype: tyref_to_external_lltype(&fd.signature.output, llbc, struct_fields),
         has_translatable_body: false,
         decline_reason,
     }
@@ -800,6 +805,7 @@ pub(in crate::front::mir) fn declined_atomic_load_fun_decl(
 pub(in crate::front::mir) fn tyref_to_external_lltype(
     ty: &TyRef,
     llbc: &Llbc,
+    struct_fields: Option<&crate::front::semantic::StructFieldRegistry>,
 ) -> crate::translator::rtyper::lltypesystem::lltype::LowLevelType {
     use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
     if is_unit_type(ty, llbc) {
@@ -811,7 +817,15 @@ pub(in crate::front::mir) fn tyref_to_external_lltype(
     if output_type_is_ref(ty, llbc) || tyref_is_raw_pointer(ty, llbc) {
         return LowLevelType::Address;
     }
-    match tyref_to_value_type(ty, llbc) {
+    let inputs = value_type_inputs(llbc);
+    match tyref_to_value_type_with(
+        ty,
+        llbc,
+        no_tombstoned_leaves(),
+        &inputs.gc_struct_ids,
+        &inputs.raw_alloc_flavor_structs,
+        struct_fields,
+    ) {
         ValueType::Int => LowLevelType::Signed,
         ValueType::Unsigned => LowLevelType::Unsigned,
         ValueType::Int128 => LowLevelType::SignedLongLongLong,
@@ -1064,7 +1078,11 @@ pub(in crate::front::mir) fn tyref_is_raw_ptr_of_primitive(ty: &TyRef, llbc: &Ll
 /// `repr(transparent)` to `usize`. A raw pointer to a primitive or an
 /// `&T` can hold a `rffi.scoped_alloc` / `lltype.malloc(flavor='raw')`
 /// address and is not this kind.
-pub(in crate::front::mir) fn tyref_is_gc_reference(ty: &TyRef, llbc: &Llbc) -> bool {
+pub(in crate::front::mir) fn tyref_is_gc_reference(
+    ty: &TyRef,
+    llbc: &Llbc,
+    struct_fields: Option<&crate::front::semantic::StructFieldRegistry>,
+) -> bool {
     if output_type_is_ref(ty, llbc) {
         return false;
     }
@@ -1080,8 +1098,16 @@ pub(in crate::front::mir) fn tyref_is_gc_reference(ty: &TyRef, llbc: &Llbc) -> b
     if raw_scalar_address_value_type(ty, llbc).is_some() {
         return false;
     }
+    let inputs = value_type_inputs(llbc);
     matches!(
-        tyref_to_value_type(ty, llbc),
+        tyref_to_value_type_with(
+            ty,
+            llbc,
+            no_tombstoned_leaves(),
+            &inputs.gc_struct_ids,
+            &inputs.raw_alloc_flavor_structs,
+            struct_fields,
+        ),
         ValueType::Ref(_) | ValueType::Str | ValueType::StringBuilder
     )
 }
@@ -1130,6 +1156,7 @@ pub(in crate::front::mir) fn collect_fn_stubs_from_llbc_if(
     include: impl Fn(&FunDecl) -> bool,
     admit_option_raw_adt_ptr: bool,
     raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+    struct_fields: Option<&crate::front::semantic::StructFieldRegistry>,
 ) -> Vec<crate::translator::rtyper::cutover::ResidualStubSpec> {
     use crate::flowspace::argument::Signature;
     let mut out = Vec::new();
@@ -1176,6 +1203,7 @@ pub(in crate::front::mir) fn collect_fn_stubs_from_llbc_if(
                 error_carrier,
                 gc_struct_ids,
                 raw_alloc_flavor_structs,
+                struct_fields,
             )
         };
         let class_root = dont_look_inside_return_class_root(
@@ -1185,9 +1213,10 @@ pub(in crate::front::mir) fn collect_fn_stubs_from_llbc_if(
             no_tombstoned_leaves(),
             gc_struct_ids,
             raw_alloc_flavor_structs,
+            struct_fields,
         );
         let result_lltype = if token.is_none() {
-            let lltype = tyref_to_external_lltype(&fd.signature.output, llbc);
+            let lltype = tyref_to_external_lltype(&fd.signature.output, llbc, struct_fields);
             if crate::translator::rtyper::cutover::default_someshell_for_lltype(&lltype).is_none() {
                 continue;
             }
@@ -1372,6 +1401,7 @@ pub(in crate::front::mir) fn collect_fn_stubs_from_llbc_if(
 #[cfg(any(test, feature = "mir-frontend"))]
 pub(crate) fn collect_foreign_opaque_method_externals(
     llbc: &Llbc,
+    struct_fields: Option<&crate::front::semantic::StructFieldRegistry>,
 ) -> Vec<(
     Vec<String>,
     crate::flowspace::argument::Signature,
@@ -1407,7 +1437,7 @@ pub(crate) fn collect_foreign_opaque_method_externals(
                 continue;
             }
             let Some(result_ty) =
-                foreign_opaque_method_result_valuetype(&fd.signature.output, llbc)
+                foreign_opaque_method_result_valuetype(&fd.signature.output, llbc, struct_fields)
             else {
                 continue;
             };
@@ -1427,7 +1457,7 @@ pub(crate) fn collect_foreign_opaque_method_externals(
             out.push((segments, signature, result_ty));
             continue;
         }
-        if let Some(row) = local_crate_opaque_import_external(llbc, fd) {
+        if let Some(row) = local_crate_opaque_import_external(llbc, fd, struct_fields) {
             out.push(row);
         }
     }
@@ -1456,6 +1486,7 @@ pub(in crate::front::mir) fn fundecl_stub_argnames(fd: &FunDecl) -> Vec<String> 
 pub(in crate::front::mir) fn local_crate_opaque_import_external(
     llbc: &Llbc,
     fd: &FunDecl,
+    struct_fields: Option<&crate::front::semantic::StructFieldRegistry>,
 ) -> Option<(
     Vec<String>,
     crate::flowspace::argument::Signature,
@@ -1471,7 +1502,8 @@ pub(in crate::front::mir) fn local_crate_opaque_import_external(
     if !crate::local_crates::is_local_crate_root(root) {
         return None;
     }
-    let result_ty = foreign_opaque_method_result_valuetype(&fd.signature.output, llbc)?;
+    let result_ty =
+        foreign_opaque_method_result_valuetype(&fd.signature.output, llbc, struct_fields)?;
     let segments: Vec<String> = fd
         .item_meta
         .name_path_str()
@@ -1529,7 +1561,8 @@ pub(in crate::front::mir) fn first_input_is_adt_free(
 /// A scalar literal output keeps its `ValueType`; `()` is `Void`
 /// (`history.py` `getkind`, `Vec::set_len` / `Vec::resize`); an
 /// opaque-ADT output projects to `Ref(None)` except a str-family result
-/// (`is_str_family_class_root`) which keeps `Ref(Some(root))`; a
+/// (`is_str_family_class_root`) or a layout-present std cell
+/// (`tyref_std_cell_class_root`) which keep `Ref(Some(root))`; a
 /// payload-carrying enum keeps `Ref(Some(root))` when
 /// `tyref_to_value_type` painted a class root (`unaryop.py`
 /// `SomeInstance.getattr` needs `self.classdef`). A pointer-niche
@@ -1541,13 +1574,22 @@ pub(in crate::front::mir) fn first_input_is_adt_free(
 pub(in crate::front::mir) fn foreign_opaque_method_result_valuetype(
     output: &TyRef,
     llbc: &Llbc,
+    struct_fields: Option<&crate::front::semantic::StructFieldRegistry>,
 ) -> Option<ValueType> {
     // A reference return (`&T`) is not the owned residual result the
     // stub models; decline.
     if output_type_is_ref(output, llbc) {
         return None;
     }
-    match tyref_to_value_type(output, llbc) {
+    let inputs = value_type_inputs(llbc);
+    match tyref_to_value_type_with(
+        output,
+        llbc,
+        no_tombstoned_leaves(),
+        &inputs.gc_struct_ids,
+        &inputs.raw_alloc_flavor_structs,
+        struct_fields,
+    ) {
         // Scalar literal results are produced directly by the residual.
         vt @ (ValueType::Int | ValueType::Unsigned | ValueType::Float | ValueType::Bool) => {
             Some(vt)
@@ -1563,10 +1605,12 @@ pub(in crate::front::mir) fn foreign_opaque_method_result_valuetype(
         //   `BigInt`-returning arithmetic cluster) → classdef-less
         //   `SomeInstance`, the shell `bigint_from` produces, except a
         //   str-family result (`is_str_family_class_root`: rust-heap
-        //   `String`, …) keeps the class root so
+        //   `String`, …) or a layout-present std cell
+        //   (`tyref_std_cell_class_root`) keeps the class root so
         //   `foreign_opaque_method_return_shell` seeds `SomeString`
-        //   (`no_nul=False`). Dropping it to
-        //   `Ref(None)` minted the classdef-less Instance
+        //   (`no_nul=False`) / `declared_return_annotation` intern's
+        //   `SomeInstance(classdef)` (`signature.py` `annotationoftype`).
+        //   Dropping it to `Ref(None)` minted the classdef-less Instance
         //   `pairtype(SomeObject, SomeObject).union` cannot join with
         //   `String::new()` (`binaryop.py`). An Opaque Vec leaf keeps
         //   the uninterned spelling so the shell projects SomeList
@@ -1611,6 +1655,19 @@ pub(in crate::front::mir) fn foreign_opaque_method_result_valuetype(
                         )
                     })
                 });
+            // Layout-present std cell: keep the class `tyref_to_value_type_with`
+            // already painted (`tyref_std_cell_class_root` /
+            // `bookkeeper.py` `getuniqueclassdef`). Opaque /
+            // `published_struct_copy` would otherwise substitute
+            // `str_family_root` (`signature.py` `annotationoftype`).
+            let cell_class =
+                tyref_std_cell_class_root(output, llbc, no_tombstoned_leaves(), struct_fields);
+            let keep_cell_class = cell_class.is_some() && cell_class == root;
+            let opaque_root = if keep_cell_class {
+                root.clone()
+            } else {
+                str_family_root
+            };
             match &td.kind {
                 TypeDeclKind::Opaque => {
                     // rlist.py ListRepr / listdef.py ListDef: an Opaque Vec
@@ -1623,13 +1680,13 @@ pub(in crate::front::mir) fn foreign_opaque_method_result_valuetype(
                     {
                         Some(ValueType::Ref(Some(ast)))
                     } else {
-                        Some(ValueType::Ref(str_family_root))
+                        Some(ValueType::Ref(opaque_root))
                     }
                 }
                 TypeDeclKind::Enum(_) if !type_decl_is_fieldless_enum(td, llbc) => {
                     root.map(|r| ValueType::Ref(Some(r)))
                 }
-                _ if td.published_struct_copy => Some(ValueType::Ref(str_family_root)),
+                _ if td.published_struct_copy => Some(ValueType::Ref(opaque_root)),
                 _ => None,
             }
         }
@@ -1768,6 +1825,7 @@ pub(in crate::front::mir) fn fundecl_keeps_zst_self(
     tombstoned: &std::collections::HashSet<String>,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+    struct_fields: Option<&crate::front::semantic::StructFieldRegistry>,
 ) -> bool {
     if trait_impl_trait_path_for_fundecl(llbc, fd).is_none() {
         return false;
@@ -1794,6 +1852,7 @@ pub(in crate::front::mir) fn fundecl_keeps_zst_self(
         tombstoned,
         gc_struct_ids,
         raw_alloc_flavor_structs,
+        struct_fields,
     );
     matches!(ty, ValueType::Ref(None)) && tyref_is_void_zst(&local.ty, llbc)
 }
@@ -3221,6 +3280,7 @@ pub(in crate::front::mir) fn tyref_to_value_type_with(
     tombstoned: &std::collections::HashSet<String>,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+    struct_fields: Option<&crate::front::semantic::StructFieldRegistry>,
 ) -> ValueType {
     if let Some(erased) = rbigint_gc_root::erase_tyref(ty, llbc) {
         return tyref_to_value_type_with(
@@ -3229,6 +3289,7 @@ pub(in crate::front::mir) fn tyref_to_value_type_with(
             tombstoned,
             gc_struct_ids,
             raw_alloc_flavor_structs,
+            struct_fields,
         );
     }
     // The Value arm carries the body inline; primitives
@@ -3291,6 +3352,7 @@ pub(in crate::front::mir) fn tyref_to_value_type_with(
             tombstoned,
             gc_struct_ids,
             raw_alloc_flavor_structs,
+            struct_fields,
         );
     }
     // A borrow hides the projection: `&Self::Anchor` is a `Ref` whose
@@ -3311,6 +3373,7 @@ pub(in crate::front::mir) fn tyref_to_value_type_with(
                 tombstoned,
                 gc_struct_ids,
                 raw_alloc_flavor_structs,
+                struct_fields,
             );
         }
         if let Some(inner) = tyref_transparent_inner_value_type(
@@ -3319,6 +3382,7 @@ pub(in crate::front::mir) fn tyref_to_value_type_with(
             tombstoned,
             gc_struct_ids,
             raw_alloc_flavor_structs,
+            struct_fields,
         ) {
             return inner;
         }
@@ -3365,18 +3429,20 @@ pub(in crate::front::mir) fn tyref_to_value_type_with(
     {
         return inner;
     }
-    // Opaque `core::cell::Ref` / `RefMut` / `RefCell` have no `value`
-    // field in this artefact. RPython has no RefCell: a single-owner
-    // interpreter field is a direct getattr, and the dynamic borrow flag
-    // has no lltype counterpart, so the wrapper word is T
-    // (`Adt.generics.types[0]`). Mapping here is what lets
-    // `RefCell::borrow` and `Ref::deref` pass `banks_agree` as identities.
+    // Std `Ref` / `RefMut` / `RefCell` (`tyref_std_cell_payload_value_type`):
+    // a pointer-valued `value` (`Ref` / `RefMut`, `NonNull<T>`) and a
+    // spelling no artefact published intern rows for occupy T's bank. A
+    // cell whose harvested `value` holds T inline (`RefCell`) is the cell
+    // class, so `RefCell::borrow` FieldRead of `value` resolves on the cell.
+    // Layout is [`std_cell_layout_present`] on harvested intern rows
+    // (`bookkeeper.py` `Bookkeeper.getuniqueclassdef`).
     if let Some(inner) = tyref_std_cell_payload_value_type(
         ty,
         llbc,
         tombstoned,
         gc_struct_ids,
         raw_alloc_flavor_structs,
+        struct_fields,
     ) {
         return inner;
     }
@@ -3404,7 +3470,7 @@ pub(in crate::front::mir) fn tyref_to_value_type_with(
     // use. Identify the env by `src`, never by the shared `closure` /
     // `closure#N` leaf.
     if tyref_is_closure_env(ty, llbc) {
-        return ValueType::Ref(tyref_input_class_root(ty, llbc, tombstoned));
+        return ValueType::Ref(tyref_input_class_root(ty, llbc, tombstoned, struct_fields));
     }
     // A `repr(transparent)` GC handle keeps the wrapper's class. The
     // handle intern's as a subclass of `Deref::Target` (`error::PyError`
@@ -3436,6 +3502,7 @@ pub(in crate::front::mir) fn tyref_to_value_type_with(
         tombstoned,
         gc_struct_ids,
         raw_alloc_flavor_structs,
+        struct_fields,
     ) {
         return inner;
     }
@@ -3494,6 +3561,7 @@ pub(in crate::front::mir) fn tyref_to_value_type_with(
             tombstoned,
             gc_struct_ids,
             raw_alloc_flavor_structs,
+            struct_fields,
         );
     }
     // `llmemory.py` `GCREF = Ptr(GcOpaqueType('GCREF'))`. `history.py`
@@ -3706,6 +3774,7 @@ pub(in crate::front::mir) fn tyref_to_value_type(ty: &TyRef, llbc: &Llbc) -> Val
         no_tombstoned_leaves(),
         &inputs.gc_struct_ids,
         &inputs.raw_alloc_flavor_structs,
+        None,
     )
 }
 
@@ -3721,6 +3790,7 @@ pub(in crate::front::mir) fn tyref_deref_value_type_with(
     tombstoned: &std::collections::HashSet<String>,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+    struct_fields: Option<&crate::front::semantic::StructFieldRegistry>,
 ) -> ValueType {
     let Some(node) = tyref_node(ty, llbc).and_then(|node| strip_ty_wrappers(node, llbc)) else {
         return ValueType::Ref(None);
@@ -3731,6 +3801,7 @@ pub(in crate::front::mir) fn tyref_deref_value_type_with(
         tombstoned,
         gc_struct_ids,
         raw_alloc_flavor_structs,
+        struct_fields,
     )
 }
 
@@ -3805,6 +3876,7 @@ pub(in crate::front::mir) fn adt_field_read_value_type(
     tombstoned: &std::collections::HashSet<String>,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+    struct_fields: Option<&crate::front::semantic::StructFieldRegistry>,
 ) -> ValueType {
     if let Some(raw) = raw_field_address_value_type(place_ty, field_ty, owner_declared_gc, llbc) {
         return raw;
@@ -3816,6 +3888,7 @@ pub(in crate::front::mir) fn adt_field_read_value_type(
             tombstoned,
             gc_struct_ids,
             raw_alloc_flavor_structs,
+            struct_fields,
         )
     } else {
         tyref_to_value_type_with(
@@ -3824,34 +3897,40 @@ pub(in crate::front::mir) fn adt_field_read_value_type(
             tombstoned,
             gc_struct_ids,
             raw_alloc_flavor_structs,
+            struct_fields,
         )
     };
     match declared {
         ValueType::Ref(None) => {
             if owner_is_closure_env
-                && let Some(peeled) = tyref_shared_borrow_primitive_value(field_ty, llbc)
-                    .or_else(|| tyref_shared_borrow_primitive_value(place_ty, llbc))
-                    .or_else(|| {
-                        [field_ty, place_ty].into_iter().find_map(|ty| {
-                            tyref_is_borrowed_transparent_scalar(
-                                ty,
-                                llbc,
-                                tombstoned,
-                                gc_struct_ids,
-                                raw_alloc_flavor_structs,
-                            )
-                            .then(|| {
-                                tyref_transparent_inner_value_type(
+                && let Some(peeled) =
+                    tyref_shared_borrow_primitive_value(field_ty, llbc, struct_fields)
+                        .or_else(|| {
+                            tyref_shared_borrow_primitive_value(place_ty, llbc, struct_fields)
+                        })
+                        .or_else(|| {
+                            [field_ty, place_ty].into_iter().find_map(|ty| {
+                                tyref_is_borrowed_transparent_scalar(
                                     ty,
                                     llbc,
                                     tombstoned,
                                     gc_struct_ids,
                                     raw_alloc_flavor_structs,
+                                    struct_fields,
                                 )
+                                .then(|| {
+                                    tyref_transparent_inner_value_type(
+                                        ty,
+                                        llbc,
+                                        tombstoned,
+                                        gc_struct_ids,
+                                        raw_alloc_flavor_structs,
+                                        struct_fields,
+                                    )
+                                })
+                                .flatten()
                             })
-                            .flatten()
                         })
-                    })
             {
                 return peeled;
             }
@@ -3906,6 +3985,7 @@ pub(in crate::front::mir) fn adt_field_read_value_type(
                 tombstoned,
                 gc_struct_ids,
                 raw_alloc_flavor_structs,
+                struct_fields,
             )
         }
         resolved => resolved,
@@ -3925,6 +4005,7 @@ pub(in crate::front::mir) fn tuple_element_field_value_type(
     tombstoned: &std::collections::HashSet<String>,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+    struct_fields: Option<&crate::front::semantic::StructFieldRegistry>,
 ) -> ValueType {
     if let Some(ccharp) = raw_u8_ccharp_bank(place_ty, llbc).or_else(|| {
         element_ty
@@ -3946,6 +4027,7 @@ pub(in crate::front::mir) fn tuple_element_field_value_type(
         tombstoned,
         gc_struct_ids,
         raw_alloc_flavor_structs,
+        struct_fields,
     ) {
         ValueType::Ref(None) => element_ty
             .map(|ty| {
@@ -3955,6 +4037,7 @@ pub(in crate::front::mir) fn tuple_element_field_value_type(
                     tombstoned,
                     gc_struct_ids,
                     raw_alloc_flavor_structs,
+                    struct_fields,
                 )
             })
             .unwrap_or(ValueType::Ref(None)),
@@ -4053,11 +4136,17 @@ pub(in crate::front::mir) fn tyref_is_closure_env(ty: &TyRef, llbc: &Llbc) -> bo
 pub(in crate::front::mir) fn tyref_shared_borrow_primitive_value(
     ty: &TyRef,
     llbc: &Llbc,
+    struct_fields: Option<&crate::front::semantic::StructFieldRegistry>,
 ) -> Option<ValueType> {
     let pointee = tyref_shared_borrow_primitive_pointee(ty, llbc)?;
-    Some(tyref_to_value_type(
+    let inputs = value_type_inputs(llbc);
+    Some(tyref_to_value_type_with(
         &TyRef::Other(pointee.clone().into()),
         llbc,
+        no_tombstoned_leaves(),
+        &inputs.gc_struct_ids,
+        &inputs.raw_alloc_flavor_structs,
+        struct_fields,
     ))
 }
 
@@ -4150,6 +4239,7 @@ pub(in crate::front::mir) fn tyref_enum_payload_value_type(
     tombstoned: &std::collections::HashSet<String>,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+    struct_fields: Option<&crate::front::semantic::StructFieldRegistry>,
 ) -> ValueType {
     // `rffi.py` `CCHARP`. Int-banked so overlay Signed keeps the stamp.
     if let Some(ccharp) = raw_u8_ccharp_bank(ty, llbc) {
@@ -4165,6 +4255,7 @@ pub(in crate::front::mir) fn tyref_enum_payload_value_type(
             tombstoned,
             gc_struct_ids,
             raw_alloc_flavor_structs,
+            struct_fields,
         );
     }
     // A variant payload `&Raw` / `&mut Raw` is the interior pointer word
@@ -4190,6 +4281,7 @@ pub(in crate::front::mir) fn tyref_enum_payload_value_type(
             tombstoned,
             gc_struct_ids,
             raw_alloc_flavor_structs,
+            struct_fields,
         ),
         None => ValueType::Ref(None),
     }
@@ -5220,6 +5312,7 @@ pub(in crate::front::mir) fn tuple_residual_return_token(
     spec: crate::ErrorCarrierSpec<'_>,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+    struct_fields: Option<&crate::front::semantic::StructFieldRegistry>,
 ) -> Option<String> {
     let node = strip_ty_wrappers(tyref_node(ty, llbc)?, llbc)?;
     let stripped = TyRef::Other(node.clone().into());
@@ -5236,6 +5329,7 @@ pub(in crate::front::mir) fn tuple_residual_return_token(
                 spec,
                 gc_struct_ids,
                 raw_alloc_flavor_structs,
+                struct_fields,
             )
             .unwrap_or_else(|| "()".to_string()),
         );
@@ -5252,7 +5346,8 @@ pub(in crate::front::mir) fn tuple_residual_return_token(
 /// (`legacy_resolve.rs infer_concrete_from_op` →
 /// `valuetype_to_concrete`).  The classification mirrors `lower_call`'s
 /// `result_ty` derivation (unit is void; a non-byte raw scalar pointer
-/// is the `i64` token; otherwise `tyref_to_value_type`) so the real path
+/// is the `i64` token; otherwise [`tyref_to_value_type_with`] with the
+/// same harvested intern rows ordinary lowering reads) so the real path
 /// and the legacy walker converge by construction.
 ///
 /// The tokens are the Rust primitive spellings the codewriter's
@@ -5269,6 +5364,7 @@ pub(in crate::front::mir) fn dont_look_inside_return_token(
     spec: crate::ErrorCarrierSpec<'_>,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+    struct_fields: Option<&crate::front::semantic::StructFieldRegistry>,
 ) -> Option<String> {
     // A `Result<T, PyError>` callee is reached through the residual-call
     // ABI, which hands back the `Ok` payload and routes the error through
@@ -5329,6 +5425,7 @@ pub(in crate::front::mir) fn dont_look_inside_return_token(
         spec,
         gc_struct_ids,
         raw_alloc_flavor_structs,
+        struct_fields,
     ) {
         return Some(token);
     }
@@ -5338,6 +5435,7 @@ pub(in crate::front::mir) fn dont_look_inside_return_token(
         no_tombstoned_leaves(),
         gc_struct_ids,
         raw_alloc_flavor_structs,
+        struct_fields,
     ) {
         ValueType::Bool => "bool",
         ValueType::Int => {
@@ -5416,11 +5514,20 @@ pub(in crate::front::mir) fn dont_look_inside_return_class_root(
     tombstoned: &std::collections::HashSet<String>,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+    struct_fields: Option<&crate::front::semantic::StructFieldRegistry>,
 ) -> Option<String> {
     let payload = crate::front::result_exc::result_exc_projected_ok(output, llbc, spec);
     let ty = payload.as_ref().unwrap_or(output);
     if tyref_is_gcref_spelling(ty, llbc) {
         return None;
+    }
+    // Layout-present std cell: intern the cell class
+    // (`tyref_std_cell_class_root` / `bookkeeper.py` `getuniqueclassdef`).
+    // Before the transparent peel so a cell whose harvested `value`
+    // holds T inline is not treated as a wrapper of T
+    // (`signature.py` `annotationoftype`).
+    if let Some(root) = tyref_std_cell_class_root(ty, llbc, tombstoned, struct_fields) {
+        return Some(root);
     }
     if let Some(root) =
         tyref_niche_option_gc_payload_spelling(ty, llbc, gc_struct_ids, raw_alloc_flavor_structs)
@@ -5437,6 +5544,7 @@ pub(in crate::front::mir) fn dont_look_inside_return_class_root(
         no_tombstoned_leaves(),
         gc_struct_ids,
         raw_alloc_flavor_structs,
+        struct_fields,
     )
     .is_some()
     {
@@ -5692,6 +5800,7 @@ pub(in crate::front::mir) fn dont_look_inside_return_container_root(
     llbc: &Llbc,
     spec: crate::ErrorCarrierSpec<'_>,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    struct_fields: Option<&crate::front::semantic::StructFieldRegistry>,
 ) -> Option<String> {
     // Same Result<T, PyError> payload [`dont_look_inside_return_token`]
     // reads. `encode_ascii` returns `Result<Vec<u8>, PyError>`; looking
@@ -5710,6 +5819,7 @@ pub(in crate::front::mir) fn dont_look_inside_return_container_root(
         gc_struct_ids,
         &std::collections::HashSet::<String>::new(),
         no_tombstoned_leaves(),
+        struct_fields,
     );
     if majit_ir::descr::is_shared_u8_slice_spelling(&spelling)
         || majit_ir::descr::is_option_of_u8_window_spelling(&spelling)
@@ -5840,6 +5950,7 @@ pub(in crate::front::mir) fn tyref_to_attr_value_type_with(
     tombstoned: &std::collections::HashSet<String>,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+    struct_fields: Option<&crate::front::semantic::StructFieldRegistry>,
 ) -> ValueType {
     if let Some(erased) = rbigint_gc_root::erase_tyref(ty, llbc) {
         return tyref_to_attr_value_type_with(
@@ -5848,6 +5959,7 @@ pub(in crate::front::mir) fn tyref_to_attr_value_type_with(
             tombstoned,
             gc_struct_ids,
             raw_alloc_flavor_structs,
+            struct_fields,
         );
     }
     let Some(resolved) = tyref_node(ty, llbc) else {
@@ -5870,6 +5982,21 @@ pub(in crate::front::mir) fn tyref_to_attr_value_type_with(
     {
         return inner;
     }
+    // Matching [`tyref_to_value_type`]: the same std-cell helper, so a
+    // field, a return, and an argument of `&RefCell<T>` / `RefCell<T>` /
+    // `Ref<T>` carry one ValueType. A pointer-valued `value` and a
+    // spelling with no harvested layout peel to T; harvested inline
+    // `value` is the cell class `RefCell::borrow` FieldReads.
+    if let Some(cell) = tyref_std_cell_payload_value_type(
+        ty,
+        llbc,
+        tombstoned,
+        gc_struct_ids,
+        raw_alloc_flavor_structs,
+        struct_fields,
+    ) {
+        return cell;
+    }
     // Matching [`tyref_to_value_type`]: a `Vec` of one-word items is the
     // address of its raw `{ptr, len, cap}` header (`RustVecRepr`, kind
     // `int`). Layout and the register bank keep that Int. FORCE does not
@@ -5891,6 +6018,7 @@ pub(in crate::front::mir) fn tyref_to_attr_value_type_with(
         tombstoned,
         gc_struct_ids,
         raw_alloc_flavor_structs,
+        struct_fields,
     ) {
         return inner;
     }
@@ -5947,6 +6075,7 @@ pub(in crate::front::mir) fn tyref_to_attr_value_type_with(
             tombstoned,
             gc_struct_ids,
             raw_alloc_flavor_structs,
+            struct_fields,
         );
     }
     // A `str`/`Wtf8` field seeds a `SomeString` attr shell (via
@@ -5993,6 +6122,7 @@ pub(in crate::front::mir) fn tyref_to_attr_value_type_with(
             tombstoned,
             gc_struct_ids,
             raw_alloc_flavor_structs,
+            struct_fields,
         );
     }
     // `Option<NonZero*>` and a fieldless-enum niche are integers at every
@@ -6057,30 +6187,35 @@ pub(in crate::front::mir) fn tyref_to_attr_value_type_for_struct_field(
     llbc: &Llbc,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+    struct_fields: Option<&crate::front::semantic::StructFieldRegistry>,
 ) -> ValueType {
     if tyref_is_type_parameter(ty, llbc) {
         return ValueType::Unknown;
     }
     if type_decl_is_closure_env(owner) {
-        if let Some(peeled) = tyref_shared_borrow_primitive_value(ty, llbc).or_else(|| {
-            tyref_is_borrowed_transparent_scalar(
-                ty,
-                llbc,
-                no_tombstoned_leaves(),
-                gc_struct_ids,
-                raw_alloc_flavor_structs,
-            )
-            .then(|| {
-                tyref_transparent_inner_value_type(
+        if let Some(peeled) =
+            tyref_shared_borrow_primitive_value(ty, llbc, struct_fields).or_else(|| {
+                tyref_is_borrowed_transparent_scalar(
                     ty,
                     llbc,
                     no_tombstoned_leaves(),
                     gc_struct_ids,
                     raw_alloc_flavor_structs,
+                    struct_fields,
                 )
+                .then(|| {
+                    tyref_transparent_inner_value_type(
+                        ty,
+                        llbc,
+                        no_tombstoned_leaves(),
+                        gc_struct_ids,
+                        raw_alloc_flavor_structs,
+                        struct_fields,
+                    )
+                })
+                .flatten()
             })
-            .flatten()
-        }) {
+        {
             return peeled;
         }
         if closure_env_field_is_cell_address(type_decl_is_closure_env(owner), ty, llbc).is_some() {
@@ -6094,6 +6229,7 @@ pub(in crate::front::mir) fn tyref_to_attr_value_type_for_struct_field(
         no_tombstoned_leaves(),
         gc_struct_ids,
         raw_alloc_flavor_structs,
+        struct_fields,
     )
 }
 
@@ -7171,6 +7307,7 @@ pub(in crate::front::mir) fn tyref_by_value_struct_decl<'l>(
     tombstoned: &std::collections::HashSet<String>,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+    struct_fields: Option<&crate::front::semantic::StructFieldRegistry>,
 ) -> Option<&'l TypeDecl> {
     let node = tyref_node(ty, llbc).and_then(|n| strip_ty_indirections(n, llbc))?;
     let obj = node.as_object()?;
@@ -7236,6 +7373,7 @@ pub(in crate::front::mir) fn tyref_by_value_struct_decl<'l>(
         gc_struct_ids,
         0,
         raw_alloc_flavor_structs,
+        struct_fields,
     ) {
         return None;
     }
@@ -7256,6 +7394,7 @@ pub(in crate::front::mir) fn tyref_by_value_struct_decl<'l>(
             tombstoned,
             gc_struct_ids,
             raw_alloc_flavor_structs,
+            struct_fields,
         ),
         Some(ValueType::Int | ValueType::Unsigned | ValueType::Bool | ValueType::Float)
     ) {
@@ -7375,6 +7514,7 @@ pub(in crate::front::mir) fn exception_class_raw_owned_attr(
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     raw_alloc_flavor_structs: &std::collections::HashSet<String>,
     ambiguous_leaves: &std::collections::HashSet<String>,
+    struct_fields: Option<&crate::front::semantic::StructFieldRegistry>,
 ) -> Option<ExceptionClassRawOwnedAttr> {
     if !tyref_is_by_value_raw_flavor_struct(ty, llbc, raw_alloc_flavor_structs) {
         return None;
@@ -7391,6 +7531,7 @@ pub(in crate::front::mir) fn exception_class_raw_owned_attr(
         gc_struct_ids,
         raw_alloc_flavor_structs,
         ambiguous_leaves,
+        struct_fields,
     );
     let class_root =
         flavor_raw_pointer_class_root(&pointer, llbc, tombstoned, raw_alloc_flavor_structs)
@@ -7428,6 +7569,7 @@ pub(in crate::front::mir) fn exception_class_attr_is_one_word(
     llbc: &Llbc,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+    struct_fields: Option<&crate::front::semantic::StructFieldRegistry>,
 ) -> bool {
     if tyref_is_by_value_alloc_string(ty, llbc) {
         return true;
@@ -7453,6 +7595,7 @@ pub(in crate::front::mir) fn exception_class_attr_is_one_word(
         no_tombstoned_leaves(),
         gc_struct_ids,
         raw_alloc_flavor_structs,
+        struct_fields,
     ) else {
         return true;
     };
@@ -7585,6 +7728,7 @@ pub(in crate::front::mir) fn collect_by_value_struct_leaves(
     tombstoned: &std::collections::HashSet<String>,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+    struct_fields: Option<&crate::front::semantic::StructFieldRegistry>,
 ) -> Vec<InlineLeaf> {
     let TypeDeclKind::Struct(fields) = &td.kind else {
         return Vec::new();
@@ -7626,6 +7770,7 @@ pub(in crate::front::mir) fn collect_by_value_struct_leaves(
             tombstoned,
             gc_struct_ids,
             raw_alloc_flavor_structs,
+            struct_fields,
         ) {
             // `heaptracker.all_fielddescrs`: by-value nesting is finite (a
             // self-containing by-value struct is impossible), so there is no
@@ -7637,6 +7782,7 @@ pub(in crate::front::mir) fn collect_by_value_struct_leaves(
                 tombstoned,
                 gc_struct_ids,
                 raw_alloc_flavor_structs,
+                struct_fields,
             );
             if transparent_payload_idx == Some(i) {
                 leaves.extend(nested_leaves);
@@ -7663,6 +7809,7 @@ pub(in crate::front::mir) fn collect_by_value_struct_leaves(
                 llbc,
                 gc_struct_ids,
                 raw_alloc_flavor_structs,
+                struct_fields,
             ),
         });
     }
@@ -7684,6 +7831,7 @@ pub(in crate::front::mir) fn inline_struct_field_leaves(
     owner: &str,
     field_name: &str,
     raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+    struct_fields: Option<&crate::front::semantic::StructFieldRegistry>,
 ) -> Option<crate::model::InlineStructExpansion> {
     let td = type_decl_by_owner_root(llbc, owner)?;
     let TypeDeclKind::Struct(fields) = &td.kind else {
@@ -7699,6 +7847,7 @@ pub(in crate::front::mir) fn inline_struct_field_leaves(
         tombstoned,
         gc_struct_ids,
         raw_alloc_flavor_structs,
+        struct_fields,
     )?;
     Some(crate::model::InlineStructExpansion {
         at_offset_zero: type_decl_struct_field_offset(td, llbc, field_idx) == Some(0),
@@ -7709,6 +7858,7 @@ pub(in crate::front::mir) fn inline_struct_field_leaves(
             tombstoned,
             gc_struct_ids,
             raw_alloc_flavor_structs,
+            struct_fields,
         ),
     })
 }
@@ -8034,12 +8184,13 @@ pub(in crate::front::mir) fn tyref_input_class_root(
     ty: &TyRef,
     llbc: &Llbc,
     tombstoned: &std::collections::HashSet<String>,
+    struct_fields: Option<&crate::front::semantic::StructFieldRegistry>,
 ) -> Option<String> {
     // Matching [`tyref_to_value_type`]: `&Option<P>` is the Option word.
     if let Some(option_ty) = tyref_shared_borrow_option_pointee(ty, llbc)
         && option_nonzero_word_kind(&option_ty, llbc).is_none()
     {
-        return tyref_input_class_root(&option_ty, llbc, tombstoned)
+        return tyref_input_class_root(&option_ty, llbc, tombstoned, struct_fields)
             .or_else(|| tyref_split_core_enum_param_root(&option_ty, llbc, tombstoned));
     }
     if let Some(root) = niche_option_storage_raw_struct_root(ty, llbc, tombstoned) {
@@ -8061,6 +8212,23 @@ pub(in crate::front::mir) fn tyref_input_class_root(
             .and_then(|id| llbc.type_by_id(id))
     {
         return Some(closure_env_class_identity(td, tombstoned));
+    }
+    // Same intern key [`tyref_std_cell_payload_value_type`] paints.
+    // `adt_node_class_root_identity` declines generic core structs, so
+    // without this seed a `&RefCell<T>` Input is classdef-less and
+    // `getattr` of `value` walls. A pointer-valued guard (`Ref` /
+    // `RefMut`) occupies T's bank: seed T's class, not the guard, via
+    // the same Input helper a `T` / `&T` param uses (list spelling,
+    // shaped tuple, then this function). Nested `Ref<RefCell<T>>` uses
+    // the same walk [`register_std_cell_instantiation_rows`] does
+    // (`bookkeeper.py` `Bookkeeper.getuniqueclassdef`).
+    if tyref_is_std_cell_wrapper(ty, llbc) {
+        if let Some(root) = tyref_std_cell_class_root_nested(ty, llbc, tombstoned, struct_fields) {
+            return Some(root);
+        }
+        if let Some(inner) = tyref_adt_generics_type_arg(ty, 0, llbc) {
+            return tyref_ref_param_class_root(&inner, llbc, tombstoned, None, struct_fields);
+        }
     }
     tyref_class_root_with(ty, llbc, tombstoned)
 }
@@ -8147,6 +8315,7 @@ pub(in crate::front::mir) fn tyref_ref_param_class_root(
     llbc: &Llbc,
     tombstoned: &std::collections::HashSet<String>,
     generics: Option<&FunGenerics>,
+    struct_fields: Option<&crate::front::semantic::StructFieldRegistry>,
 ) -> Option<String> {
     let spelling = tyref_to_ast_string(ty, llbc);
     if majit_ir::descr::is_list_container_spelling(&spelling) {
@@ -8161,7 +8330,7 @@ pub(in crate::front::mir) fn tyref_ref_param_class_root(
     if let Some(root) = tyref_shaped_tuple_root(ty, llbc) {
         return Some(root);
     }
-    tyref_input_class_root(ty, llbc, tombstoned)
+    tyref_input_class_root(ty, llbc, tombstoned, struct_fields)
         .or_else(|| tyref_strips_to_str(ty, llbc).then(|| "str".to_string()))
         .or_else(|| tyref_generic_trait_bound_root(ty, llbc, generics))
         .or_else(|| tyref_split_core_enum_param_root(ty, llbc, tombstoned))
@@ -8218,36 +8387,186 @@ pub(in crate::front::mir) fn tyref_atomic_inner_value_type(
     }
 }
 
-/// Inner [`ValueType`] of an Opaque std `Ref` / `RefMut` / `RefCell`.
+/// [`ValueType`] of a std `Ref` / `RefMut` / `RefCell`.
 ///
-/// Charon records those ADTs as `TypeDeclKind::Opaque` (no `value`
-/// field). RPython has no RefCell: `ec.<attr>` is a direct getattr, and
-/// the borrow flag has no lltype counterpart, so the wrapper occupies
-/// T's register bank. Keyed on the ADT path plus generic 0.
+/// RPython has no borrow guard: `ec.<attr>` is a direct getattr, and the
+/// borrow flag has no lltype counterpart. [`tyref_std_cell_class_root`]
+/// is the one layout verdict this helper consumes:
+///
+/// * Some: harvested `value` holds T inline (`RefCell`). The cell class,
+///   so the layout-present borrow FieldRead of `value` resolves on the
+///   cell, not on T. Same intern shape as `MutRef<T>`.
+/// * None: `value` is a pointer to T (`Ref` / `RefMut`, `NonNull<T>`),
+///   or no artefact published intern rows. The wrapper occupies T's
+///   register bank (`Adt.generics.types[0]`). Nested `Ref<RefCell<T>>`
+///   walks the same way Input does. `RefCell::borrow` / `Ref::deref`
+///   then pass `banks_agree` as `same_as` (`std_identity.rs`).
+///
+/// Value sites, attr sites, and Input `class_root` share this helper.
 pub(in crate::front::mir) fn tyref_std_cell_payload_value_type(
     ty: &TyRef,
     llbc: &Llbc,
     tombstoned: &std::collections::HashSet<String>,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+    struct_fields: Option<&crate::front::semantic::StructFieldRegistry>,
 ) -> Option<ValueType> {
     if !tyref_is_std_cell_wrapper(ty, llbc) {
         return None;
     }
+    if let Some(root) = tyref_std_cell_class_root(ty, llbc, tombstoned, struct_fields) {
+        return Some(ValueType::Ref(Some(root)));
+    }
     let inner = tyref_adt_generics_type_arg(ty, 0, llbc)?;
+    if let Some(nested) = tyref_std_cell_payload_value_type(
+        &inner,
+        llbc,
+        tombstoned,
+        gc_struct_ids,
+        raw_alloc_flavor_structs,
+        struct_fields,
+    ) {
+        return Some(nested);
+    }
     Some(tyref_to_value_type_with(
         &inner,
         llbc,
         tombstoned,
         gc_struct_ids,
         raw_alloc_flavor_structs,
+        struct_fields,
     ))
+}
+
+/// Intern key of a std cell whose `value` field holds T inline.
+///
+/// The identity is the crate-stripped TypeDecl path plus generic 0
+/// (`MutRef<T>` / enum instantiation suffix). [`std_cell_layout_present`]
+/// reads harvested intern rows of that identity (`bookkeeper.py`
+/// `Bookkeeper.getuniqueclassdef`).
+pub(in crate::front::mir) fn tyref_std_cell_class_root(
+    ty: &TyRef,
+    llbc: &Llbc,
+    tombstoned: &std::collections::HashSet<String>,
+    struct_fields: Option<&crate::front::semantic::StructFieldRegistry>,
+) -> Option<String> {
+    let root = tyref_std_cell_identity_root(ty, llbc, tombstoned)?;
+    crate::front::std_identity::std_cell_layout_present(&root, struct_fields).then_some(root)
+}
+
+/// Crate-stripped decl path plus instantiation of a std cell, the
+/// spelling [`std_cell_layout_present`] keys intern rows on.
+fn tyref_std_cell_identity_root(
+    ty: &TyRef,
+    llbc: &Llbc,
+    tombstoned: &std::collections::HashSet<String>,
+) -> Option<String> {
+    if !tyref_is_std_cell_wrapper(ty, llbc) {
+        return None;
+    }
+    let td = tyref_type_decl(ty, llbc)?;
+    let identity = super::class_identity_spelling(&td.item_meta.name_path_str(), tombstoned);
+    let inner = tyref_adt_generics_type_arg(ty, 0, llbc)?;
+    let inner_ast = tyref_to_ast_string_with(&inner, llbc, tombstoned);
+    Some(majit_ir::descr::with_instantiation_suffix(
+        &identity,
+        &format!("<{inner_ast}>"),
+    ))
+}
+
+/// Layout-present std-cell intern key of `ty`, walking through
+/// pointer-valued `Ref` / `RefMut` the same way [`tyref_input_class_root`]
+/// unwraps. `bookkeeper.py` `Bookkeeper.getuniqueclassdef` does not depend
+/// on whether the class sat at the outermost signature type.
+fn tyref_std_cell_class_root_nested(
+    ty: &TyRef,
+    llbc: &Llbc,
+    tombstoned: &std::collections::HashSet<String>,
+    struct_fields: Option<&crate::front::semantic::StructFieldRegistry>,
+) -> Option<String> {
+    fn walk(
+        ty: &TyRef,
+        llbc: &Llbc,
+        tombstoned: &std::collections::HashSet<String>,
+        struct_fields: Option<&crate::front::semantic::StructFieldRegistry>,
+        depth: usize,
+    ) -> Option<String> {
+        if depth > 24 {
+            return None;
+        }
+        if let Some(root) = tyref_std_cell_class_root(ty, llbc, tombstoned, struct_fields) {
+            return Some(root);
+        }
+        if tyref_is_std_cell_wrapper(ty, llbc)
+            && let Some(inner) = tyref_adt_generics_type_arg(ty, 0, llbc)
+        {
+            return walk(&inner, llbc, tombstoned, struct_fields, depth + 1);
+        }
+        None
+    }
+    walk(ty, llbc, tombstoned, struct_fields, 0)
+}
+
+/// Publish per-instantiation field rows for a std cell whose `value`
+/// holds T inline. Harvest of the TypeDecl writes the unsuffixed
+/// template (`cell::RefCell`); [`tyref_std_cell_class_root`] paints
+/// `cell::RefCell<T>`. `derive_subject_inputcells` intern's a suffixed
+/// Input only when the registry has that exact key
+/// (`registered_struct_root_key`); without it the seed stays
+/// classdef-less and `getattr` of `value` walls. Same intern shape as
+/// `MutRef<T>`: the cell class, not T. A pointer-valued guard is not a
+/// cell class and does not get a row.
+pub(in crate::front::mir) fn register_std_cell_instantiation_rows(
+    llbc: &Llbc,
+    struct_fields: &mut crate::front::semantic::StructFieldRegistry,
+    tombstoned: &std::collections::HashSet<String>,
+) {
+    let mut roots = std::collections::BTreeSet::new();
+    for fd in llbc.iter_fun_decls() {
+        for ty in fd
+            .signature
+            .inputs
+            .iter()
+            .chain(std::iter::once(&fd.signature.output))
+        {
+            if let Some(root) =
+                tyref_std_cell_class_root_nested(ty, llbc, tombstoned, Some(&*struct_fields))
+            {
+                roots.insert(root);
+            }
+        }
+    }
+    for td in llbc.iter_type_decls() {
+        let TypeDeclKind::Struct(fields) = &td.kind else {
+            continue;
+        };
+        for field in fields {
+            if let Some(root) =
+                tyref_std_cell_class_root_nested(&field.ty, llbc, tombstoned, Some(&*struct_fields))
+            {
+                roots.insert(root);
+            }
+        }
+    }
+    for root in roots {
+        if struct_fields.fields.contains_key(&root) {
+            continue;
+        }
+        let template = majit_ir::descr::strip_instantiation_suffix(&root);
+        let Some(rows) = struct_fields
+            .intern_field_rows(&template)
+            .map(|rows| rows.to_vec())
+        else {
+            continue;
+        };
+        struct_fields.fields.insert(root, rows);
+    }
 }
 
 /// `core::cell::{Ref, RefMut, RefCell}` (and the `std::cell` re-export),
 /// by value or behind one borrow. A user type that shares a leaf name
 /// does not match.
-fn tyref_is_std_cell_wrapper(ty: &TyRef, llbc: &Llbc) -> bool {
+pub(in crate::front::mir) fn tyref_is_std_cell_wrapper(ty: &TyRef, llbc: &Llbc) -> bool {
     let Some(node) = tyref_node(ty, llbc).and_then(|node| strip_ty_wrappers(node, llbc)) else {
         return false;
     };
@@ -8257,28 +8576,7 @@ fn tyref_is_std_cell_wrapper(ty: &TyRef, llbc: &Llbc) -> bool {
     let Some(td) = llbc.type_by_id(id) else {
         return false;
     };
-    match td.item_meta.template_name().next_back() {
-        Some(NameSeg::Ident { ident: (s, _) })
-            if matches!(s.as_str(), "Ref" | "RefMut" | "RefCell") => {}
-        _ => return false,
-    }
-    let mut crate_ok = false;
-    let mut saw_cell = false;
-    for seg in td.item_meta.template_name() {
-        let NameSeg::Ident { ident: (id, _) } = seg else {
-            continue;
-        };
-        if !crate_ok && !saw_cell {
-            if !matches!(id.as_str(), "core" | "std") {
-                return false;
-            }
-            crate_ok = true;
-        }
-        if id == "cell" {
-            saw_cell = true;
-        }
-    }
-    crate_ok && saw_cell
+    crate::front::std_identity::is_std_cell_wrapper_path(td.item_meta.name_path_str())
 }
 
 /// The type argument `T` of a `core::sync::atomic::Atomic<T>`, resolved
@@ -8671,6 +8969,7 @@ pub(in crate::front::mir) fn tyref_is_borrowed_transparent_scalar(
     tombstoned: &std::collections::HashSet<String>,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+    struct_fields: Option<&crate::front::semantic::StructFieldRegistry>,
 ) -> bool {
     if !output_type_is_ref(ty, llbc) {
         return false;
@@ -8688,7 +8987,8 @@ pub(in crate::front::mir) fn tyref_is_borrowed_transparent_scalar(
             llbc,
             tombstoned,
             gc_struct_ids,
-            raw_alloc_flavor_structs
+            raw_alloc_flavor_structs,
+            struct_fields,
         ),
         Some(
             ValueType::Int
@@ -8813,7 +9113,8 @@ pub(in crate::front::mir) fn transparent_handle_has_deref_class(
                     llbc,
                     tombstoned,
                     gc_struct_ids,
-                    raw_alloc_flavor_structs
+                    raw_alloc_flavor_structs,
+                    None,
                 ),
                 ValueType::Ref(_)
             )
@@ -8970,6 +9271,7 @@ pub(in crate::front::mir) fn tyref_transparent_inner_value_type(
     tombstoned: &std::collections::HashSet<String>,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+    struct_fields: Option<&crate::front::semantic::StructFieldRegistry>,
 ) -> Option<ValueType> {
     // The host type peels to `usize`; `tyref_is_anchor` paints the frame
     // Ref instead. Callers that peel before that paint must not take the
@@ -9081,6 +9383,7 @@ pub(in crate::front::mir) fn tyref_transparent_inner_value_type(
                     tombstoned,
                     gc_struct_ids,
                     raw_alloc_flavor_structs,
+                    struct_fields,
                 );
                 if matches!(inner, ValueType::Str) {
                     return Some(inner);
@@ -9206,6 +9509,7 @@ pub(in crate::front::mir) fn tyref_is_primitive_word(
     tombstoned: &std::collections::HashSet<String>,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+    struct_fields: Option<&crate::front::semantic::StructFieldRegistry>,
 ) -> bool {
     matches!(
         tyref_to_value_type_with(
@@ -9214,6 +9518,7 @@ pub(in crate::front::mir) fn tyref_is_primitive_word(
             tombstoned,
             gc_struct_ids,
             raw_alloc_flavor_structs,
+            struct_fields,
         ),
         ValueType::Int
             | ValueType::Unsigned
@@ -9488,7 +9793,7 @@ pub(in crate::front::mir) fn tyref_keeps_empty_class_instance(
     tyref_is_void_zst(ty, llbc)
         && !tyref_is_option_of_uninhabited(ty, llbc)
         && !tyref_is_bytecode_arg_marker(ty, llbc)
-        && tyref_input_class_root(ty, llbc, tombstoned).is_some()
+        && tyref_input_class_root(ty, llbc, tombstoned, None).is_some()
 }
 
 /// Whether a `TyRef` resolves (behind reference wrappers) to an exact
@@ -10486,8 +10791,9 @@ pub(in crate::front::mir) fn stamp_fn_ptr(
     ty: &TyRef,
     llbc: &Llbc,
     error_carrier: crate::ErrorCarrierSpec<'_>,
+    struct_fields: Option<&crate::front::semantic::StructFieldRegistry>,
 ) {
-    if let Some(ft) = func_type_from_fn_ptr_ty(ty, llbc, error_carrier) {
+    if let Some(ft) = func_type_from_fn_ptr_ty(ty, llbc, error_carrier, struct_fields) {
         stamp_func_type(var, ft);
         return;
     }
@@ -10534,6 +10840,7 @@ pub(in crate::front::mir) fn func_type_from_fn_ptr_ty(
     ty: &TyRef,
     llbc: &Llbc,
     error_carrier: crate::ErrorCarrierSpec<'_>,
+    struct_fields: Option<&crate::front::semantic::StructFieldRegistry>,
 ) -> Option<crate::translator::rtyper::lltypesystem::lltype::FuncType> {
     use crate::translator::rtyper::lltypesystem::lltype::{FuncType, LowLevelType};
     let owned = crate::front::result_exc::tyref_option_payload(ty, llbc);
@@ -10549,12 +10856,12 @@ pub(in crate::front::mir) fn func_type_from_fn_ptr_ty(
     let args = match sig.get("inputs").and_then(serde_json::Value::as_array) {
         Some(items) => items
             .iter()
-            .map(|n| fn_ptr_ty_node_to_lltype(n, llbc, error_carrier))
+            .map(|n| fn_ptr_ty_node_to_lltype(n, llbc, error_carrier, struct_fields))
             .collect(),
         None => Vec::new(),
     };
     let result = match sig.get("output") {
-        Some(n) => fn_ptr_ty_node_to_lltype(n, llbc, error_carrier),
+        Some(n) => fn_ptr_ty_node_to_lltype(n, llbc, error_carrier, struct_fields),
         None => LowLevelType::Void,
     };
     Some(FuncType { args, result })
@@ -10564,10 +10871,11 @@ fn fn_ptr_ty_node_to_lltype(
     node: &serde_json::Value,
     llbc: &Llbc,
     error_carrier: crate::ErrorCarrierSpec<'_>,
+    struct_fields: Option<&crate::front::semantic::StructFieldRegistry>,
 ) -> crate::translator::rtyper::lltypesystem::lltype::LowLevelType {
     let ty = serde_json::from_value::<TyRef>(node.clone())
         .unwrap_or_else(|_| TyRef::Other(node.clone().into()));
-    fn_ptr_tyref_to_lltype(&ty, llbc, error_carrier)
+    fn_ptr_tyref_to_lltype(&ty, llbc, error_carrier, struct_fields)
 }
 
 /// A one-level pointer onto the rstr `STR` layout. `rstr.STRPTR`, not
@@ -10594,6 +10902,7 @@ fn fn_ptr_tyref_to_lltype(
     ty: &TyRef,
     llbc: &Llbc,
     error_carrier: crate::ErrorCarrierSpec<'_>,
+    struct_fields: Option<&crate::front::semantic::StructFieldRegistry>,
 ) -> crate::translator::rtyper::lltypesystem::lltype::LowLevelType {
     use crate::translator::rtyper::cutover::valuetype_to_lltype;
     use crate::translator::rtyper::lltypesystem::lltype::{GCREF, LowLevelType};
@@ -10605,7 +10914,7 @@ fn fn_ptr_tyref_to_lltype(
     if crate::front::result_exc::tyref_lowers_as_result_exc(ty, llbc, error_carrier)
         && let Some(ok) = crate::front::result_exc::tyref_result_ok(ty, llbc)
     {
-        return fn_ptr_tyref_to_lltype(&ok, llbc, error_carrier);
+        return fn_ptr_tyref_to_lltype(&ok, llbc, error_carrier, struct_fields);
     }
     if is_unit_type(ty, llbc) {
         return LowLevelType::Void;
@@ -10669,7 +10978,16 @@ fn fn_ptr_tyref_to_lltype(
             return LowLevelType::Signed;
         }
     }
-    valuetype_to_lltype(&tyref_to_value_type(ty, llbc)).unwrap_or_else(|| OBJECTPTR.clone())
+    let inputs = value_type_inputs(llbc);
+    valuetype_to_lltype(&tyref_to_value_type_with(
+        ty,
+        llbc,
+        no_tombstoned_leaves(),
+        &inputs.gc_struct_ids,
+        &inputs.raw_alloc_flavor_structs,
+        struct_fields,
+    ))
+    .unwrap_or_else(|| OBJECTPTR.clone())
 }
 
 /// Pointee of a one-level pointer that is the GCREF word: `*mut GCREFOpaque`,
@@ -11781,6 +12099,7 @@ pub(in crate::front::mir) fn list_spelling_item(list_root: &str) -> Option<&str>
 pub(in crate::front::mir) fn raw_ptr_typed_items_element(
     ty: &TyRef,
     llbc: &Llbc,
+    struct_fields: Option<&crate::front::semantic::StructFieldRegistry>,
 ) -> Option<(ValueType, String)> {
     let pointee = type_node_raw_ptr_pointee(tyref_node(ty, llbc)?, llbc)?;
     let spelling = json_ty_scalar_element_spelling(pointee, llbc)?;
@@ -11788,7 +12107,15 @@ pub(in crate::front::mir) fn raw_ptr_typed_items_element(
         return None;
     }
     let pointee = strip_ty_indirections(pointee, llbc)?;
-    let item_ty = tyref_to_value_type(&TyRef::Other(pointee.clone().into()), llbc);
+    let inputs = value_type_inputs(llbc);
+    let item_ty = tyref_to_value_type_with(
+        &TyRef::Other(pointee.clone().into()),
+        llbc,
+        no_tombstoned_leaves(),
+        &inputs.gc_struct_ids,
+        &inputs.raw_alloc_flavor_structs,
+        struct_fields,
+    );
     Some((item_ty, format!("[{spelling}]")))
 }
 
@@ -13020,6 +13347,7 @@ pub(in crate::front::mir) fn mut_ref_cell_root_of(
     tombstoned: &std::collections::HashSet<String>,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+    struct_fields: Option<&crate::front::semantic::StructFieldRegistry>,
 ) -> Option<String> {
     if !matches!(
         tyref_to_value_type_with(
@@ -13027,7 +13355,8 @@ pub(in crate::front::mir) fn mut_ref_cell_root_of(
             llbc,
             tombstoned,
             gc_struct_ids,
-            raw_alloc_flavor_structs
+            raw_alloc_flavor_structs,
+            struct_fields
         ),
         ValueType::Ref(_)
     ) {
@@ -13040,6 +13369,7 @@ pub(in crate::front::mir) fn mut_ref_cell_root_of(
         gc_struct_ids,
         0,
         raw_alloc_flavor_structs,
+        struct_fields,
     ) {
         return None;
     }
@@ -13053,6 +13383,7 @@ pub(in crate::front::mir) fn gc_ref_pointer(
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     depth: usize,
     raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+    struct_fields: Option<&crate::front::semantic::StructFieldRegistry>,
 ) -> bool {
     if depth > 4 {
         return false;
@@ -13070,7 +13401,8 @@ pub(in crate::front::mir) fn gc_ref_pointer(
                 llbc,
                 tombstoned,
                 gc_struct_ids,
-                raw_alloc_flavor_structs
+                raw_alloc_flavor_structs,
+                struct_fields,
             ),
             ValueType::Ref(_)
         );
@@ -13108,6 +13440,7 @@ pub(in crate::front::mir) fn gc_ref_pointer(
                     gc_struct_ids,
                     depth + 1,
                     raw_alloc_flavor_structs,
+                    struct_fields,
                 )
             });
     }
@@ -13132,6 +13465,7 @@ pub(in crate::front::mir) fn gc_ref_pointer(
             gc_struct_ids,
             depth + 1,
             raw_alloc_flavor_structs,
+            struct_fields,
         )
     })
 }
@@ -13170,6 +13504,7 @@ pub(in crate::front::mir) fn tyref_gc_mut_ref_cell_root(
     tombstoned: &std::collections::HashSet<String>,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+    struct_fields: Option<&crate::front::semantic::StructFieldRegistry>,
 ) -> Option<String> {
     tyref_mut_ref_pointee(ty, llbc).and_then(|pointee| {
         mut_ref_cell_root_of(
@@ -13178,6 +13513,7 @@ pub(in crate::front::mir) fn tyref_gc_mut_ref_cell_root(
             tombstoned,
             gc_struct_ids,
             raw_alloc_flavor_structs,
+            struct_fields,
         )
     })
 }
@@ -13213,6 +13549,7 @@ pub(in crate::front::mir) fn gc_mut_ref_param_locals(
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     self_dont_look_inside: bool,
     raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+    struct_fields: Option<&crate::front::semantic::StructFieldRegistry>,
 ) -> std::collections::HashSet<usize> {
     // A `dont_look_inside` body is called through the same raw-word ABI
     // its residual callers use, so its parameters are not cells.
@@ -13231,6 +13568,7 @@ pub(in crate::front::mir) fn gc_mut_ref_param_locals(
             tombstoned,
             gc_struct_ids,
             raw_alloc_flavor_structs,
+            struct_fields,
         )
         .is_some()
         {
@@ -13249,6 +13587,7 @@ pub(in crate::front::mir) fn tyref_option_gc_mut_ref_cell_root(
     tombstoned: &std::collections::HashSet<String>,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+    struct_fields: Option<&crate::front::semantic::StructFieldRegistry>,
 ) -> Option<String> {
     let payload = crate::front::result_exc::tyref_option_payload(ty, llbc)?;
     tyref_gc_mut_ref_cell_root(
@@ -13257,6 +13596,7 @@ pub(in crate::front::mir) fn tyref_option_gc_mut_ref_cell_root(
         tombstoned,
         gc_struct_ids,
         raw_alloc_flavor_structs,
+        struct_fields,
     )
 }
 
@@ -13275,6 +13615,7 @@ pub(in crate::front::mir) fn gc_mut_ref_input_stamp(
     tombstoned: &std::collections::HashSet<String>,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+    struct_fields: Option<&crate::front::semantic::StructFieldRegistry>,
 ) -> Option<(String, String)> {
     if gc_mut_ref_params.contains(&index) {
         let root = tyref_gc_mut_ref_cell_root(
@@ -13283,6 +13624,7 @@ pub(in crate::front::mir) fn gc_mut_ref_input_stamp(
             tombstoned,
             gc_struct_ids,
             raw_alloc_flavor_structs,
+            struct_fields,
         )?;
         return Some((root.clone(), root));
     }
@@ -13293,6 +13635,7 @@ pub(in crate::front::mir) fn gc_mut_ref_input_stamp(
             tombstoned,
             gc_struct_ids,
             raw_alloc_flavor_structs,
+            struct_fields,
         )?;
         return Some((root.clone(), format!("Option<{root}>")));
     }
@@ -13319,6 +13662,7 @@ pub(in crate::front::mir) fn gc_mut_ref_option_param_locals(
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     self_dont_look_inside: bool,
     raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+    struct_fields: Option<&crate::front::semantic::StructFieldRegistry>,
 ) -> std::collections::HashSet<usize> {
     if self_dont_look_inside {
         return std::collections::HashSet::new();
@@ -13335,6 +13679,7 @@ pub(in crate::front::mir) fn gc_mut_ref_option_param_locals(
             tombstoned,
             gc_struct_ids,
             raw_alloc_flavor_structs,
+            struct_fields,
         )
         .is_some()
         {
@@ -13829,6 +14174,7 @@ pub(in crate::front::mir) fn tyref_is_tuple(ty: &TyRef, llbc: &Llbc) -> bool {
 pub(in crate::front::mir) fn tyref_checked_binop_value_type(
     ty: &TyRef,
     llbc: &Llbc,
+    struct_fields: Option<&crate::front::semantic::StructFieldRegistry>,
 ) -> Option<ValueType> {
     let adt = tyref_node(ty, llbc)?.as_object()?.get("Adt")?.as_object()?;
     if adt.get("builtin").and_then(serde_json::Value::as_str) != Some("Tuple") {
@@ -13851,9 +14197,14 @@ pub(in crate::front::mir) fn tyref_checked_binop_value_type(
         return None;
     }
     let value_ty = strip_ty_wrappers(&types[0], llbc)?;
-    Some(tyref_to_value_type(
+    let inputs = value_type_inputs(llbc);
+    Some(tyref_to_value_type_with(
         &TyRef::Other(value_ty.clone().into()),
         llbc,
+        no_tombstoned_leaves(),
+        &inputs.gc_struct_ids,
+        &inputs.raw_alloc_flavor_structs,
+        struct_fields,
     ))
 }
 
@@ -14179,6 +14530,7 @@ fn borrowed_transparent_scalar_field_layout_spelling(
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     raw_alloc_flavor_structs: &std::collections::HashSet<String>,
     ambiguous_leaves: &std::collections::HashSet<String>,
+    struct_fields: Option<&crate::front::semantic::StructFieldRegistry>,
 ) -> Option<String> {
     if !tyref_is_borrowed_transparent_scalar(
         ty,
@@ -14186,6 +14538,7 @@ fn borrowed_transparent_scalar_field_layout_spelling(
         no_tombstoned_leaves(),
         gc_struct_ids,
         raw_alloc_flavor_structs,
+        struct_fields,
     ) {
         return None;
     }
@@ -14202,6 +14555,7 @@ fn borrowed_transparent_scalar_field_layout_spelling(
             gc_struct_ids,
             raw_alloc_flavor_structs,
             ambiguous_leaves,
+            struct_fields,
         ));
     }
     transparent_scalar_kind_layout_spelling(decl, llbc)
@@ -14220,6 +14574,7 @@ pub(in crate::front::mir) fn tyref_to_field_layout_string(
     llbc: &Llbc,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+    struct_fields: Option<&crate::front::semantic::StructFieldRegistry>,
 ) -> String {
     tyref_to_field_layout_string_with(
         ty,
@@ -14227,6 +14582,7 @@ pub(in crate::front::mir) fn tyref_to_field_layout_string(
         gc_struct_ids,
         raw_alloc_flavor_structs,
         no_tombstoned_leaves(),
+        struct_fields,
     )
 }
 
@@ -14236,6 +14592,7 @@ pub(in crate::front::mir) fn tyref_to_field_layout_string_with(
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     raw_alloc_flavor_structs: &std::collections::HashSet<String>,
     ambiguous_leaves: &std::collections::HashSet<String>,
+    struct_fields: Option<&crate::front::semantic::StructFieldRegistry>,
 ) -> String {
     // A `FrameAnchor` / `&FrameAnchor` field is the frame pointer
     // (`tyref_to_ast_string` of a `RawPtr` to an ADT uses the TypeDecl
@@ -14269,6 +14626,7 @@ pub(in crate::front::mir) fn tyref_to_field_layout_string_with(
         gc_struct_ids,
         raw_alloc_flavor_structs,
         ambiguous_leaves,
+        struct_fields,
     ) {
         return spelling;
     }
@@ -14373,7 +14731,14 @@ pub(in crate::front::mir) fn tyref_to_field_layout_string_with(
         && let Some((index, _)) = transparent_nonzst_field(decl, llbc)
         && let Some(field) = fields.get(index)
         && !matches!(
-            tyref_to_value_type(&field.ty, llbc),
+            tyref_to_value_type_with(
+                &field.ty,
+                llbc,
+                no_tombstoned_leaves(),
+                gc_struct_ids,
+                raw_alloc_flavor_structs,
+                struct_fields,
+            ),
             ValueType::Ref(_)
                 | ValueType::Str
                 | ValueType::StringBuilder
@@ -16710,8 +17075,12 @@ fn marked_exception_ast_name(llbc: &Llbc, name_path: &str) -> Option<String> {
 /// CAST head of one ADT declaration path.
 ///
 /// A marked exception class is its intern key. A withdrawn duplicate leaf
-/// is the crate-stripped path [`tombstoned_owner_spelling`] paints. Every
-/// other ADT keeps the TypeDecl leaf.
+/// is the crate-stripped path [`tombstoned_owner_spelling`] paints. A std
+/// cell TypeDecl (`core::cell` / `std::cell` / crate-stripped `cell`,
+/// leaf `Ref` / `RefMut` / `RefCell`) keeps that module path so a
+/// harvested field spelling matches
+/// [`crate::front::std_identity::is_std_cell_wrapper_path`]. Every other
+/// ADT keeps the TypeDecl leaf.
 fn adt_ast_head(
     llbc: &Llbc,
     name_path: &str,
@@ -16719,6 +17088,9 @@ fn adt_ast_head(
 ) -> String {
     if let Some(key) = marked_exception_ast_name(llbc, name_path) {
         return key;
+    }
+    if crate::front::std_identity::is_std_cell_wrapper_path(name_path) {
+        return super::class_identity_spelling(name_path, tombstoned);
     }
     let leaf = name_path.rsplit("::").next().unwrap_or(name_path);
     if tombstoned.contains(leaf) {
@@ -16788,7 +17160,8 @@ pub(in crate::front::mir) fn charon_adt_to_ast_string(
 /// FieldRow.ty of a named by-value ADT: the crate-stripped TypeDecl
 /// path `resolve_adt_field` stamps on FieldWrite.owner_root
 /// (`class_identity_spelling`). `charon_adt_to_ast_string` is the ADT
-/// leaf; two TypeDecls that share that leaf (`module::struct::Code`
+/// leaf except a std cell, which keeps `cell::RefCell` / `cell::Ref` /
+/// `cell::RefMut`; two TypeDecls that share that leaf (`module::struct::Code`
 /// beside `eval::Code`) collide unless the row carries `name_path()`.
 /// `consider_struct` / `all_fielddescrs` / `get_field_descr` key on
 /// the STRUCT. An array-of-ADT layout qualifies the element the same
@@ -17515,6 +17888,7 @@ pub(in crate::front::mir) fn scalar_inherent_method_path(
     tombstoned: &std::collections::HashSet<String>,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+    struct_fields: Option<&crate::front::semantic::StructFieldRegistry>,
 ) -> Option<Vec<String>> {
     let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
         return None;
@@ -17549,6 +17923,7 @@ pub(in crate::front::mir) fn scalar_inherent_method_path(
         gc_struct_ids,
         0,
         raw_alloc_flavor_structs,
+        struct_fields,
     ) {
         return None;
     }

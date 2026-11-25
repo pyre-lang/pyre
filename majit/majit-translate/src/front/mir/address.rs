@@ -1007,6 +1007,7 @@ impl<'a> Lowering<'a> {
             self.tombstoned_leaves,
             self.gc_struct_ids,
             &self.raw_alloc_flavor_structs,
+            self.struct_fields,
         )
     }
 
@@ -1021,6 +1022,7 @@ impl<'a> Lowering<'a> {
             self.tombstoned_leaves,
             self.gc_struct_ids,
             &self.raw_alloc_flavor_structs,
+            self.struct_fields,
         )
     }
 
@@ -1086,6 +1088,7 @@ impl<'a> Lowering<'a> {
                 self.tombstoned_leaves,
                 self.gc_struct_ids,
                 &self.raw_alloc_flavor_structs,
+                self.struct_fields,
             ),
             ValueType::Ref(_)
         )
@@ -1538,6 +1541,7 @@ impl<'a> Lowering<'a> {
                         self.tombstoned_leaves,
                         self.gc_struct_ids,
                         &self.raw_alloc_flavor_structs,
+                        self.struct_fields,
                     )
                     .or_else(|| {
                         if !tyref_is_type_var(ty, self.llbc) {
@@ -1553,6 +1557,7 @@ impl<'a> Lowering<'a> {
                                     self.tombstoned_leaves,
                                     self.gc_struct_ids,
                                     &self.raw_alloc_flavor_structs,
+                                    self.struct_fields,
                                 )
                             })
                     });
@@ -1652,6 +1657,7 @@ impl<'a> Lowering<'a> {
                 self.tombstoned_leaves,
                 self.gc_struct_ids,
                 &self.raw_alloc_flavor_structs,
+                self.struct_fields,
             )
             .is_some()
                 || self.mut_ref_cell_root(&followed.ty).is_some()
@@ -1673,6 +1679,7 @@ impl<'a> Lowering<'a> {
             self.tombstoned_leaves,
             self.gc_struct_ids,
             &self.raw_alloc_flavor_structs,
+            self.struct_fields,
         )
         .is_some()
         {
@@ -1687,6 +1694,7 @@ impl<'a> Lowering<'a> {
             self.tombstoned_leaves,
             self.gc_struct_ids,
             &self.raw_alloc_flavor_structs,
+            self.struct_fields,
         )
         .is_some()
         .then_some(GcMutRefArg::WholeLocal(local))
@@ -2034,7 +2042,7 @@ impl<'a> Lowering<'a> {
     /// is kind `'r'` (`history.py` `getkind`) and cannot hold a
     /// `rffi.scoped_alloc` / `lltype.malloc(flavor='raw')` address.
     fn tyref_is_nullable_gcref(&self, ty: &TyRef) -> bool {
-        if tyref_is_gc_reference(ty, self.llbc) {
+        if tyref_is_gc_reference(ty, self.llbc, self.struct_fields) {
             return true;
         }
         if !self.tyref_is_niche_option_ptr(ty) {
@@ -2050,7 +2058,11 @@ impl<'a> Lowering<'a> {
         else {
             return false;
         };
-        tyref_is_gc_reference(&TyRef::Other(payload.clone().into()), self.llbc)
+        tyref_is_gc_reference(
+            &TyRef::Other(payload.clone().into()),
+            self.llbc,
+            self.struct_fields,
+        )
     }
 
     /// Store the aliased word into a fresh raw address and pass that

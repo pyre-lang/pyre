@@ -1779,13 +1779,13 @@ pub fn all_subclass_range_aliases() -> Vec<SubclassRangeAlias> {
         subclass_range_alias(21, &crate::function::CLASSMETHOD_TYPE),
         subclass_range_alias(22, &crate::_pypy_generic_alias::UNION_TYPE),
         subclass_range_alias(23, &crate::iterobject::SEQ_ITER_TYPE),
-        // The producer-specific str/bytes/bytearray/memoryview/array iterator
-        // identities all carry the `W_SeqIterObject` payload, so they share
-        // its GC type id the way the six dict view iterators share 109.
-        subclass_range_alias(23, &crate::iterobject::STR_ASCII_ITER_TYPE),
-        subclass_range_alias(23, &crate::iterobject::STR_ITER_TYPE),
-        subclass_range_alias(23, &crate::iterobject::BYTES_ITER_TYPE),
-        subclass_range_alias(23, &crate::iterobject::BYTEARRAY_ITER_TYPE),
+        // The producer-specific memoryview/array iterator identities
+        // carry the `W_SeqIterObject` payload, so they share its GC type
+        // id the way the six dict view iterators share 110.
+        // `str_iterator` / `str_ascii_iterator` use `W_FastUnicodeIterObject`
+        // and alias at the interpreter tail (`all_subclass_range_aliases`).
+        // `bytes_iterator` / `bytearray_iterator` use interpreter
+        // `iterobject.py W_StringIterObject` and alias there too.
         subclass_range_alias(23, &crate::iterobject::MEMORY_ITER_TYPE),
         subclass_range_alias(23, &crate::iterobject::ARRAY_ITER_TYPE),
         subclass_range_alias(24, typed::<crate::interp_itertools::W_Count>()),

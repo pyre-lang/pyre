@@ -252,7 +252,7 @@ fn build_semantic_program_via_active_frontend(
             let mut eval_override_graphs = Vec::new();
             let mut profilefunc_graphs = Vec::new();
             let mut profilefunc_spellings = Vec::new();
-            let mut fnptr_field_families = Vec::new();
+            let mut fnptr_family_inputs = front::mir::FnPtrFamilyInputs::default();
             let mut declared_gc = front::mir::DeclaredGcFacts::default();
             let mut repr_transparent = std::collections::HashSet::new();
             let mut raw_alloc_flavor_structs = std::collections::HashSet::new();
@@ -393,11 +393,7 @@ fn build_semantic_program_via_active_frontend(
                         profilefunc_spellings.push(spelling);
                     }
                 }
-                for row in front::mir::discover_fnptr_field_families(&llbc) {
-                    if !fnptr_field_families.contains(&row) {
-                        fnptr_field_families.push(row);
-                    }
-                }
+                fnptr_family_inputs.merge(front::mir::collect_fnptr_family_inputs(&llbc));
                 prof.mark(&format!("    harvest {p}"));
             }
             discovered.sort_by(|a, b| a.0.cmp(&b.0));
@@ -409,6 +405,8 @@ fn build_semantic_program_via_active_frontend(
                 profilefunc_graphs.clone(),
                 profilefunc_spellings.clone(),
             );
+            let fnptr_field_families =
+                front::mir::resolve_fnptr_field_families(&fnptr_family_inputs);
 
             let mut graph_bodies = front::graph_body::GraphBodyProvider::new(
                 static_addrs,
@@ -449,6 +447,9 @@ fn build_semantic_program_via_active_frontend(
                 if !profilefunc_spellings.is_empty() {
                     llbc.set_profilefunc_spellings(profilefunc_spellings.clone());
                 }
+                if !fnptr_field_families.is_empty() {
+                    front::mir::seed_fnptr_field_families(&llbc, fnptr_field_families.clone());
+                }
                 llbc.set_root_stack_effects(root_stack_crates.clone(), root_stack_touching.clone());
                 llbc.register_transparent_scalar_kinds(discovered.iter().cloned());
                 llbc.register_stack_sensitive_fns(stack_sensitive.iter().cloned());
@@ -461,27 +462,18 @@ fn build_semantic_program_via_active_frontend(
                 front::mir::attach_foldable_const_lits(&llbc, &foldable_cross);
                 front::mir::attach_foldable_const_lits(&llbc, &foldable_impl_by_ord[ord]);
                 front::mir::register_ambiguous_impl_foldable_const_lits(&llbc);
-                unsafe_fn_stubs.extend(front::mir::collect_unsafe_fn_stubs_from_llbc(
-                    &llbc,
-                    &gc_struct_ids,
-                    static_addrs.error_carrier,
-                    &raw_alloc_flavor_structs,
-                ));
-                unsafe_fn_stubs.extend(front::mir::collect_policy_opaque_fn_stubs_from_llbc(
-                    &llbc,
-                    &gc_struct_ids,
-                    static_addrs.error_carrier,
-                    &raw_alloc_flavor_structs,
-                ));
-                foreign_opaque_method_externals
-                    .extend(front::mir::collect_foreign_opaque_method_externals(&llbc));
-                let prog = graph_bodies.lower_prelinked_crate(
+                // Stub FUNC.RESULT is computed after intern-row harvest
+                // inside `lower_prelinked_crate` so the classifier reads
+                // the same registry ordinary lowering uses.
+                let mut prog = graph_bodies.lower_prelinked_crate(
                     llbc,
                     module_paths,
                     &cross_tombstoned_leaves,
                     &gc_struct_ids,
                     &raw_alloc_flavor_structs,
                 );
+                unsafe_fn_stubs.append(&mut prog.unsafe_fn_stubs);
+                foreign_opaque_method_externals.append(&mut prog.foreign_opaque_method_externals);
                 prof.mark(&format!("    lower {p}"));
                 front::mir::absorb_semantic_program(
                     &mut merged,

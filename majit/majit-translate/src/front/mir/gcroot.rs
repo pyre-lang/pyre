@@ -1110,6 +1110,7 @@ impl<'a> Lowering<'a> {
                     self.tombstoned_leaves,
                     self.gc_struct_ids,
                     &self.raw_alloc_flavor_structs,
+                    self.struct_fields,
                 )
             }) {
                 return Err(LowerError::Unsupported(format!(

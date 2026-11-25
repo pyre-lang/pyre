@@ -20,6 +20,7 @@
 //! (`getarrayitem_gc`/`setarrayitem_gc` or `getfield_gc`/`setfield_gc`).
 
 use crate::flowspace::model::Variable;
+use crate::front::semantic::{FieldRow, StructFieldRegistry};
 use crate::model::{CallTarget, FieldDescriptor, OpKind, ValueType};
 
 fn path_has(segments: &[String], needle: &str) -> bool {
@@ -39,6 +40,74 @@ fn is_std_fn_path(segments: &[String]) -> bool {
 
 fn is_std_type_path(path: Option<&str>) -> bool {
     path.is_some_and(|p| p.split("::").next().is_some_and(is_std_crate))
+}
+
+/// `core::cell::...` or Charon dropping the `core::` crate prefix
+/// (`cell::Cell::get`, the same spelling `FOREIGN_STDLIB_EXTERNALS` keys).
+/// User and nestedscope `Cell` keep a crate prefix and stay residual.
+pub(crate) fn is_std_cell_module_path(path: &str) -> bool {
+    path.starts_with("core::cell::")
+        || path.starts_with("std::cell::")
+        || path.starts_with("cell::Cell::")
+        || path.starts_with("cell::<Impl>::")
+}
+
+/// Type spelling of `core::cell::{Ref, RefMut, RefCell}` (and the
+/// `std::cell` re-export), including the crate-stripped intern key
+/// `cell::RefCell<T>`. Same identity `tyref_is_std_cell_wrapper`
+/// reads off the TypeDecl path. A user type that shares a leaf name
+/// does not match.
+pub(crate) fn is_std_cell_wrapper_path(path: &str) -> bool {
+    let template = majit_ir::descr::strip_generic_args(path.trim());
+    let segs: Vec<&str> = template.split("::").collect();
+    let Some((leaf, prefix)) = segs.split_last() else {
+        return false;
+    };
+    if !matches!(*leaf, "Ref" | "RefMut" | "RefCell") {
+        return false;
+    }
+    matches!(prefix, ["core", "cell"] | ["std", "cell"] | ["cell"])
+}
+
+/// Layout-present std cell: the harvested intern rows of this identity
+/// hold T inline in `value`.
+///
+/// `bookkeeper.py` `Bookkeeper.getuniqueclassdef` keys one ClassDef on
+/// the class. The cell-vs-payload verdict is that identity (crate-stripped
+/// decl path plus instantiation) plus those rows, not the TypeDecl kind
+/// of the artefact that happens to mention the type. A `RefCell` whose
+/// `value` is `UnsafeCell<T>` / T intern's as the cell class. A `Ref` /
+/// `RefMut` whose `value` is `NonNull<T>`, or a spelling no artefact
+/// published rows for, occupies T's bank.
+pub(crate) fn std_cell_layout_present(spelling: &str, reg: Option<&StructFieldRegistry>) -> bool {
+    is_std_cell_wrapper_path(spelling)
+        && intern_rows_hold_std_cell_payload_inline(reg.and_then(|r| r.intern_field_rows(spelling)))
+}
+
+/// `true` when intern rows include a `value` field that is T itself,
+/// not a pointer to T.
+pub(crate) fn intern_rows_hold_std_cell_payload_inline(rows: Option<&[FieldRow]>) -> bool {
+    rows.is_some_and(|rows| {
+        rows.iter().any(|row| {
+            row.name == "value"
+                && !row.is_rustc_pointer_niche
+                && !crate::front::mir::is_rustc_pointer_niche_spelling(&row.ty)
+                && !registry_ty_is_raw_ptr(&row.ty)
+        })
+    })
+}
+
+/// Field-registry encoding of a Charon `RawPtr` node. A marker ADT
+/// wrapping a pointer is a different constructor. Harvest of a one-word
+/// `Vec` paints `*mut Vec<item>` (`annotation_struct_field_type` /
+/// `project_rust_vec`); that spelling is the list itself
+/// (`rlist.py` `ListRepr`), not a Charon RawPtr to T.
+pub(crate) fn registry_ty_is_raw_ptr(ty: &str) -> bool {
+    let t = ty.trim();
+    if !(t.starts_with("*mut ") || t.starts_with("*const ")) {
+        return false;
+    }
+    !majit_ir::descr::is_list_container_spelling(t)
 }
 
 fn path_leaf(path: Option<&str>) -> Option<&str> {
@@ -381,6 +450,16 @@ pub(crate) fn lower_std_primitive_op(
                     .iter()
                     .find(|(name, _)| name == "value" || name == "data")
             {
+                // Layout-present `Ref` / `RefMut`: `value` is `NonNull<T>`,
+                // so the wrapper occupies T's bank
+                // (`tyref_std_cell_payload_value_type`). Deref is identity
+                // when the banks agree, same as the Opaque arm.
+                if is_std_cell_ref_deref_target(target, receiver_path) {
+                    if banks_agree {
+                        return same_as(operand, result_ty.clone());
+                    }
+                    return op_kind;
+                }
                 return payload_field_read(operand, name, owner, result_ty.clone());
             }
             return op_kind;
@@ -1271,8 +1350,12 @@ mod tests {
     }
 
     #[test]
-    fn ref_deref_reads_value_field_not_the_guard() {
+    fn ref_deref_aliases_the_payload_when_value_is_a_pointer() {
         let v = dummy_var();
+        let layout = [
+            ("value".into(), ValueType::Ref(Some("Vec".into()))),
+            ("borrow".into(), ValueType::Ref(None)),
+        ];
         let deref = lower_std_primitive_op(
             call(
                 path(&["core", "cell", "Ref", "deref"]),
@@ -1285,18 +1368,19 @@ mod tests {
             None,
             false,
             true,
-            Some(&[
-                ("value".into(), ValueType::Ref(Some("Vec".into()))),
-                ("borrow".into(), ValueType::Ref(None)),
-            ]),
+            Some(&layout),
             false,
         );
         match deref {
-            OpKind::FieldRead { field, base, .. } => {
-                assert_eq!(field.name, "value");
-                assert_eq!(base, v);
+            OpKind::UnaryOp {
+                ref op,
+                ref operand,
+                ..
+            } => {
+                assert_eq!(op, "same_as");
+                assert_eq!(operand, &v);
             }
-            other => panic!("expected a field read of Ref.value, got {other:?}"),
+            other => panic!("layout-present Ref::deref is the inner value, got {other:?}"),
         }
 
         let peeled = lower_std_primitive_op(
@@ -1316,19 +1400,40 @@ mod tests {
             None,
             false,
             true,
-            Some(&[
-                ("value".into(), ValueType::Ref(Some("Vec".into()))),
-                ("borrow".into(), ValueType::Ref(None)),
-            ]),
+            Some(&layout),
             false,
         );
         match peeled {
-            OpKind::FieldRead { field, base, .. } => {
-                assert_eq!(field.name, "value");
-                assert_eq!(base, v);
+            OpKind::UnaryOp {
+                ref op,
+                ref operand,
+                ..
+            } => {
+                assert_eq!(op, "same_as");
+                assert_eq!(operand, &v);
             }
-            other => panic!("peeled cell::Ref::deref should read value, got {other:?}"),
+            other => panic!("peeled cell::Ref::deref is the inner value, got {other:?}"),
         }
+
+        let disagree = lower_std_primitive_op(
+            call(
+                path(&["core", "cell", "Ref", "deref"]),
+                vec![v],
+                ValueType::Ref(Some("Vec".into())),
+            ),
+            Some("core::cell::Ref"),
+            None,
+            None,
+            None,
+            false,
+            false,
+            Some(&layout),
+            false,
+        );
+        assert!(
+            matches!(disagree, OpKind::Call { .. }),
+            "layout-present Ref::deref keeps the residual Call when banks disagree, got {disagree:?}"
+        );
     }
 
     #[test]
@@ -1889,5 +1994,114 @@ mod tests {
             is_default_target(&ptr_default),
             crate::front::mir::is_core_default_path("core::ptr::mut_ptr::<Impl>::default")
         );
+    }
+
+    #[test]
+    fn accepts_core_std_and_charon_short_cell_get() {
+        for path in [
+            "core::cell::Cell::get",
+            "std::cell::Cell::get",
+            "cell::Cell::get",
+            "cell::Cell::<Impl>::get",
+            "cell::<Impl>::get",
+            "core::cell::<Impl>::get",
+        ] {
+            assert!(is_std_cell_module_path(path), "{path}");
+        }
+    }
+
+    #[test]
+    fn rejects_user_and_nestedscope_cell() {
+        for path in [
+            "fixture::Cell::get",
+            "my_crate::Cell::get",
+            "pyre_object::nestedscope::Cell::get",
+            "pyre_object::nestedscope::w_cell_get",
+        ] {
+            assert!(!is_std_cell_module_path(path), "{path}");
+        }
+    }
+
+    #[test]
+    fn wrapper_path_accepts_std_cell_class_spellings() {
+        for path in [
+            "core::cell::RefCell",
+            "std::cell::RefCell<Vec<*mut X>>",
+            "cell::RefCell<Hidden>",
+            "core::cell::Ref",
+            "cell::RefMut<T>",
+        ] {
+            assert!(is_std_cell_wrapper_path(path), "{path}");
+        }
+    }
+
+    #[test]
+    fn wrapper_path_rejects_user_holder_and_other_cell_types() {
+        for path in [
+            "Holder<T>",
+            "Holder<HolderPayload>",
+            "fixture::RefCell<T>",
+            "core::cell::UnsafeCell<T>",
+            "core::cell::Cell<T>",
+            "cell::Cell<T>",
+        ] {
+            assert!(!is_std_cell_wrapper_path(path), "{path}");
+        }
+    }
+
+    #[test]
+    fn layout_present_reads_intern_rows_of_the_nominal_identity() {
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            "cell::RefCell".to_string(),
+            vec![
+                FieldRow::named("borrow", "i64"),
+                FieldRow::named("value", "cell::UnsafeCell<Vec<i64>>"),
+            ],
+        );
+        reg.fields.insert(
+            "cell::Ref".to_string(),
+            vec![
+                FieldRow::named("value", "NonNull<Vec<i64>>"),
+                FieldRow::named("borrow", "i64"),
+            ],
+        );
+        assert!(
+            std_cell_layout_present("cell::RefCell<Vec<i64>>", Some(&reg)),
+            "harvested inline value intern's as the cell class"
+        );
+        assert!(
+            !std_cell_layout_present("cell::Ref<Vec<i64>>", Some(&reg)),
+            "pointer-valued value occupies T's bank"
+        );
+        assert!(
+            !std_cell_layout_present("cell::RefCell<Vec<i64>>", None),
+            "no artefact published rows: peel"
+        );
+        assert!(!std_cell_layout_present(
+            "fixture::RefCell<Vec<i64>>",
+            Some(&reg)
+        ));
+        let mut raw = FieldRow::named("value", "*mut i64");
+        raw.is_rustc_pointer_niche = false;
+        assert!(!intern_rows_hold_std_cell_payload_inline(Some(&[
+            FieldRow::named("borrow", "i64"),
+            raw,
+        ])));
+        assert!(
+            intern_rows_hold_std_cell_payload_inline(Some(&[
+                FieldRow::named("borrow", "i64"),
+                FieldRow::named("value", "*mut Vec<i64>"),
+            ])),
+            "Vec header-pointer harvest is T inline"
+        );
+        let mut niche = FieldRow::named("value", "i64");
+        niche.is_rustc_pointer_niche = true;
+        assert!(!intern_rows_hold_std_cell_payload_inline(Some(&[niche])));
+        assert!(intern_rows_hold_std_cell_payload_inline(Some(&[
+            FieldRow::named("borrow", "i64"),
+            FieldRow::named("value", "Vec<i64>"),
+        ])));
+        assert!(!intern_rows_hold_std_cell_payload_inline(None));
     }
 }

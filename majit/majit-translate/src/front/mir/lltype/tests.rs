@@ -10,13 +10,16 @@ use super::{
     no_tombstoned_leaves, payload_tuple_suffix, raw_field_address_value_type,
     raw_ptr_pointee_is_non_adt_spelling, repeat_array_result_ty, shaped_array_parts,
     ty_is_raw_address, type_decl_is_closure_env, tyref_array_suffix, tyref_enum_payload_value_type,
-    tyref_fn_ptr_input_class_root, tyref_is_closure_env, tyref_is_cow_str, tyref_is_gcref_spelling,
-    tyref_is_niche_option, tyref_is_option_of_string_value, tyref_is_ptr_to_int_cast_origin,
-    tyref_is_raw_byte_ptr, tyref_is_raw_c_void_pp, tyref_is_raw_c_void_ptr, tyref_is_string_family,
-    tyref_is_void_zst, tyref_niche_option_gc_payload_spelling, tyref_positional_aggregate_root,
+    tyref_fn_ptr_input_class_root, tyref_input_class_root, tyref_is_closure_env, tyref_is_cow_str,
+    tyref_is_gcref_spelling, tyref_is_niche_option, tyref_is_option_of_string_value,
+    tyref_is_ptr_to_int_cast_origin, tyref_is_raw_byte_ptr, tyref_is_raw_c_void_pp,
+    tyref_is_raw_c_void_ptr, tyref_is_string_family, tyref_is_void_zst,
+    tyref_niche_option_gc_payload_spelling, tyref_positional_aggregate_root,
     tyref_ptr_pointee_is_vec, tyref_raw_ptr_to_classed_instance_spelling,
-    tyref_ref_param_class_root, tyref_shaped_tuple_root, tyref_to_attr_value_type_for_struct_field,
-    tyref_to_value_type, tyref_tuple_suffix, unique_unsafecell_slice_deref_field_index,
+    tyref_ref_param_class_root, tyref_shaped_tuple_root, tyref_std_cell_class_root,
+    tyref_std_cell_payload_value_type, tyref_to_attr_value_type_for_struct_field,
+    tyref_to_attr_value_type_with, tyref_to_value_type, tyref_to_value_type_with,
+    tyref_tuple_suffix, unique_unsafecell_slice_deref_field_index,
 };
 use crate::front::mir::tests::assert_graph_operands_defined;
 use crate::front::mir::tests::interior_adt;
@@ -52,8 +55,9 @@ use crate::front::mir::tests::{
     struct_decl, trait_clone_call_fixture, trait_clone_kind_payload, transparent_layout,
     type_decl_alias, type_decl_meta, type_decl_struct, tyref_to_attr_value_type, unit_fn_ptr,
     usize_ty, vec_decl_json, vec_of, vec_type_decls, vec_usize_ty_json, window_const_slice_ptr,
-    window_empty_generics, window_llbc, window_local, window_meta, window_mut_slice, window_place,
-    window_shared_slice, window_slice, window_span, window_usize,
+    window_empty_generics, window_llbc, window_local, window_meta, window_mut_slice,
+    window_opaque_fun, window_place, window_shared_slice, window_slice, window_span,
+    window_unwind_and_return_blocks, window_usize,
 };
 
 #[test]
@@ -1884,7 +1888,8 @@ fn nested_dedup_i64_pointee_classifies_as_signed() {
             &llbc,
             super::no_tombstoned_leaves(),
             &gc,
-            &std::collections::HashSet::<String>::new()
+            &std::collections::HashSet::<String>::new(),
+            None,
         ),
         Some(ValueType::Int)
     );
@@ -1986,6 +1991,1171 @@ fn std_cell_ref_wrappers_type_as_generic0() {
         ValueType::Ref(None),
         "a user cell::Ref is not the std wrapper"
     );
+}
+
+fn harvest_struct_fields(llbc: &Llbc) -> crate::front::semantic::StructFieldRegistry {
+    let (_, _, fields, _, _, _, _, _) = super::derive_program_metadata(
+        llbc,
+        &super::harvest_declared_gc_facts(llbc).gc_struct_ids(),
+        super::no_immutable_fields(),
+        &std::collections::HashSet::new(),
+        &[],
+    );
+    fields
+}
+
+fn std_cell_value_attr_input(
+    ty: &TyRef,
+    llbc: &Llbc,
+    fields: &crate::front::semantic::StructFieldRegistry,
+) -> (ValueType, ValueType, Option<String>) {
+    let tomb = no_tombstoned_leaves();
+    let gc = std::collections::HashSet::new();
+    let raw = std::collections::HashSet::new();
+    (
+        tyref_to_value_type_with(ty, llbc, tomb, &gc, &raw, Some(fields)),
+        tyref_to_attr_value_type_with(ty, llbc, tomb, &gc, &raw, Some(fields)),
+        tyref_input_class_root(ty, llbc, tomb, Some(fields)),
+    )
+}
+
+/// Diagnostic of the `is_resolving` wall: `tyref_to_value_type`
+/// (`lltype.rs`) peeled a Struct `RefCell<Vec<_>>` to the Vec Int bank
+/// via `tyref_std_cell_payload_value_type`, while `tyref_to_attr_value_type`
+/// did not call that helper (`Ref(None)`). `RefCell::borrow` still emits
+/// FieldRead `"value"` (`std_identity.rs` layout-present). House rule:
+/// both paths use that helper; Opaque and a pointer-valued `value` peel
+/// to T, a Struct whose `value` holds T inline keeps the cell class.
+#[test]
+fn std_cell_struct_with_value_field_keeps_the_cell_on_value_and_attr() {
+    let host_adt = named_adt(2, vec![]);
+    let host_ptr = serde_json::json!({"RawPtr": [host_adt, "Mut"]});
+    let vec_ty = named_adt(1, vec![host_ptr]);
+    let llbc = llbc_with_types(
+        "fixture",
+        vec![
+            type_decl_struct(
+                0,
+                &["core", "cell", "RefCell"],
+                vec![
+                    serde_json::json!({
+                        "name": "borrow",
+                        "ty": i64_ty(),
+                        "attr_info": null
+                    }),
+                    serde_json::json!({
+                        "name": "value",
+                        "ty": vec_ty.clone(),
+                        "attr_info": null
+                    }),
+                ],
+            ),
+            type_decl_struct(1, &["alloc", "vec", "Vec"], vec![]),
+            type_decl_struct(2, &["fixture", "Host"], vec![]),
+        ],
+        vec![],
+    );
+    let refcell_vec = TyRef::Other(named_adt(0, vec![vec_ty.clone()]).into());
+    let fields = harvest_struct_fields(&llbc);
+    let (value, attr, input) = std_cell_value_attr_input(&refcell_vec, &llbc, &fields);
+    assert_eq!(
+        value, attr,
+        "field vs return/arg of RefCell<Vec<_>> must agree; value={value:?} attr={attr:?}"
+    );
+    match &value {
+        ValueType::Ref(Some(root)) => {
+            assert!(
+                root.starts_with("cell::RefCell<") && root.contains("Vec<"),
+                "Struct RefCell with a value field is the cell class, got {root}"
+            );
+            assert_eq!(
+                input.as_deref(),
+                Some(root.as_str()),
+                "Input class_root is the same cell class the value path paints"
+            );
+        }
+        other => {
+            panic!("Struct RefCell with a value field must keep the cell class, got {other:?}")
+        }
+    }
+
+    let borrowed = TyRef::Other(
+        serde_json::json!({
+            "Ref": ["Erased", named_adt(0, vec![vec_ty]), "Shared"]
+        })
+        .into(),
+    );
+    let (borrowed_value, borrowed_attr, borrowed_input) =
+        std_cell_value_attr_input(&borrowed, &llbc, &fields);
+    assert_eq!(
+        borrowed_value, borrowed_attr,
+        "&RefCell<Vec<_>> value vs attr"
+    );
+    assert_eq!(
+        borrowed_value, value,
+        "&RefCell and RefCell share the cell class"
+    );
+    let ValueType::Ref(Some(cell_root)) = borrowed_value else {
+        panic!("&RefCell must paint Ref(Some(cell class))");
+    };
+    assert_eq!(
+        borrowed_input.as_deref(),
+        Some(cell_root.as_str()),
+        "Input class_root of &RefCell is the same cell class the value path paints"
+    );
+}
+
+/// `is_resolving` shape: a fn returning `&RefCell<Vec<GCREF-ish>>`
+/// then `.borrow()`, and the field-access shape of the same storage.
+/// The borrowed Vec is the function result so the intercept FieldRead
+/// of `"value"` stays live (an unused dest is dropped; a dummy write
+/// of local 0 in the borrow block was jump-threaded to returnblock).
+///
+/// Annotate is the argument arrival (`&RefCell` Input): intern of the
+/// cell class plus FieldRead `"value"` of borrow, no `SomeRustVec.getattr`.
+/// Return and field graphs assert the same FieldRead and that a getter
+/// dest is the cell class (`tyref_std_cell_payload_value_type`), not the
+/// Vec Int bank.
+#[test]
+fn std_cell_refcell_vec_gcref_borrow_any_annotates() {
+    use crate::annotator::annrpython::RPythonAnnotator;
+    use crate::annotator::model::SomeValue;
+    use crate::translator::rtyper::call_registry::CallRegistry;
+    use crate::translator::rtyper::flowspace_adapter::{
+        derive_subject_inputcells, function_graph_to_flowspace,
+    };
+    use std::rc::Rc;
+
+    let host_adt = named_adt(2, vec![]);
+    let host_ptr = serde_json::json!({"RawPtr": [host_adt.clone(), "Mut"]});
+    let vec_ty = named_adt(1, vec![host_ptr.clone()]);
+    let refcell_ty = named_adt(0, vec![vec_ty.clone()]);
+    let refcell_ref = serde_json::json!({"Ref": ["Erased", refcell_ty.clone(), "Shared"]});
+    let owner_adt = named_adt(3, vec![]);
+    let owner_ref = serde_json::json!({"Ref": ["Erased", owner_adt.clone(), "Shared"]});
+    let (unwind, ret) = window_unwind_and_return_blocks();
+
+    let refcell_decl = type_decl_struct(
+        0,
+        &["core", "cell", "RefCell"],
+        vec![
+            serde_json::json!({
+                "name": "borrow",
+                "ty": i64_ty(),
+                "attr_info": null
+            }),
+            serde_json::json!({
+                "name": "value",
+                "ty": vec_ty.clone(),
+                "attr_info": null
+            }),
+        ],
+    );
+    let vec_decl = type_decl_struct(1, &["alloc", "vec", "Vec"], vec![]);
+    let host_decl = type_decl_struct(2, &["fixture", "Host"], vec![]);
+    let owner_decl = type_decl_struct(
+        3,
+        &["fixture", "Owner"],
+        vec![serde_json::json!({
+            "name": "active",
+            "ty": refcell_ty.clone(),
+            "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true}
+        })],
+    );
+
+    let owner_deref = window_place(
+        serde_json::json!({"Projection": [
+            window_place(serde_json::json!({"Local": 1}), &owner_ref),
+            "Deref"
+        ]}),
+        &owner_adt,
+    );
+    let active_place = window_place(
+        serde_json::json!({"Projection": [
+            owner_deref,
+            {"Field": [null, 0]}
+        ]}),
+        &refcell_ty,
+    );
+    let borrow_call = |arg_ty: &serde_json::Value, arg_local: u64, target: u64| {
+        serde_json::json!({"Call": {"call": {
+            "func": {"Regular": {
+                "kind": {"Fun": 2},
+                "generics": window_empty_generics()
+            }},
+            "args": [{"Read": window_place(serde_json::json!({"Local": arg_local}), arg_ty)}]
+        }, "dest": window_place(serde_json::json!({"Local": 0}), &vec_ty),
+            "target": target, "on_unwind": 1}})
+    };
+
+    let getter = window_opaque_fun(
+        1,
+        &["fixture", "Owner", "active_cell"],
+        vec![owner_ref.clone()],
+        refcell_ref.clone(),
+    );
+    let borrow = window_opaque_fun(
+        2,
+        &["core", "cell", "RefCell", "borrow"],
+        vec![refcell_ref.clone()],
+        vec_ty.clone(),
+    );
+    let getter_caller = serde_json::json!({
+        "def_id": 0,
+        "item_meta": window_meta(&["fixture", "getter_borrow_any"], true),
+        "signature": {
+            "is_unsafe": false,
+            "inputs": [owner_ref.clone()],
+            "output": vec_ty.clone()
+        },
+        "body": {"Unstructured": {
+            "span": window_span(),
+            "locals": {"arg_count": 1, "locals": [
+                window_local(0, &vec_ty),
+                window_local(1, &owner_ref),
+                window_local(2, &refcell_ref)
+            ]},
+            "body": [
+                {
+                    "statements": [],
+                    "kind": "Regular",
+                    "terminator": {"span": window_span(), "kind": {"Call": {"call": {
+                        "func": {"Regular": {
+                            "kind": {"Fun": 1},
+                            "generics": window_empty_generics()
+                        }},
+                        "args": [{"Read": window_place(serde_json::json!({"Local": 1}), &owner_ref)}]
+                    }, "dest": window_place(serde_json::json!({"Local": 2}), &refcell_ref),
+                        "target": 2, "on_unwind": 1}}}
+                },
+                unwind.clone(),
+                {
+                    "statements": [],
+                    "kind": "Regular",
+                    "terminator": {"span": window_span(), "kind": borrow_call(&refcell_ref, 2, 3)}
+                },
+                ret.clone()
+            ]
+        }}
+    });
+    let field_caller = serde_json::json!({
+        "def_id": 3,
+        "item_meta": window_meta(&["fixture", "field_borrow_any"], true),
+        "signature": {
+            "is_unsafe": false,
+            "inputs": [owner_ref.clone()],
+            "output": vec_ty.clone()
+        },
+        "body": {"Unstructured": {
+            "span": window_span(),
+            "locals": {"arg_count": 1, "locals": [
+                window_local(0, &vec_ty),
+                window_local(1, &owner_ref),
+                window_local(2, &refcell_ref)
+            ]},
+            "body": [
+                {
+                    "statements": [{
+                        "span": window_span(),
+                        "kind": {"Assign": [
+                            window_place(serde_json::json!({"Local": 2}), &refcell_ref),
+                            {"Ref": {
+                                "place": active_place,
+                                "kind": "Shared",
+                                "ptr_metadata": null
+                            }}
+                        ]}
+                    }],
+                    "kind": "Regular",
+                    "terminator": {"span": window_span(), "kind": borrow_call(&refcell_ref, 2, 2)}
+                },
+                unwind.clone(),
+                ret.clone()
+            ]
+        }}
+    });
+    let arg_caller = serde_json::json!({
+        "def_id": 4,
+        "item_meta": window_meta(&["fixture", "arg_borrow_any"], true),
+        "signature": {
+            "is_unsafe": false,
+            "inputs": [refcell_ref.clone()],
+            "output": vec_ty.clone()
+        },
+        "body": {"Unstructured": {
+            "span": window_span(),
+            "locals": {"arg_count": 1, "locals": [
+                window_local(0, &vec_ty),
+                window_local(1, &refcell_ref)
+            ]},
+            "body": [
+                {
+                    "statements": [],
+                    "kind": "Regular",
+                    "terminator": {"span": window_span(), "kind": borrow_call(&refcell_ref, 1, 2)}
+                },
+                unwind,
+                ret
+            ]
+        }}
+    });
+
+    let llbc = window_llbc(
+        vec![refcell_decl, vec_decl, host_decl, owner_decl],
+        vec![getter_caller, getter, borrow, field_caller, arg_caller],
+    );
+    let harvested = Rc::new(crate::front::mir::LowerContext::new(&llbc).struct_field_registry());
+
+    let has_value_field = |graph: &crate::model::FunctionGraph| {
+        graph_ops(graph).iter().any(|op| {
+            matches!(
+                &op.kind,
+                OpKind::FieldRead { field, .. } if field.name == "value"
+            )
+        })
+    };
+    let cell_call_dest = |graph: &crate::model::FunctionGraph| {
+        graph_ops(graph).iter().find_map(|op| match &op.kind {
+            OpKind::Call {
+                result_ty,
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } if segments.last().map(String::as_str) == Some("active_cell") => {
+                Some(result_ty.clone())
+            }
+            _ => None,
+        })
+    };
+
+    let getter_graph = crate::front::mir::lower_function(&llbc, "getter_borrow_any")
+        .unwrap_or_else(|e| panic!("lower getter_borrow_any: {e:?}"));
+    assert!(
+        has_value_field(&getter_graph),
+        "getter_borrow_any: RefCell::borrow must FieldRead value; graph={}",
+        getter_graph.dump()
+    );
+    match cell_call_dest(&getter_graph) {
+        Some(ValueType::Ref(Some(root)))
+            if root.starts_with("cell::RefCell<") && root.contains("Vec<") => {}
+        other => panic!(
+            "getter dest must be the cell class, not the Vec bank; got {other:?}; graph={}",
+            getter_graph.dump()
+        ),
+    }
+
+    let field_graph = crate::front::mir::lower_function(&llbc, "field_borrow_any")
+        .unwrap_or_else(|e| panic!("lower field_borrow_any: {e:?}"));
+    assert!(
+        has_value_field(&field_graph),
+        "field_borrow_any: RefCell::borrow must FieldRead value; graph={}",
+        field_graph.dump()
+    );
+
+    let graph = crate::front::mir::lower_function(&llbc, "arg_borrow_any")
+        .unwrap_or_else(|e| panic!("lower arg_borrow_any: {e:?}"));
+    assert!(
+        has_value_field(&graph),
+        "arg_borrow_any: RefCell::borrow must FieldRead value; graph={}",
+        graph.dump()
+    );
+    let input_root = graph_ops(&graph).iter().find_map(|op| match &op.kind {
+        OpKind::Input {
+            class_root: Some(root),
+            ..
+        } => Some(root.as_str()),
+        _ => None,
+    });
+    assert!(
+        input_root.is_some_and(|root| root.starts_with("cell::RefCell<") && root.contains("Vec<")),
+        "arg_borrow_any Input class_root is the cell class; graph={}",
+        graph.dump()
+    );
+
+    let ann = RPythonAnnotator::new(None, None, None, false);
+    ann.bookkeeper.set_struct_fields(harvested);
+    let registry = CallRegistry::new(ann.bookkeeper.clone());
+    let lifted = function_graph_to_flowspace(&graph, &registry)
+        .unwrap_or_else(|e| panic!("lift arg_borrow_any: {e:?}"));
+    crate::translator::simplify::simplify_graph(&lifted.graph.borrow(), None);
+    let cells = derive_subject_inputcells(&graph, Some(&ann.bookkeeper))
+        .unwrap_or_else(|e| panic!("arg_borrow_any inputcells: {e:?}"));
+    assert!(
+        cells.iter().any(|cell| matches!(cell, SomeValue::Instance(inst) if inst.classdef.as_ref().is_some_and(|cd| {
+            let name = cd.borrow().name.clone();
+            name.starts_with("cell::RefCell<") && name.contains("Vec<")
+        }))),
+        "arg_borrow_any Input must intern the cell class; cells={cells:?}"
+    );
+    let start = lifted.graph.borrow().startblock.clone();
+    let opt_cells: Vec<Option<SomeValue>> = cells.into_iter().map(Some).collect();
+    ann.addpendingblock(&lifted.graph, &start, &opt_cells);
+    ann.complete_pending_blocks()
+        .unwrap_or_else(|e| panic!("arg_borrow_any annotate: {e}"));
+}
+
+/// `Ref<'b, T>` is `{ value: NonNull<T>, borrow }` — a pointer to T —
+/// so it occupies T's bank. `RefCell<T>` holds T inline and stays the
+/// cell class. Field / return / argument / class_root share that verdict.
+#[test]
+fn std_cell_ref_guard_types_as_payload_not_cell_class() {
+    let host_adt = named_adt(2, vec![]);
+    let host_ptr = serde_json::json!({"RawPtr": [host_adt, "Mut"]});
+    let vec_ty = named_adt(1, vec![host_ptr]);
+    let nonnull_ty = named_adt(3, vec![vec_ty.clone()]);
+    let llbc = llbc_with_types(
+        "fixture",
+        vec![
+            type_decl_struct(
+                0,
+                &["core", "cell", "RefCell"],
+                vec![
+                    serde_json::json!({
+                        "name": "borrow",
+                        "ty": i64_ty(),
+                        "attr_info": null
+                    }),
+                    serde_json::json!({
+                        "name": "value",
+                        "ty": vec_ty.clone(),
+                        "attr_info": null
+                    }),
+                ],
+            ),
+            type_decl_struct(1, &["alloc", "vec", "Vec"], vec![]),
+            type_decl_struct(2, &["fixture", "Host"], vec![]),
+            opaque_type_decl(3, &["core", "ptr", "non_null", "NonNull"]),
+            type_decl_struct(
+                4,
+                &["core", "cell", "Ref"],
+                vec![
+                    serde_json::json!({
+                        "name": "value",
+                        "ty": nonnull_ty,
+                        "attr_info": null
+                    }),
+                    serde_json::json!({
+                        "name": "borrow",
+                        "ty": i64_ty(),
+                        "attr_info": null
+                    }),
+                ],
+            ),
+        ],
+        vec![],
+    );
+    let refcell = TyRef::Other(named_adt(0, vec![vec_ty.clone()]).into());
+    let cell_ref = TyRef::Other(named_adt(4, vec![vec_ty.clone()]).into());
+    let vec = TyRef::Other(vec_ty.clone().into());
+    let tombstoned = no_tombstoned_leaves();
+    let fields = harvest_struct_fields(&llbc);
+
+    match tyref_std_cell_class_root(&refcell, &llbc, tombstoned, Some(&fields)) {
+        Some(root) if root.starts_with("cell::RefCell<") && root.contains("Vec<") => {}
+        other => panic!("RefCell with inline value is the cell class, got {other:?}"),
+    }
+    assert_eq!(
+        tyref_std_cell_class_root(&cell_ref, &llbc, tombstoned, Some(&fields)),
+        None,
+        "Ref with NonNull value is not a cell class"
+    );
+
+    let gc = std::collections::HashSet::new();
+    let raw = std::collections::HashSet::new();
+    let vec_vt = tyref_to_value_type_with(&vec, &llbc, tombstoned, &gc, &raw, Some(&fields));
+    let (ref_vt, ref_attr, _) = std_cell_value_attr_input(&cell_ref, &llbc, &fields);
+    assert_eq!(
+        ref_vt, vec_vt,
+        "Ref<Vec> occupies Vec's bank; ref={ref_vt:?} vec={vec_vt:?}"
+    );
+    assert_eq!(
+        ref_vt, ref_attr,
+        "field vs return of Ref<Vec> must agree; value={ref_vt:?} attr={ref_attr:?}"
+    );
+
+    let borrowed_ref = TyRef::Other(
+        serde_json::json!({
+            "Ref": ["Erased", named_adt(4, vec![vec_ty.clone()]), "Shared"]
+        })
+        .into(),
+    );
+    let (borrowed_vt, _, _) = std_cell_value_attr_input(&borrowed_ref, &llbc, &fields);
+    assert_eq!(borrowed_vt, ref_vt, "&Ref peels to the same bank as Ref");
+    assert_eq!(
+        tyref_ref_param_class_root(&borrowed_ref, &llbc, tombstoned, None, Some(&fields)),
+        tyref_ref_param_class_root(&vec, &llbc, tombstoned, None, Some(&fields)),
+        "Input class_root of &Ref<Vec> is Vec's class, not the guard"
+    );
+}
+
+/// Opaque std `RefCell<Vec<i64>>` rendered from its TypeDecl carries the
+/// `cell::` module path, so a harvested reference field projects the vec
+/// payload (`bookkeeper.py` `Bookkeeper.immutablevalue`).
+#[test]
+fn harvested_opaque_std_refcell_vec_i64_field_projects_payload() {
+    use crate::annotator::bookkeeper::Bookkeeper;
+    use crate::annotator::model::SomeValue;
+    use std::rc::Rc;
+
+    let i64 = i64_ty();
+    let vec_ty = named_adt(1, vec![i64.clone()]);
+    let refcell_ty = named_adt(0, vec![vec_ty.clone()]);
+    let borrowed = serde_json::json!({"Ref": ["Erased", refcell_ty.clone(), "Shared"]});
+    let llbc = llbc_with_types(
+        "fixture",
+        vec![
+            opaque_type_decl(0, &["core", "cell", "RefCell"]),
+            type_decl_struct(1, &["alloc", "vec", "Vec"], vec![]),
+            type_decl_struct(
+                2,
+                &["fixture", "Holder"],
+                vec![named_copy_field("borrowed", borrowed)],
+            ),
+            opaque_type_decl(3, &["fixture", "user", "RefCell"]),
+        ],
+        vec![],
+    );
+    let adt = serde_json::json!({
+        "id": 0,
+        "generics": {"types": [vec_ty.clone()]}
+    });
+    let rendered = super::charon_adt_to_ast_string(
+        adt.as_object().unwrap(),
+        &llbc,
+        0,
+        &std::collections::HashSet::new(),
+    );
+    assert_eq!(
+        rendered, "cell::RefCell<Vec<i64>>",
+        "std RefCell TypeDecl render carries the cell module path"
+    );
+    let user = serde_json::json!({"id": 3, "generics": {"types": []}});
+    assert_eq!(
+        super::charon_adt_to_ast_string(
+            user.as_object().unwrap(),
+            &llbc,
+            0,
+            &std::collections::HashSet::new(),
+        ),
+        "RefCell",
+        "a user RefCell keeps the TypeDecl leaf"
+    );
+
+    let (_, _, fields, _, _, _, _, _) = super::derive_program_metadata(
+        &llbc,
+        &super::harvest_declared_gc_facts(&llbc).gc_struct_ids(),
+        super::no_immutable_fields(),
+        &std::collections::HashSet::new(),
+        &[],
+    );
+    let harvested = fields
+        .field_type("Holder", "borrowed")
+        .expect("Holder.borrowed harvested")
+        .to_string();
+    assert!(
+        harvested.contains("cell::RefCell<Vec<i64>>"),
+        "harvested reference field carries the std cell path, got {harvested}"
+    );
+
+    let bk = Rc::new(Bookkeeper::new());
+    bk.set_struct_fields(Rc::new(fields));
+    match bk.project_struct_field_type(&harvested) {
+        SomeValue::List(_) | SomeValue::RustVec(_) => {}
+        other => panic!("opaque std RefCell<Vec<i64>> field is the vec payload, got {other:?}"),
+    }
+}
+
+/// Same nominal `RefCell<Vec<i64>>`: a layout-present TypeDecl and an
+/// Opaque TypeDecl visible to lowering. Harvested intern rows of that
+/// identity are the layout (`bookkeeper.py` `Bookkeeper.getuniqueclassdef`);
+/// lowering and the bookkeeper share [`std_cell_layout_present`].
+#[test]
+fn std_cell_opaque_decl_and_layout_present_decl_share_one_representation() {
+    use crate::annotator::bookkeeper::Bookkeeper;
+    use crate::annotator::model::SomeValue;
+    use crate::front::std_identity::std_cell_layout_present;
+    use std::rc::Rc;
+
+    let i64 = i64_ty();
+    let vec_ty = named_adt(1, vec![i64.clone()]);
+    let refcell_ty = named_adt(0, vec![vec_ty.clone()]);
+    let layout_llbc = llbc_with_types(
+        "fixture",
+        vec![
+            type_decl_struct(
+                0,
+                &["core", "cell", "RefCell"],
+                vec![
+                    named_copy_field("borrow", i64.clone()),
+                    named_copy_field("value", vec_ty.clone()),
+                ],
+            ),
+            type_decl_struct(1, &["alloc", "vec", "Vec"], vec![]),
+        ],
+        vec![],
+    );
+    let opaque_llbc = llbc_with_types(
+        "fixture",
+        vec![
+            opaque_type_decl(0, &["core", "cell", "RefCell"]),
+            type_decl_struct(1, &["alloc", "vec", "Vec"], vec![]),
+        ],
+        vec![],
+    );
+    let layout_ty = TyRef::Other(refcell_ty.clone().into());
+    let opaque_ty = TyRef::Other(refcell_ty.into());
+    let tomb = no_tombstoned_leaves();
+    let gc = std::collections::HashSet::new();
+    let raw = std::collections::HashSet::new();
+
+    let mut fields = harvest_struct_fields(&layout_llbc);
+    super::register_std_cell_instantiation_rows(&layout_llbc, &mut fields, tomb);
+
+    let layout_root = tyref_std_cell_class_root(&layout_ty, &layout_llbc, tomb, Some(&fields))
+        .expect("layout-present TypeDecl is the cell class");
+    assert!(
+        layout_root.starts_with("cell::RefCell<") && layout_root.contains("Vec<i64>"),
+        "layout-present identity is cell::RefCell<Vec<i64>>, got {layout_root}"
+    );
+    let harvested_value_ty = fields.intern_field_rows(&layout_root).and_then(|rows| {
+        rows.iter()
+            .find(|row| row.name == "value")
+            .map(|row| row.ty.clone())
+    });
+    assert!(
+        harvested_value_ty
+            .as_deref()
+            .is_some_and(|ty| ty.contains("Vec")),
+        "harvested value row of {layout_root} is the vec payload, got {harvested_value_ty:?}"
+    );
+    assert!(
+        harvested_value_ty
+            .as_deref()
+            .is_some_and(|ty| !crate::front::std_identity::registry_ty_is_raw_ptr(ty)),
+        "harvested value row {harvested_value_ty:?} is T sitting in the struct (`rlist.py` ListRepr)"
+    );
+    assert!(
+        std_cell_layout_present(&layout_root, Some(&fields)),
+        "harvested rows of {layout_root} hold T inline; intern={:?}; keys={:?}",
+        fields.intern_field_rows(&layout_root).map(|rows| {
+            rows.iter()
+                .map(|row| {
+                    (
+                        row.name.as_str(),
+                        row.ty.as_str(),
+                        row.is_rustc_pointer_niche,
+                    )
+                })
+                .collect::<Vec<_>>()
+        }),
+        fields
+            .fields
+            .keys()
+            .filter(|k| k.contains("RefCell") || k.contains("Vec"))
+            .collect::<Vec<_>>(),
+    );
+
+    assert_eq!(
+        tyref_std_cell_class_root(&opaque_ty, &opaque_llbc, tomb, None),
+        None,
+        "this artefact's Opaque TypeDecl alone peels"
+    );
+    let opaque_root = tyref_std_cell_class_root(&opaque_ty, &opaque_llbc, tomb, Some(&fields))
+        .expect("Opaque TypeDecl plus harvested rows is the cell class");
+    assert_eq!(opaque_root, layout_root);
+
+    let (layout_value, layout_attr, layout_input) =
+        std_cell_value_attr_input(&layout_ty, &layout_llbc, &fields);
+    let (opaque_value, opaque_attr, opaque_input) =
+        std_cell_value_attr_input(&opaque_ty, &opaque_llbc, &fields);
+    let expected = ValueType::Ref(Some(layout_root.clone()));
+    assert_eq!(layout_value, expected);
+    assert_eq!(layout_attr, expected);
+    assert_eq!(layout_input.as_deref(), Some(layout_root.as_str()));
+    assert_eq!(opaque_value, expected);
+    assert_eq!(opaque_attr, expected);
+    assert_eq!(opaque_input.as_deref(), Some(layout_root.as_str()));
+    assert_eq!(
+        [
+            layout_value.clone(),
+            layout_attr.clone(),
+            ValueType::Ref(layout_input.clone()),
+            opaque_value.clone(),
+            opaque_attr.clone(),
+            ValueType::Ref(opaque_input.clone()),
+        ],
+        [
+            expected.clone(),
+            expected.clone(),
+            expected.clone(),
+            expected.clone(),
+            expected.clone(),
+            expected.clone(),
+        ],
+        "same registry: value/attr/Input of Opaque and layout-present decls are one representation"
+    );
+    assert_eq!(
+        tyref_std_cell_payload_value_type(&layout_ty, &layout_llbc, tomb, &gc, &raw, Some(&fields)),
+        tyref_std_cell_payload_value_type(&opaque_ty, &opaque_llbc, tomb, &gc, &raw, Some(&fields)),
+    );
+
+    let bk = Rc::new(Bookkeeper::new());
+    bk.set_struct_fields(Rc::new(fields.clone()));
+    match bk.project_struct_field_type(&layout_root) {
+        SomeValue::Instance(inst) => {
+            let name = inst
+                .classdef
+                .as_ref()
+                .expect("cell class intern's")
+                .borrow()
+                .name
+                .clone();
+            assert!(
+                name.contains("RefCell") && name.contains("Vec"),
+                "bookkeeper intern's the cell class, got {name}"
+            );
+        }
+        other => panic!("layout-present cell is the cell class, got {other:?}"),
+    }
+
+    let empty = crate::front::semantic::StructFieldRegistry::default();
+    assert_eq!(
+        tyref_std_cell_class_root(&opaque_ty, &opaque_llbc, tomb, None),
+        None,
+        "no artefact published rows: both sides peel"
+    );
+    let bk_empty = Rc::new(Bookkeeper::new());
+    bk_empty.set_struct_fields(Rc::new(empty));
+    match bk_empty.project_struct_field_type("cell::RefCell<Vec<i64>>") {
+        SomeValue::List(_) | SomeValue::RustVec(_) => {}
+        other => panic!("no harvested layout peels to the vec payload, got {other:?}"),
+    }
+}
+
+/// Opaque-decl `RefCell<T>` residual: [`dont_look_inside_return_class_root`]
+/// and [`foreign_opaque_method_result_valuetype`] intern the cell class
+/// when the registry holds the layout row (`signature.py`
+/// `annotationoftype` / `bookkeeper.py` `getuniqueclassdef`). Without
+/// those rows the residual stays classdef-less.
+#[test]
+fn opaque_refcell_residual_class_root_is_layout_present_cell_class() {
+    let i64 = i64_ty();
+    let vec_ty = named_adt(1, vec![i64.clone()]);
+    let refcell_ty = named_adt(0, vec![vec_ty.clone()]);
+    let layout_llbc = llbc_with_types(
+        "fixture",
+        vec![
+            type_decl_struct(
+                0,
+                &["core", "cell", "RefCell"],
+                vec![
+                    named_copy_field("borrow", i64.clone()),
+                    named_copy_field("value", vec_ty.clone()),
+                ],
+            ),
+            type_decl_struct(1, &["alloc", "vec", "Vec"], vec![]),
+        ],
+        vec![],
+    );
+    let impl_seg = serde_json::json!({"Impl": {"Ty": {
+        "skip_binder": {"Value": [0, refcell_ty.clone()]},
+        "kind": "InherentImplBlock"
+    }}});
+    let cell_new = serde_json::json!({
+        "def_id": 0,
+        "item_meta": {
+            "name": [
+                {"Ident": ["core", 0]},
+                {"Ident": ["cell", 0]},
+                impl_seg,
+                {"Ident": ["new", 0]}
+            ],
+            "span": window_span(),
+            "source_text": null,
+            "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+            "is_local": false
+        },
+        "signature": {
+            "is_unsafe": false,
+            "inputs": [],
+            "output": refcell_ty.clone()
+        },
+        "body": "Opaque"
+    });
+    let opaque_llbc = llbc_with_types(
+        "fixture",
+        vec![
+            opaque_type_decl(0, &["core", "cell", "RefCell"]),
+            type_decl_struct(1, &["alloc", "vec", "Vec"], vec![]),
+        ],
+        vec![cell_new],
+    );
+    let opaque_ty = TyRef::Other(refcell_ty.into());
+    let tomb = no_tombstoned_leaves();
+    let gc = std::collections::HashSet::new();
+    let raw = std::collections::HashSet::new();
+    let carrier = crate::ErrorCarrierSpec::default();
+
+    let mut fields = harvest_struct_fields(&layout_llbc);
+    super::register_std_cell_instantiation_rows(&layout_llbc, &mut fields, tomb);
+    let cell_root = tyref_std_cell_class_root(&opaque_ty, &opaque_llbc, tomb, Some(&fields))
+        .expect("Opaque TypeDecl plus harvested rows is the cell class");
+
+    assert_eq!(
+        super::dont_look_inside_return_class_root(
+            &opaque_ty,
+            &opaque_llbc,
+            carrier,
+            tomb,
+            &gc,
+            &raw,
+            Some(&fields),
+        )
+        .as_deref(),
+        Some(cell_root.as_str()),
+        "residual class root of Opaque RefCell with layout rows is the cell class"
+    );
+    assert_eq!(
+        super::dont_look_inside_return_class_root(
+            &opaque_ty,
+            &opaque_llbc,
+            carrier,
+            tomb,
+            &gc,
+            &raw,
+            None,
+        ),
+        None,
+        "no harvested layout: residual class root of Opaque RefCell is classdef-less"
+    );
+
+    assert_eq!(
+        super::foreign_opaque_method_result_valuetype(&opaque_ty, &opaque_llbc, Some(&fields)),
+        Some(ValueType::Ref(Some(cell_root.clone()))),
+        "foreign-opaque residual of layout-present RefCell keeps the cell class"
+    );
+
+    let harvested = super::collect_foreign_opaque_method_externals(&opaque_llbc, Some(&fields));
+    let row = harvested
+        .iter()
+        .find(|(segments, _, _)| segments.last().map(String::as_str) == Some("new"));
+    let Some((_, _, result_ty)) = row else {
+        panic!("RefCell::new must be harvested, got {harvested:?}");
+    };
+    assert_eq!(
+        result_ty,
+        &ValueType::Ref(Some(cell_root.clone())),
+        "registered SomeInstance of layout-present RefCell is the cell class"
+    );
+}
+
+/// `Ref<'_, RefCell<Payload>>` as the only occurrence of that cell
+/// instantiation still publishes `cell::RefCell<Payload>`
+/// (`classdesc.py` `ClassDesc.getuniqueclassdef`).
+#[test]
+fn register_std_cell_instantiation_rows_walks_ref_of_refcell_input() {
+    let payload_ty = named_adt(1, vec![]);
+    let refcell_ty = named_adt(0, vec![payload_ty.clone()]);
+    let cell_ref_ty = named_adt(2, vec![refcell_ty.clone()]);
+    let nonnull_ty = named_adt(3, vec![payload_ty.clone()]);
+    let llbc = llbc_with_types(
+        "fixture",
+        vec![
+            type_decl_struct(
+                0,
+                &["core", "cell", "RefCell"],
+                vec![
+                    named_copy_field("borrow", i64_ty()),
+                    named_copy_field("value", payload_ty.clone()),
+                ],
+            ),
+            type_decl_struct(
+                1,
+                &["fixture", "Payload"],
+                vec![named_copy_field("x", i64_ty())],
+            ),
+            type_decl_struct(
+                2,
+                &["core", "cell", "Ref"],
+                vec![
+                    named_copy_field("value", nonnull_ty),
+                    named_copy_field("borrow", i64_ty()),
+                ],
+            ),
+            opaque_type_decl(3, &["core", "ptr", "non_null", "NonNull"]),
+        ],
+        vec![window_opaque_fun(
+            0,
+            &["fixture", "takes_ref_of_cell"],
+            vec![cell_ref_ty.clone()],
+            i64_ty(),
+        )],
+    );
+    let input = TyRef::Other(cell_ref_ty.into());
+    let tomb = no_tombstoned_leaves();
+    let mut fields = harvest_struct_fields(&llbc);
+    let requested = super::tyref_input_class_root(&input, &llbc, tomb, Some(&fields))
+        .expect("Ref<RefCell<Payload>> Input names the cell class");
+    assert!(
+        requested.starts_with("cell::RefCell<") && requested.contains("Payload"),
+        "input class_root is the nested cell, got {requested}"
+    );
+    assert_eq!(
+        super::tyref_std_cell_class_root(&input, &llbc, tomb, Some(&fields)),
+        None,
+        "the outer Ref is not itself a layout-present cell"
+    );
+    assert!(
+        !fields.fields.contains_key(&requested),
+        "harvest of whole signature types must not already hold {requested}"
+    );
+    super::register_std_cell_instantiation_rows(&llbc, &mut fields, tomb);
+    assert!(
+        fields.fields.contains_key(&requested),
+        "nested Ref<RefCell<Payload>> must register {requested}; keys={:?}",
+        fields
+            .fields
+            .keys()
+            .filter(|k| k.contains("RefCell"))
+            .collect::<Vec<_>>()
+    );
+}
+
+/// Duplicate `Payload` leaves paint the payload with the real tombstone
+/// set; registration after that set is final uses the same key lowering
+/// requests (`bookkeeper.py` `Bookkeeper.getuniqueclassdef`).
+#[test]
+fn register_std_cell_instantiation_keys_match_lowering_after_duplicate_payload_leaf() {
+    let payload_a = named_adt(1, vec![]);
+    let refcell_ty = named_adt(0, vec![payload_a.clone()]);
+    let llbc = llbc_with_types(
+        "fixture",
+        vec![
+            type_decl_struct(
+                0,
+                &["core", "cell", "RefCell"],
+                vec![
+                    named_copy_field("borrow", i64_ty()),
+                    named_copy_field("value", payload_a.clone()),
+                ],
+            ),
+            type_decl_struct(
+                1,
+                &["fixture", "mod_a", "Payload"],
+                vec![named_copy_field("x", i64_ty())],
+            ),
+            type_decl_struct(
+                2,
+                &["fixture", "mod_b", "Payload"],
+                vec![named_copy_field("y", i64_ty())],
+            ),
+        ],
+        vec![window_opaque_fun(
+            0,
+            &["fixture", "takes_cell"],
+            vec![refcell_ty.clone()],
+            i64_ty(),
+        )],
+    );
+    let cell = TyRef::Other(refcell_ty.into());
+    let tomb = super::tombstoned_leaves_of(&llbc);
+    assert!(
+        tomb.contains("Payload"),
+        "two Payload declarations withdraw the leaf; tomb={tomb:?}"
+    );
+    let ctx = crate::front::mir::LowerContext::new(&llbc);
+    let reg = ctx.struct_field_registry();
+    let requested = super::tyref_input_class_root(&cell, &llbc, tomb, Some(&reg))
+        .expect("layout-present RefCell Input names the cell class");
+    let value_root = super::tyref_std_cell_class_root(&cell, &llbc, tomb, Some(&reg))
+        .expect("layout-present RefCell is a cell class");
+    assert_eq!(requested, value_root);
+    let early = super::tyref_std_cell_class_root(&cell, &llbc, no_tombstoned_leaves(), Some(&reg))
+        .expect("empty-tombstone cell root");
+    assert_ne!(
+        early, requested,
+        "duplicate payload leaf must change the instantiation key"
+    );
+    assert!(
+        requested.starts_with("cell::RefCell<") && requested.contains("mod_a::Payload"),
+        "lowering key qualifies the payload, got {requested}"
+    );
+    assert!(
+        reg.fields.contains_key(&requested),
+        "registered key must equal the lowering root {requested}; keys={:?}",
+        reg.fields
+            .keys()
+            .filter(|k| k.contains("RefCell"))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        !reg.fields.contains_key(&early),
+        "empty-tombstone key {early} must not remain after disambiguation"
+    );
+}
+
+/// `RefCell::borrow` dest is `Ref<Vec<_>>`. The FieldRead of inline
+/// `value` is the Vec; the dest must not recast onto `cell::Ref<…>`.
+#[test]
+fn std_cell_borrow_dest_ref_does_not_recast_onto_the_guard() {
+    use crate::annotator::annrpython::RPythonAnnotator;
+    use crate::annotator::model::SomeValue;
+    use crate::translator::rtyper::call_registry::CallRegistry;
+    use crate::translator::rtyper::flowspace_adapter::{
+        derive_subject_inputcells, function_graph_to_flowspace,
+    };
+    use std::rc::Rc;
+
+    let host_adt = named_adt(2, vec![]);
+    let host_ptr = serde_json::json!({"RawPtr": [host_adt, "Mut"]});
+    let vec_ty = named_adt(1, vec![host_ptr]);
+    let refcell_ty = named_adt(0, vec![vec_ty.clone()]);
+    let ref_adt = named_adt(4, vec![vec_ty.clone()]);
+    let nonnull_ty = named_adt(3, vec![vec_ty.clone()]);
+    let refcell_ref = serde_json::json!({"Ref": ["Erased", refcell_ty.clone(), "Shared"]});
+    let (unwind, ret) = window_unwind_and_return_blocks();
+
+    let refcell_decl = type_decl_struct(
+        0,
+        &["core", "cell", "RefCell"],
+        vec![
+            serde_json::json!({
+                "name": "borrow",
+                "ty": i64_ty(),
+                "attr_info": null
+            }),
+            serde_json::json!({
+                "name": "value",
+                "ty": vec_ty.clone(),
+                "attr_info": null
+            }),
+        ],
+    );
+    let vec_decl = type_decl_struct(1, &["alloc", "vec", "Vec"], vec![]);
+    let host_decl = type_decl_struct(2, &["fixture", "Host"], vec![]);
+    let nonnull_decl = opaque_type_decl(3, &["core", "ptr", "non_null", "NonNull"]);
+    let ref_decl = type_decl_struct(
+        4,
+        &["core", "cell", "Ref"],
+        vec![
+            serde_json::json!({
+                "name": "value",
+                "ty": nonnull_ty,
+                "attr_info": null
+            }),
+            serde_json::json!({
+                "name": "borrow",
+                "ty": i64_ty(),
+                "attr_info": null
+            }),
+        ],
+    );
+    let borrow = window_opaque_fun(
+        1,
+        &["core", "cell", "RefCell", "borrow"],
+        vec![refcell_ref.clone()],
+        ref_adt.clone(),
+    );
+    let deref = window_opaque_fun(
+        2,
+        &["core", "cell", "Ref", "deref"],
+        vec![ref_adt.clone()],
+        vec_ty.clone(),
+    );
+    let caller = serde_json::json!({
+        "def_id": 0,
+        "item_meta": window_meta(&["fixture", "arg_borrow_deref"], true),
+        "signature": {
+            "is_unsafe": false,
+            "inputs": [refcell_ref.clone()],
+            "output": vec_ty.clone()
+        },
+        "body": {"Unstructured": {
+            "span": window_span(),
+            "locals": {"arg_count": 1, "locals": [
+                window_local(0, &vec_ty),
+                window_local(1, &refcell_ref),
+                window_local(2, &ref_adt)
+            ]},
+            "body": [
+                {
+                    "statements": [],
+                    "kind": "Regular",
+                    "terminator": {"span": window_span(), "kind": {"Call": {"call": {
+                        "func": {"Regular": {
+                            "kind": {"Fun": 1},
+                            "generics": window_empty_generics()
+                        }},
+                        "args": [{"Read": window_place(serde_json::json!({"Local": 1}), &refcell_ref)}]
+                    }, "dest": window_place(serde_json::json!({"Local": 2}), &ref_adt),
+                        "target": 2, "on_unwind": 1}}}
+                },
+                unwind,
+                {
+                    "statements": [],
+                    "kind": "Regular",
+                    "terminator": {"span": window_span(), "kind": {"Call": {"call": {
+                        "func": {"Regular": {
+                            "kind": {"Fun": 2},
+                            "generics": window_empty_generics()
+                        }},
+                        "args": [{"Read": window_place(serde_json::json!({"Local": 2}), &ref_adt)}]
+                    }, "dest": window_place(serde_json::json!({"Local": 0}), &vec_ty),
+                        "target": 3, "on_unwind": 1}}}
+                },
+                ret
+            ]
+        }}
+    });
+
+    let llbc = window_llbc(
+        vec![refcell_decl, vec_decl, host_decl, nonnull_decl, ref_decl],
+        vec![caller, borrow, deref],
+    );
+    let harvested = Rc::new(crate::front::mir::LowerContext::new(&llbc).struct_field_registry());
+    let graph = crate::front::mir::lower_function(&llbc, "arg_borrow_deref")
+        .unwrap_or_else(|e| panic!("lower arg_borrow_deref: {e:?}"));
+    assert!(
+        graph_ops(&graph).iter().any(|op| {
+            matches!(
+                &op.kind,
+                OpKind::FieldRead { field, .. } if field.name == "value"
+            )
+        }),
+        "borrow must FieldRead value; graph={}",
+        graph.dump()
+    );
+    let cast_roots: Vec<&str> = graph_ops(&graph)
+        .iter()
+        .filter_map(|op| crate::model::cast_instance_root(&op.kind))
+        .collect();
+    assert!(
+        !cast_roots
+            .iter()
+            .any(|root| root.starts_with("cell::Ref<") || root.contains("::Ref<")),
+        "borrow dest must not recast onto the Ref guard; roots={cast_roots:?}; graph={}",
+        graph.dump()
+    );
+
+    let ann = RPythonAnnotator::new(None, None, None, false);
+    ann.bookkeeper.set_struct_fields(harvested);
+    let registry = CallRegistry::new(ann.bookkeeper.clone());
+    let lifted = function_graph_to_flowspace(&graph, &registry)
+        .unwrap_or_else(|e| panic!("lift arg_borrow_deref: {e:?}"));
+    crate::translator::simplify::simplify_graph(&lifted.graph.borrow(), None);
+    let cells = derive_subject_inputcells(&graph, Some(&ann.bookkeeper))
+        .unwrap_or_else(|e| panic!("arg_borrow_deref inputcells: {e:?}"));
+    assert!(
+        cells.iter().any(|cell| matches!(cell, SomeValue::Instance(inst) if inst.classdef.as_ref().is_some_and(|cd| {
+            let name = cd.borrow().name.clone();
+            name.starts_with("cell::RefCell<") && name.contains("Vec<")
+        }))),
+        "arg_borrow_deref Input must intern the cell class; cells={cells:?}"
+    );
+    let start = lifted.graph.borrow().startblock.clone();
+    let opt_cells: Vec<Option<SomeValue>> = cells.into_iter().map(Some).collect();
+    ann.addpendingblock(&lifted.graph, &start, &opt_cells);
+    ann.complete_pending_blocks()
+        .unwrap_or_else(|e| panic!("arg_borrow_deref annotate: {e}"));
 }
 
 #[test]
@@ -2223,13 +3393,13 @@ fn type_alias_of_fn_ptr_peels_to_functype() {
         ),
         "TypeDeclKind::Alias {{aliased_ty: FnPtr}} is a function pointer"
     );
-    let ft = super::func_type_from_fn_ptr_ty(&ty, &llbc, crate::ErrorCarrierSpec::default())
+    let ft = super::func_type_from_fn_ptr_ty(&ty, &llbc, crate::ErrorCarrierSpec::default(), None)
         .expect("alias FnPtr lowers to FuncType");
     assert_eq!(ft.args, vec![OBJECTPTR.clone()]);
     assert_eq!(ft.result, *OBJECTPTR);
 
     let var = crate::flowspace::model::Variable::named("hook");
-    super::stamp_fn_ptr(&var, &ty, &llbc, crate::ErrorCarrierSpec::default());
+    super::stamp_fn_ptr(&var, &ty, &llbc, crate::ErrorCarrierSpec::default(), None);
     let ct = var.concretetype().expect("dest stamped");
     let crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Ptr(ptr_ty) = ct else {
         panic!("stamp must be Ptr, got {ct:?}");
@@ -2269,18 +3439,20 @@ fn fn_ptr_str_family_pointer_is_strptr_not_objectptr() {
         )
     };
     let spec = crate::ErrorCarrierSpec::default();
-    let str_ft = super::func_type_from_fn_ptr_ty(&fnptr(0), &llbc, spec).expect("Utf8Str fn-ptr");
+    let str_ft =
+        super::func_type_from_fn_ptr_ty(&fnptr(0), &llbc, spec, None).expect("Utf8Str fn-ptr");
     assert_eq!(
         str_ft.args,
         vec![STRPTR.clone()],
         "FUNC.ARGS of *const unicodeobject::Utf8Str is STRPTR; ast={}",
         super::tyref_to_ast_string(&TyRef::Other(raw(0).into()), &llbc)
     );
-    let inst_ft = super::func_type_from_fn_ptr_ty(&fnptr(1), &llbc, spec).expect("Inst fn-ptr");
+    let inst_ft =
+        super::func_type_from_fn_ptr_ty(&fnptr(1), &llbc, spec, None).expect("Inst fn-ptr");
     assert_eq!(inst_ft.args, vec![OBJECTPTR.clone()]);
     let other_ty = TyRef::Other(raw(2).into());
-    let other_ft =
-        super::func_type_from_fn_ptr_ty(&fnptr(2), &llbc, spec).expect("other::Utf8Str fn-ptr");
+    let other_ft = super::func_type_from_fn_ptr_ty(&fnptr(2), &llbc, spec, None)
+        .expect("other::Utf8Str fn-ptr");
     assert!(
         !super::tyref_raw_ptr_pointee_is_string_value(&other_ty, &llbc),
         "other::Utf8Str is not the STR layout; intern ast={}",
@@ -2292,7 +3464,7 @@ fn fn_ptr_str_family_pointer_is_strptr_not_objectptr() {
         "other::Utf8Str is not the STR layout; intern ast={}",
         super::tyref_to_ast_string(&other_ty, &llbc)
     );
-    let str_ty = super::fn_ptr_tyref_to_lltype(&TyRef::Other(raw(0).into()), &llbc, spec);
+    let str_ty = super::fn_ptr_tyref_to_lltype(&TyRef::Other(raw(0).into()), &llbc, spec, None);
     assert_eq!(str_ty, *STRPTR);
 }
 
@@ -2415,6 +3587,7 @@ fn interned_c_void_ptr_dest_is_voidp() {
             &no_tombstoned_leaves(),
             &std::collections::HashSet::new(),
             &std::collections::HashSet::new(),
+            None,
         ),
         ValueType::Int,
         "Result Ok *mut c_void is VOIDP int-bank, not GCREF"
@@ -2517,7 +3690,7 @@ fn fn_ptr_ty_keeps_gcref_result() {
         })
         .into(),
     );
-    let ft = super::func_type_from_fn_ptr_ty(&ty, &llbc, crate::ErrorCarrierSpec::default())
+    let ft = super::func_type_from_fn_ptr_ty(&ty, &llbc, crate::ErrorCarrierSpec::default(), None)
         .expect("hook FnPtr lowers");
     assert_eq!(ft.args.len(), 4);
     assert_eq!(ft.args[0], LowLevelType::Unsigned);
@@ -2548,9 +3721,13 @@ fn fn_ptr_ty_keeps_gcref_result() {
         })
         .into(),
     );
-    let ft_opaque =
-        super::func_type_from_fn_ptr_ty(&opaque_out, &llbc, crate::ErrorCarrierSpec::default())
-            .expect("GCREFOpaque result FnPtr lowers");
+    let ft_opaque = super::func_type_from_fn_ptr_ty(
+        &opaque_out,
+        &llbc,
+        crate::ErrorCarrierSpec::default(),
+        None,
+    )
+    .expect("GCREFOpaque result FnPtr lowers");
     assert_eq!(
         ft_opaque.result, *GCREF,
         "bare GCREFOpaque FUNC.RESULT is GCREF"
@@ -2593,9 +3770,13 @@ fn fn_ptr_ty_keeps_gcref_result() {
         })
         .into(),
     );
-    let ft_gcref =
-        super::func_type_from_fn_ptr_ty(&ty_gcref, &llbc_gcref, crate::ErrorCarrierSpec::default())
-            .expect("GcRef hook FnPtr lowers");
+    let ft_gcref = super::func_type_from_fn_ptr_ty(
+        &ty_gcref,
+        &llbc_gcref,
+        crate::ErrorCarrierSpec::default(),
+        None,
+    )
+    .expect("GcRef hook FnPtr lowers");
     assert_eq!(ft_gcref.args.len(), 4);
     assert_eq!(
         ft_gcref.args[2], *GCREF,
@@ -2699,7 +3880,7 @@ fn a_tuple_param_names_the_shape_its_reads_name() {
     // class_root must keep the shaped name so `call_once` args
     // seed `SomeTuple` (`rtuple.py` `TupleRepr`).
     assert_eq!(
-        tyref_ref_param_class_root(&by_value, &llbc, no_tombstoned_leaves(), None),
+        tyref_ref_param_class_root(&by_value, &llbc, no_tombstoned_leaves(), None, None),
         Some(owner)
     );
 
@@ -2793,7 +3974,7 @@ fn a_tuple_param_names_the_shape_its_reads_name() {
         "shaped root must name the fn payload: {shaped}"
     );
     assert_eq!(
-        tyref_ref_param_class_root(&tupled, &fn_llbc, no_tombstoned_leaves(), None),
+        tyref_ref_param_class_root(&tupled, &fn_llbc, no_tombstoned_leaves(), None, None),
         Some(shaped.clone())
     );
     let empty_gc: std::collections::HashSet<majit_ir::descr::StructId> =
@@ -2805,6 +3986,7 @@ fn a_tuple_param_names_the_shape_its_reads_name() {
             crate::ErrorCarrierSpec::default(),
             &empty_gc,
             &std::collections::HashSet::<String>::new(),
+            None,
         )
         .as_deref(),
         Some("Tuple<i64,bool>"),
@@ -3014,6 +4196,7 @@ fn flavor_raw_struct_borrow_is_int_banked_with_class_root() {
         super::no_tombstoned_leaves(),
         &empty_gc,
         &harvested,
+        None,
     );
     assert!(
         matches!(
@@ -3028,6 +4211,7 @@ fn flavor_raw_struct_borrow_is_int_banked_with_class_root() {
         super::no_tombstoned_leaves(),
         &empty_gc,
         &empty,
+        None,
     );
     assert!(
         matches!(empty_vt, ValueType::Ref(_)),
@@ -3054,6 +4238,7 @@ fn flavor_raw_struct_borrow_is_int_banked_with_class_root() {
         spec,
         &empty_gc,
         &harvested,
+        None,
     );
     assert!(
         harvested_token
@@ -3068,6 +4253,7 @@ fn flavor_raw_struct_borrow_is_int_banked_with_class_root() {
             spec,
             &empty_gc,
             &empty,
+            None,
         )
         .as_deref(),
         Some("ref"),
@@ -3409,6 +4595,7 @@ fn flavor_raw_generic_named_arg_keeps_unsuffixed_class_root() {
         super::no_tombstoned_leaves(),
         &empty_gc,
         &harvested,
+        None,
     );
     match vt {
         ValueType::Ref(Some(root)) => {
@@ -3738,7 +4925,13 @@ fn range_inclusive_self_after_subst_paints_instantiation_class() {
             .expect("substituted start_bound body");
     let self_ty = &copied.locals.locals[1].ty;
     assert_eq!(
-        super::tyref_ref_param_class_root(self_ty, &llbc, super::no_tombstoned_leaves(), None),
+        super::tyref_ref_param_class_root(
+            self_ty,
+            &llbc,
+            super::no_tombstoned_leaves(),
+            None,
+            None
+        ),
         Some("ops::range::RangeInclusive<i64>".to_string())
     );
 }
@@ -5098,7 +6291,8 @@ fn tombstoned_duplicate_leaf_paints_the_declaration_path() {
             &llbc,
             &tombstoned,
             &super::harvest_declared_gc_facts(&llbc).gc_struct_ids(),
-            &std::collections::HashSet::<String>::new()
+            &std::collections::HashSet::<String>::new(),
+            None
         ),
         ValueType::Ref(Some("module::struct::Code".to_string()))
     );
@@ -5243,6 +6437,7 @@ fn colliding_arguments_paints_crate_relative_identity() {
             &tombstoned,
             &std::collections::HashSet::new(),
             &std::collections::HashSet::new(),
+            None,
         )
         .as_deref(),
         Some("argument::Arguments"),
@@ -5256,6 +6451,7 @@ fn colliding_arguments_paints_crate_relative_identity() {
             &tombstoned,
             &std::collections::HashSet::new(),
             &std::collections::HashSet::new(),
+            None,
         )
         .as_deref(),
         Some("pyobject::PyObject"),
@@ -6457,7 +7653,8 @@ fn field_layout_keeps_reference_repr_instead_of_embedding_the_referent() {
             &shared,
             &llbc,
             &gc_struct_ids,
-            &std::collections::HashSet::<String>::new()
+            &std::collections::HashSet::<String>::new(),
+            None
         ),
         "&i64"
     );
@@ -6466,7 +7663,8 @@ fn field_layout_keeps_reference_repr_instead_of_embedding_the_referent() {
             &mutable,
             &llbc,
             &gc_struct_ids,
-            &std::collections::HashSet::<String>::new()
+            &std::collections::HashSet::<String>::new(),
+            None
         ),
         "&mut i64"
     );
@@ -6579,20 +7777,20 @@ fn enum_payload_of_ref_to_raw_storage_is_int() {
         "a borrowed raw struct parameter stays a reference"
     );
     assert_eq!(
-        tyref_enum_payload_value_type(&mut_ref, &llbc, tomb, &gc, &flavors),
+        tyref_enum_payload_value_type(&mut_ref, &llbc, tomb, &gc, &flavors, None),
         ValueType::Int,
         "Result Ok / Option Some of &mut Raw is the interior pointer word"
     );
     assert_eq!(
         adt_field_read_value_type(
-            &mut_ref, &mut_ref, true, false, None, &llbc, tomb, &gc, &flavors
+            &mut_ref, &mut_ref, true, false, None, &llbc, tomb, &gc, &flavors, None
         ),
         ValueType::Int,
         "enum payload FieldRead of &mut Raw follows intern ROW Int"
     );
     assert_eq!(
         adt_field_read_value_type(
-            &mut_ref, &mut_ref, false, true, None, &llbc, tomb, &gc, &flavors
+            &mut_ref, &mut_ref, false, true, None, &llbc, tomb, &gc, &flavors, None
         ),
         ValueType::Int,
         "closure-env capture of &mut Raw is the interior pointer word"
@@ -7463,6 +8661,7 @@ fn window_classifier_predicates() {
             &tomb,
             &gc,
             &std::collections::HashSet::<String>::new(),
+            None,
         ),
         ValueType::Str
     ));
@@ -7494,6 +8693,7 @@ fn window_classifier_predicates() {
             &tomb,
             &gc,
             &std::collections::HashSet::<String>::new(),
+            None,
         ),
         ValueType::Str
     ));
@@ -7618,7 +8818,7 @@ fn field_row_struct_identity_qualifies_array_of_adt_element() {
     );
     let gc = std::collections::HashSet::<majit_ir::descr::StructId>::new();
     let raw = std::collections::HashSet::<String>::new();
-    let layout = super::tyref_to_field_layout_string(&array_ty, &llbc, &gc, &raw);
+    let layout = super::tyref_to_field_layout_string(&array_ty, &llbc, &gc, &raw, None);
     assert_eq!(layout, "[Entry<??TypeVar#0,??TypeVar#1>;0]");
     assert_eq!(
         super::field_row_struct_identity(&array_ty, &llbc, &layout).as_deref(),
@@ -7639,7 +8839,7 @@ fn field_row_struct_identity_qualifies_array_of_adt_element() {
         })
         .into(),
     );
-    let primitive_layout = super::tyref_to_field_layout_string(&primitive, &llbc, &gc, &raw);
+    let primitive_layout = super::tyref_to_field_layout_string(&primitive, &llbc, &gc, &raw, None);
     assert_eq!(primitive_layout, "[i64;0]");
     assert_eq!(
         super::field_row_struct_identity(&primitive, &llbc, &primitive_layout),
@@ -7715,7 +8915,7 @@ fn field_row_struct_identity_qualifies_slice_element_behind_box_and_unsafecell()
     );
     let gc = std::collections::HashSet::<majit_ir::descr::StructId>::new();
     let raw = std::collections::HashSet::<String>::new();
-    let cell_layout = super::tyref_to_field_layout_string(&cell_ty, &llbc, &gc, &raw);
+    let cell_layout = super::tyref_to_field_layout_string(&cell_ty, &llbc, &gc, &raw, None);
     assert_eq!(cell_layout, "UnsafeCell<Box<[CopyInstrWord]>>");
     assert_eq!(
         super::field_row_struct_identity(&cell_ty, &llbc, &cell_layout).as_deref(),
@@ -7723,7 +8923,7 @@ fn field_row_struct_identity_qualifies_slice_element_behind_box_and_unsafecell()
     );
 
     let slice_ty = TyRef::Other(serde_json::json!({"Slice": [word.clone(), null]}).into());
-    let slice_layout = super::tyref_to_field_layout_string(&slice_ty, &llbc, &gc, &raw);
+    let slice_layout = super::tyref_to_field_layout_string(&slice_ty, &llbc, &gc, &raw, None);
     assert_eq!(slice_layout, "[CopyInstrWord]");
     assert_eq!(
         super::field_row_struct_identity(&slice_ty, &llbc, &slice_layout).as_deref(),
@@ -7745,7 +8945,7 @@ fn field_row_struct_identity_qualifies_slice_element_behind_box_and_unsafecell()
         })
         .into(),
     );
-    let box_layout = super::tyref_to_field_layout_string(&box_ty, &llbc, &gc, &raw);
+    let box_layout = super::tyref_to_field_layout_string(&box_ty, &llbc, &gc, &raw, None);
     assert_eq!(box_layout, "Box<[CopyInstrWord]>");
     assert_eq!(
         super::field_row_struct_identity(&box_ty, &llbc, &box_layout).as_deref(),
@@ -7754,7 +8954,7 @@ fn field_row_struct_identity_qualifies_slice_element_behind_box_and_unsafecell()
 
     let i64_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}});
     let primitive = TyRef::Other(serde_json::json!({"Slice": [i64_ty, null]}).into());
-    let primitive_layout = super::tyref_to_field_layout_string(&primitive, &llbc, &gc, &raw);
+    let primitive_layout = super::tyref_to_field_layout_string(&primitive, &llbc, &gc, &raw, None);
     assert_eq!(primitive_layout, "[i64]");
     assert_eq!(
         super::field_row_struct_identity(&primitive, &llbc, &primitive_layout),
@@ -7832,7 +9032,7 @@ fn field_row_struct_identity_keeps_slice_of_gc_pointer_struct() {
     );
     let gc = std::collections::HashSet::<majit_ir::descr::StructId>::new();
     let raw = std::collections::HashSet::<String>::new();
-    let cell_layout = super::tyref_to_field_layout_string(&cell_ty, &llbc, &gc, &raw);
+    let cell_layout = super::tyref_to_field_layout_string(&cell_ty, &llbc, &gc, &raw, None);
     assert_eq!(
         cell_layout,
         "UnsafeCell<Box<[Entry<??TypeVar#0,??TypeVar#1>]>>"
@@ -7879,7 +9079,7 @@ fn field_row_struct_identity_qualifies_raw_ptr_pointee() {
         })
         .into(),
     );
-    let const_layout = super::tyref_to_field_layout_string(&const_ty, &llbc, &gc, &raw);
+    let const_layout = super::tyref_to_field_layout_string(&const_ty, &llbc, &gc, &raw, None);
     assert_eq!(const_layout, "*const Layout");
     assert_eq!(
         super::field_row_struct_identity(&const_ty, &llbc, &const_layout).as_deref(),
@@ -7892,7 +9092,7 @@ fn field_row_struct_identity_qualifies_raw_ptr_pointee() {
         })
         .into(),
     );
-    let mut_layout = super::tyref_to_field_layout_string(&mut_ty, &llbc, &gc, &raw);
+    let mut_layout = super::tyref_to_field_layout_string(&mut_ty, &llbc, &gc, &raw, None);
     assert_eq!(mut_layout, "*mut Layout");
     assert_eq!(
         super::field_row_struct_identity(&mut_ty, &llbc, &mut_layout).as_deref(),
@@ -7905,7 +9105,7 @@ fn field_row_struct_identity_qualifies_raw_ptr_pointee() {
         })
         .into(),
     );
-    let unique_layout = super::tyref_to_field_layout_string(&unique_ty, &llbc, &gc, &raw);
+    let unique_layout = super::tyref_to_field_layout_string(&unique_ty, &llbc, &gc, &raw, None);
     assert_eq!(unique_layout, "*const Code");
     assert_eq!(
         super::field_row_struct_identity(&unique_ty, &llbc, &unique_layout).as_deref(),
@@ -7918,7 +9118,7 @@ fn field_row_struct_identity_qualifies_raw_ptr_pointee() {
         })
         .into(),
     );
-    let nested_layout = super::tyref_to_field_layout_string(&nested_ty, &llbc, &gc, &raw);
+    let nested_layout = super::tyref_to_field_layout_string(&nested_ty, &llbc, &gc, &raw, None);
     assert_eq!(nested_layout, "*const *const Layout");
     assert_eq!(
         super::field_row_struct_identity(&nested_ty, &llbc, &nested_layout).as_deref(),
@@ -7931,7 +9131,7 @@ fn field_row_struct_identity_qualifies_raw_ptr_pointee() {
         })
         .into(),
     );
-    let opaque_layout = super::tyref_to_field_layout_string(&opaque_ty, &llbc, &gc, &raw);
+    let opaque_layout = super::tyref_to_field_layout_string(&opaque_ty, &llbc, &gc, &raw, None);
     assert_eq!(opaque_layout, "*mut Layout");
     assert_eq!(
         super::field_row_struct_identity(&opaque_ty, &llbc, &opaque_layout),
@@ -7946,7 +9146,7 @@ fn field_row_struct_identity_qualifies_raw_ptr_pointee() {
         })
         .into(),
     );
-    let primitive_layout = super::tyref_to_field_layout_string(&primitive, &llbc, &gc, &raw);
+    let primitive_layout = super::tyref_to_field_layout_string(&primitive, &llbc, &gc, &raw, None);
     assert_eq!(primitive_layout, "*const i64");
     assert_eq!(
         super::field_row_struct_identity(&primitive, &llbc, &primitive_layout),
@@ -10961,7 +12161,7 @@ fn foreign_payload_enum_associated_fn_is_harvested_as_function_path() {
     // class root so the residual intern's a ClassDef, not a
     // classdef-less `SomeInstance`.
     let llbc = gc_alloc_outcome_from_hook_fixture();
-    let harvested = super::collect_foreign_opaque_method_externals(&llbc);
+    let harvested = super::collect_foreign_opaque_method_externals(&llbc, None);
     let row = harvested.iter().find(|(segments, _, _)| {
         segments == &["GcAllocOutcome".to_string(), "from_hook".to_string()]
     });
@@ -11065,7 +12265,7 @@ fn string_new_opaque_fixture() -> Llbc {
 #[test]
 fn foreign_opaque_string_new_keeps_str_family_root() {
     let llbc = string_new_opaque_fixture();
-    let harvested = super::collect_foreign_opaque_method_externals(&llbc);
+    let harvested = super::collect_foreign_opaque_method_externals(&llbc, None);
     let row = harvested.iter().find(|(segments, _, _)| {
         segments.last().map(String::as_str) == Some("new")
             && segments.iter().any(|s| s == "String" || s == "string")
@@ -11168,7 +12368,7 @@ fn opaque_associated_constructor_fixture() -> Llbc {
 #[test]
 fn foreign_opaque_associated_constructor_is_harvested() {
     let llbc = opaque_associated_constructor_fixture();
-    let harvested = super::collect_foreign_opaque_method_externals(&llbc);
+    let harvested = super::collect_foreign_opaque_method_externals(&llbc, None);
     let row = harvested.iter().find(|(segments, _, _)| {
         segments.last().map(String::as_str) == Some("new") && segments.iter().any(|s| s == "Mutex")
     });
@@ -11317,7 +12517,7 @@ fn hashmap_get_mut_option_mut_i64_fixture() -> Llbc {
 #[test]
 fn foreign_opaque_hashmap_get_keeps_niche_option_spelling() {
     let llbc = hashmap_get_option_ref_fixture();
-    let harvested = super::collect_foreign_opaque_method_externals(&llbc);
+    let harvested = super::collect_foreign_opaque_method_externals(&llbc, None);
     let row = harvested.iter().find(|(segments, _, _)| {
         segments.last().map(String::as_str) == Some("get")
             && segments.iter().any(|s| s == "HashMap" || s == "hashmap")
@@ -11339,7 +12539,7 @@ fn foreign_opaque_hashmap_get_keeps_niche_option_spelling() {
 #[test]
 fn foreign_opaque_hashmap_get_mut_scalar_does_not_keep_niche_option_spelling() {
     let llbc = hashmap_get_mut_option_mut_i64_fixture();
-    let harvested = super::collect_foreign_opaque_method_externals(&llbc);
+    let harvested = super::collect_foreign_opaque_method_externals(&llbc, None);
     let row = harvested.iter().find(|(segments, _, _)| {
         segments.last().map(String::as_str) == Some("get_mut")
             && segments.iter().any(|s| s == "HashMap" || s == "hashmap")
@@ -11366,7 +12566,7 @@ fn range_contains_is_not_harvested_as_function_path() {
     // A bodyless `Range::contains` is not harvested as an opaque
     // external; the FunctionPath stays unregistered (census Skip).
     let llbc = range_contains_fixture();
-    let harvested = super::collect_foreign_opaque_method_externals(&llbc);
+    let harvested = super::collect_foreign_opaque_method_externals(&llbc, None);
     assert!(
         !harvested
             .iter()
@@ -11493,6 +12693,7 @@ fn transparent_scalar_struct_uses_inner_register_bank() {
             no_tombstoned_leaves(),
             &std::collections::HashSet::new(),
             &std::collections::HashSet::new(),
+            None,
         )
         .is_none(),
         "a transparent wrapper over a scalar is that scalar's one-word field"
@@ -12103,6 +13304,7 @@ fn peel_transparent_inner(llbc: &Llbc, ty: &TyRef) -> Option<ValueType> {
         no_tombstoned_leaves(),
         &gc,
         &std::collections::HashSet::<String>::new(),
+        None,
     )
 }
 
@@ -12214,7 +13416,8 @@ fn transparent_gc_handle_keeps_the_wrapper_class() {
             &ty,
             &llbc,
             &gc_struct_ids,
-            &std::collections::HashSet::<String>::new()
+            &std::collections::HashSet::<String>::new(),
+            None
         ),
         "*mut PyErrorObject"
     );
@@ -12230,7 +13433,8 @@ fn transparent_gc_handle_keeps_the_wrapper_class() {
             &shared,
             &llbc,
             &gc_struct_ids,
-            &std::collections::HashSet::<String>::new()
+            &std::collections::HashSet::<String>::new(),
+            None
         ),
         "&PyError"
     );
@@ -12247,7 +13451,8 @@ fn transparent_gc_handle_keeps_the_wrapper_class() {
             &ptr,
             &llbc,
             &gc_struct_ids,
-            &std::collections::HashSet::<String>::new()
+            &std::collections::HashSet::<String>::new(),
+            None
         ),
         "*mut PyErrorObject"
     );
@@ -12271,7 +13476,8 @@ fn transparent_gc_handle_keeps_the_wrapper_class() {
             &ty,
             &llbc,
             &gc_struct_ids,
-            &std::collections::HashSet::<String>::new()
+            &std::collections::HashSet::<String>::new(),
+            None
         ),
         "PyError"
     );
@@ -12294,7 +13500,8 @@ fn transparent_gc_handle_keeps_the_wrapper_class() {
             &ty,
             &llbc,
             &gc_struct_ids,
-            &std::collections::HashSet::<String>::new()
+            &std::collections::HashSet::<String>::new(),
+            None
         ),
         "i64"
     );
@@ -12586,7 +13793,8 @@ fn transparent_handle_enum_payload_store_is_one_fieldwrite() {
             &llbc,
             no_tombstoned_leaves(),
             &gc_struct_ids,
-            &raw_alloc
+            &raw_alloc,
+            None
         )
         .is_none(),
         "a transparent GC handle is a Ptr leaf, not an inlined STRUCT"
@@ -12623,7 +13831,8 @@ fn by_value_struct_enum_payload_store_is_one_fieldwrite() {
             &llbc,
             no_tombstoned_leaves(),
             &gc_struct_ids,
-            &raw_alloc
+            &raw_alloc,
+            None
         )
         .is_some(),
         "MultiFieldStruct is an inlined STRUCT when stored as a Struct field"
@@ -12635,7 +13844,8 @@ fn by_value_struct_enum_payload_store_is_one_fieldwrite() {
             &gc_struct_ids,
             "PayloadShell::Variant",
             "__pos_0",
-            &raw_alloc
+            &raw_alloc,
+            None,
         )
         .is_none(),
         "an enum-variant owner is not an inlined Struct"
@@ -12692,7 +13902,8 @@ fn option_of_multi_field_struct_some_is_not_expanded_to_dotted_leaves() {
             &llbc,
             no_tombstoned_leaves(),
             &gc_struct_ids,
-            &raw_alloc
+            &raw_alloc,
+            None
         )
         .is_some(),
         "MultiFieldStruct is an inlined STRUCT when stored as a Struct field"
@@ -13076,7 +14287,7 @@ fn by_value_integer_newtype_types_as_the_inner_integer() {
     let raw_alloc = std::collections::HashSet::<String>::new();
     assert_eq!(super::tyref_to_value_type(&word_ty, &llbc), ValueType::Int);
     assert_eq!(
-        super::tyref_to_field_layout_string(&word_ty, &llbc, &gc_struct_ids, &raw_alloc),
+        super::tyref_to_field_layout_string(&word_ty, &llbc, &gc_struct_ids, &raw_alloc, None),
         "i64"
     );
     let (llbc, serial_ty) = load_handle(decls.clone(), serde_json::json!([null]), 7);
@@ -13087,7 +14298,7 @@ fn by_value_integer_newtype_types_as_the_inner_integer() {
         ValueType::Unsigned
     );
     assert_eq!(
-        super::tyref_to_field_layout_string(&serial_ty, &llbc, &gc_struct_ids, &raw_alloc),
+        super::tyref_to_field_layout_string(&serial_ty, &llbc, &gc_struct_ids, &raw_alloc, None),
         "u64"
     );
     assert!(
@@ -13096,7 +14307,8 @@ fn by_value_integer_newtype_types_as_the_inner_integer() {
             &llbc,
             no_tombstoned_leaves(),
             &gc_struct_ids,
-            &raw_alloc
+            &raw_alloc,
+            None
         )
         .is_none(),
         "integer newtype is one word, not an inlined STRUCT"
@@ -13107,7 +14319,8 @@ fn by_value_integer_newtype_types_as_the_inner_integer() {
             &llbc,
             no_tombstoned_leaves(),
             &gc_struct_ids,
-            &raw_alloc
+            &raw_alloc,
+            None
         )
         .is_none()
     );
@@ -13120,7 +14333,8 @@ fn by_value_integer_newtype_types_as_the_inner_integer() {
             &llbc,
             no_tombstoned_leaves(),
             &gc_struct_ids,
-            &raw_alloc
+            &raw_alloc,
+            None
         )
         .is_some(),
         "a two-field struct stays an inlined STRUCT"
@@ -13157,7 +14371,8 @@ fn by_value_integer_newtype_types_as_the_inner_integer() {
             &llbc,
             no_tombstoned_leaves(),
             &gc_struct_ids,
-            &raw_alloc
+            &raw_alloc,
+            None
         )
         .is_some()
     );
@@ -13217,7 +14432,7 @@ fn by_value_integer_newtype_types_as_the_inner_integer() {
         ValueType::Unsigned
     );
     assert_eq!(
-        super::tyref_to_field_layout_string(&flags_ty, &llbc, &gc_struct_ids, &raw_alloc),
+        super::tyref_to_field_layout_string(&flags_ty, &llbc, &gc_struct_ids, &raw_alloc, None),
         "u32"
     );
     assert!(
@@ -13226,7 +14441,8 @@ fn by_value_integer_newtype_types_as_the_inner_integer() {
             &llbc,
             no_tombstoned_leaves(),
             &gc_struct_ids,
-            &raw_alloc
+            &raw_alloc,
+            None
         )
         .is_none(),
         "nested integer newtypes are one IntegerRepr word, not an inlined STRUCT"
@@ -13642,7 +14858,8 @@ fn opaque_transparent_gc_handle_keeps_the_wrapper_class() {
             &ty,
             &llbc,
             &gc_struct_ids,
-            &std::collections::HashSet::<String>::new()
+            &std::collections::HashSet::<String>::new(),
+            None
         ),
         "*mut PyErrorObject"
     );
@@ -13735,7 +14952,7 @@ fn opaque_imported_handle_mut_ref_is_a_cell() {
     let tomb = super::no_tombstoned_leaves();
     let raw = std::collections::HashSet::<String>::new();
     assert!(
-        super::mut_ref_cell_root_of(&ty, &llbc, tomb, &gc_struct_ids, &raw)
+        super::mut_ref_cell_root_of(&ty, &llbc, tomb, &gc_struct_ids, &raw, None)
             .as_deref()
             .is_some_and(|root| root.starts_with("MutRef<")),
         "Opaque PyError is a MutRef payload"
@@ -13745,7 +14962,7 @@ fn opaque_imported_handle_mut_ref_is_a_cell() {
     }))
     .unwrap();
     assert!(
-        super::tyref_gc_mut_ref_cell_root(&mut_ty, &llbc, tomb, &gc_struct_ids, &raw)
+        super::tyref_gc_mut_ref_cell_root(&mut_ty, &llbc, tomb, &gc_struct_ids, &raw, None)
             .as_deref()
             .is_some_and(|root| root.starts_with("MutRef<")),
         "&mut Opaque PyError occupies a MutRef cell"
@@ -13785,7 +15002,7 @@ fn published_imported_handle_mut_ref_is_a_cell() {
     let tomb = super::no_tombstoned_leaves();
     let raw = std::collections::HashSet::<String>::new();
     assert!(
-        super::mut_ref_cell_root_of(&ty, &llbc, tomb, &gc_struct_ids, &raw)
+        super::mut_ref_cell_root_of(&ty, &llbc, tomb, &gc_struct_ids, &raw, None)
             .as_deref()
             .is_some_and(|root| root.starts_with("MutRef<")),
         "published PyError is a MutRef payload"
@@ -13795,7 +15012,7 @@ fn published_imported_handle_mut_ref_is_a_cell() {
     }))
     .unwrap();
     assert!(
-        super::tyref_gc_mut_ref_cell_root(&mut_ty, &llbc, tomb, &gc_struct_ids, &raw)
+        super::tyref_gc_mut_ref_cell_root(&mut_ty, &llbc, tomb, &gc_struct_ids, &raw, None)
             .as_deref()
             .is_some_and(|root| root.starts_with("MutRef<")),
         "&mut published PyError occupies a MutRef cell"
@@ -14033,7 +15250,8 @@ fn linked_transparent_definition_types_opaque_dependency_view() {
             &linked_ty,
             &llbcs[1],
             &gc_struct_ids,
-            &std::collections::HashSet::<String>::new()
+            &std::collections::HashSet::<String>::new(),
+            None
         ),
         "i64"
     );
@@ -14098,7 +15316,8 @@ fn opaque_foreign_scalar_without_repr_transparent_peels_to_inner_width() {
             &ty,
             &llbc,
             &gc_struct_ids,
-            &std::collections::HashSet::<String>::new()
+            &std::collections::HashSet::<String>::new(),
+            None
         ),
         "u32"
     );
@@ -14159,7 +15378,8 @@ fn suffix_spelled_external_scalar_peels_without_exact_llbc_row() {
             &ty,
             &llbc,
             &gc_struct_ids,
-            &std::collections::HashSet::<String>::new()
+            &std::collections::HashSet::<String>::new(),
+            None
         ),
         "u32"
     );
@@ -14343,7 +15563,8 @@ fn adt_field_read_peels_shared_borrow_of_usize_to_unsigned() {
             &llbc,
             no_tombstoned_leaves(),
             &super::harvest_declared_gc_facts(&llbc).gc_struct_ids(),
-            &std::collections::HashSet::<String>::new()
+            &std::collections::HashSet::<String>::new(),
+            None
         ),
         ValueType::Ref(None),
         "an ordinary struct's &u8 field is a stored pointer"
@@ -14358,7 +15579,8 @@ fn adt_field_read_peels_shared_borrow_of_usize_to_unsigned() {
             &llbc,
             no_tombstoned_leaves(),
             &super::harvest_declared_gc_facts(&llbc).gc_struct_ids(),
-            &std::collections::HashSet::<String>::new()
+            &std::collections::HashSet::<String>::new(),
+            None
         ),
         ValueType::Unsigned,
         "a closure-env &usize capture is the usize"
@@ -14376,7 +15598,8 @@ fn adt_field_read_peels_shared_borrow_of_usize_to_unsigned() {
             ordinary,
             &llbc,
             &super::harvest_declared_gc_facts(&llbc).gc_struct_ids(),
-            &std::collections::HashSet::<String>::new()
+            &std::collections::HashSet::<String>::new(),
+            None
         ),
         ValueType::Ref(None),
         "FORCE-attr rows for an ordinary struct stay Ref"
@@ -14387,7 +15610,8 @@ fn adt_field_read_peels_shared_borrow_of_usize_to_unsigned() {
             env,
             &llbc,
             &super::harvest_declared_gc_facts(&llbc).gc_struct_ids(),
-            &std::collections::HashSet::<String>::new()
+            &std::collections::HashSet::<String>::new(),
+            None
         ),
         ValueType::Unsigned,
         "FORCE-attr rows for a closure-env capture match the Int-banked getfield"
@@ -14509,12 +15733,12 @@ fn closure_env_capture_of_borrowed_transparent_scalar_is_the_inner_word() {
         "a borrow of the wrapper is the same word"
     );
     assert_eq!(
-        super::tyref_to_field_layout_string(&by_value, &llbc, &gc_ids, &raw),
+        super::tyref_to_field_layout_string(&by_value, &llbc, &gc_ids, &raw, None),
         "usize",
         "by-value layout is the inner scalar"
     );
     assert_eq!(
-        super::tyref_to_field_layout_string(&borrowed, &llbc, &gc_ids, &raw),
+        super::tyref_to_field_layout_string(&borrowed, &llbc, &gc_ids, &raw, None),
         "usize",
         "a captured &Wrapper layout is the inner scalar, not &eval::ScalarWrapper"
     );
@@ -14523,13 +15747,13 @@ fn closure_env_capture_of_borrowed_transparent_scalar_is_the_inner_word() {
     assert!(type_decl_is_closure_env(env));
     assert!(!type_decl_is_closure_env(ordinary));
     assert_eq!(
-        tyref_to_attr_value_type_for_struct_field(&borrowed, env, &llbc, &gc_ids, &raw),
+        tyref_to_attr_value_type_for_struct_field(&borrowed, env, &llbc, &gc_ids, &raw, None),
         ValueType::Unsigned,
         "closure-env FORCE of a captured &Wrapper is the inner word"
     );
     assert_eq!(
         adt_field_read_value_type(
-            &borrowed, &borrowed, false, true, None, &llbc, tomb, &gc_ids, &raw
+            &borrowed, &borrowed, false, true, None, &llbc, tomb, &gc_ids, &raw, None
         ),
         ValueType::Unsigned,
         "closure-env getfield of a captured &Wrapper is the inner word"
@@ -14575,7 +15799,8 @@ fn adt_field_read_raw_byte_ptr_bank() {
             &llbc,
             tomb,
             &gc_ids,
-            &std::collections::HashSet::<String>::new()
+            &std::collections::HashSet::<String>::new(),
+            None
         ),
         ValueType::Unsigned,
         "a GC owner's *mut u8 is CCHARP"
@@ -14590,7 +15815,8 @@ fn adt_field_read_raw_byte_ptr_bank() {
             &llbc,
             tomb,
             &gc_ids,
-            &std::collections::HashSet::<String>::new()
+            &std::collections::HashSet::<String>::new(),
+            None
         ),
         ValueType::Unsigned,
         "an unknown owner's *mut u8 is CCHARP"
@@ -14605,7 +15831,8 @@ fn adt_field_read_raw_byte_ptr_bank() {
             &llbc,
             tomb,
             &gc_ids,
-            &std::collections::HashSet::<String>::new()
+            &std::collections::HashSet::<String>::new(),
+            None
         ),
         ValueType::Unsigned,
         "a raw owner's *mut u8 is CCHARP"
@@ -14620,7 +15847,8 @@ fn adt_field_read_raw_byte_ptr_bank() {
             &llbc,
             tomb,
             &gc_ids,
-            &std::collections::HashSet::<String>::new()
+            &std::collections::HashSet::<String>::new(),
+            None
         ),
         ValueType::Int,
         "a raw owner's *mut i8 is the address word"
@@ -14635,7 +15863,8 @@ fn adt_field_read_raw_byte_ptr_bank() {
             &llbc,
             tomb,
             &gc_ids,
-            &std::collections::HashSet::<String>::new()
+            &std::collections::HashSet::<String>::new(),
+            None
         ),
         ValueType::Ref(None),
         "a GC owner's *mut i8 stays the erased GCREF"
@@ -15288,11 +16517,23 @@ fn result_integer_instantiations_paint_distinct_class_roots() {
     );
     assert_ne!(i32_u8, usize_u8);
     assert_eq!(
-        super::tyref_ref_param_class_root(&i32_dest, &llbc, super::no_tombstoned_leaves(), None),
+        super::tyref_ref_param_class_root(
+            &i32_dest,
+            &llbc,
+            super::no_tombstoned_leaves(),
+            None,
+            None
+        ),
         Some("result::Result<i32,u8>".into())
     );
     assert_eq!(
-        super::tyref_ref_param_class_root(&usize_dest, &llbc, super::no_tombstoned_leaves(), None),
+        super::tyref_ref_param_class_root(
+            &usize_dest,
+            &llbc,
+            super::no_tombstoned_leaves(),
+            None,
+            None
+        ),
         Some("result::Result<usize,u8>".into())
     );
 }
@@ -15752,8 +16993,8 @@ fn tagged_outer_option_of_niche_raw_enum_borrow_is_not_raw_address() {
         None,
         "tagged outer Option is not a GC payload stamp"
     );
-    let inner_vt = super::tyref_to_value_type_with(&inner, &llbc, tomb, &empty_gc, &empty_s);
-    let outer_vt = super::tyref_to_value_type_with(&outer, &llbc, tomb, &empty_gc, &empty_s);
+    let inner_vt = super::tyref_to_value_type_with(&inner, &llbc, tomb, &empty_gc, &empty_s, None);
+    let outer_vt = super::tyref_to_value_type_with(&outer, &llbc, tomb, &empty_gc, &empty_s, None);
     assert!(
         matches!(inner_vt, ValueType::Int),
         "inner Option<&RawEnum> paints Int, got {inner_vt:?}"
@@ -15962,6 +17203,7 @@ fn result_of_tombstoned_layout_leafs_paint_distinct_class_roots() {
         &tomb,
         &Default::default(),
         &Default::default(),
+        None,
     );
     let typeobject_root = super::tyref_to_value_type_with(
         &typeobject,
@@ -15969,6 +17211,7 @@ fn result_of_tombstoned_layout_leafs_paint_distinct_class_roots() {
         &tomb,
         &Default::default(),
         &Default::default(),
+        None,
     );
     let crate::model::ValueType::Ref(Some(alloc_name)) = &alloc_root else {
         panic!("expected Result class for alloc Layout, got {alloc_root:?}");
@@ -16032,7 +17275,8 @@ fn result_with_pointer_like_err_still_paints_class_root() {
         }
         other => panic!("expected Ref(Some(Result<...>)), got {other:?}"),
     }
-    let root = super::tyref_ref_param_class_root(&ty, &llbc, super::no_tombstoned_leaves(), None);
+    let root =
+        super::tyref_ref_param_class_root(&ty, &llbc, super::no_tombstoned_leaves(), None, None);
     assert!(
         root.as_deref()
             .is_some_and(|r| r.starts_with("result::Result<") && r.contains("i64")),
@@ -16054,7 +17298,7 @@ fn option_of_raw_pointer_stays_classdef_less() {
     );
     let ty = TyRef::Other(node.into());
     assert_eq!(
-        super::tyref_ref_param_class_root(&ty, &llbc, super::no_tombstoned_leaves(), None),
+        super::tyref_ref_param_class_root(&ty, &llbc, super::no_tombstoned_leaves(), None, None),
         None
     );
 }
@@ -16077,13 +17321,13 @@ fn option_of_type_parameter_param_seeds_enum_template() {
     );
     let ty = TyRef::Other(node.clone().into());
     assert_eq!(
-        super::tyref_ref_param_class_root(&ty, &llbc, tomb, None),
+        super::tyref_ref_param_class_root(&ty, &llbc, tomb, None, None),
         Some("option::Option".into()),
         "Option<v0> param seeds the harvested Option template"
     );
     let borrowed = TyRef::Other(option_shared_ref(node).into());
     assert_eq!(
-        super::tyref_ref_param_class_root(&borrowed, &llbc, tomb, None),
+        super::tyref_ref_param_class_root(&borrowed, &llbc, tomb, None, None),
         Some("option::Option".into()),
         "&Option<v0> param seeds the harvested Option template"
     );
@@ -16105,13 +17349,13 @@ fn option_of_unit_param_seeds_enum_template() {
     );
     let ty = TyRef::Other(node.clone().into());
     assert_eq!(
-        super::tyref_ref_param_class_root(&ty, &llbc, tomb, None),
+        super::tyref_ref_param_class_root(&ty, &llbc, tomb, None, None),
         Some("option::Option".into()),
         "Option<()> param seeds the harvested Option template"
     );
     let borrowed = TyRef::Other(option_shared_ref(node).into());
     assert_eq!(
-        super::tyref_ref_param_class_root(&borrowed, &llbc, tomb, None),
+        super::tyref_ref_param_class_root(&borrowed, &llbc, tomb, None, None),
         Some("option::Option".into()),
         "&Option<()> param seeds the harvested Option template"
     );
@@ -16238,6 +17482,7 @@ fn stamp_option_method_inputs(
         &empty_s,
         &[],
         crate::ErrorCarrierSpec::default(),
+        None,
     );
     graph
         .block(graph.startblock)
@@ -16677,7 +17922,7 @@ fn option_of_word_struct_interns_tagged_class() {
         crate::model::ValueType::Ref(Some("option::Option<WordHasher>".into()))
     );
     assert_eq!(
-        super::tyref_ref_param_class_root(&ty, &llbc, tomb, None),
+        super::tyref_ref_param_class_root(&ty, &llbc, tomb, None, None),
         Some("option::Option<WordHasher>".into())
     );
     let borrowed = TyRef::Other(option_shared_ref(option_adt_node(0, adt_node(1))).into());
@@ -16686,7 +17931,7 @@ fn option_of_word_struct_interns_tagged_class() {
         crate::model::ValueType::Ref(Some("option::Option<WordHasher>".into()))
     );
     assert_eq!(
-        super::tyref_ref_param_class_root(&borrowed, &llbc, tomb, None),
+        super::tyref_ref_param_class_root(&borrowed, &llbc, tomb, None, None),
         Some("option::Option<WordHasher>".into())
     );
 }
@@ -16714,7 +17959,7 @@ fn option_of_shared_ref_to_generic_struct_is_niche() {
         "niche Option<&Struct> must not intern a tagged class"
     );
     assert_eq!(
-        super::tyref_ref_param_class_root(&ty, &llbc, tomb, None),
+        super::tyref_ref_param_class_root(&ty, &llbc, tomb, None, None),
         None
     );
 }
@@ -16816,7 +18061,7 @@ fn option_with_extra_fn_ptr_arg_still_interns() {
     );
     let ty = TyRef::Other(node.into());
     assert_eq!(
-        super::tyref_ref_param_class_root(&ty, &llbc, tomb, None),
+        super::tyref_ref_param_class_root(&ty, &llbc, tomb, None, None),
         root.clone()
     );
     let borrowed = TyRef::Other(
@@ -16827,7 +18072,7 @@ fn option_with_extra_fn_ptr_arg_still_interns() {
         .into(),
     );
     assert_eq!(
-        super::tyref_ref_param_class_root(&borrowed, &llbc, tomb, None),
+        super::tyref_ref_param_class_root(&borrowed, &llbc, tomb, None, None),
         root
     );
 }
@@ -16889,7 +18134,7 @@ fn option_of_nested_hasher_map_interns_tagged_class() {
     );
     let borrowed = TyRef::Other(option_shared_ref(node).into());
     assert_eq!(
-        super::tyref_ref_param_class_root(&borrowed, &llbc, tomb, None),
+        super::tyref_ref_param_class_root(&borrowed, &llbc, tomb, None, None),
         root
     );
 }
@@ -16928,7 +18173,7 @@ fn option_instantiated_type_decl_interns_tagged_class() {
     );
     let borrowed = TyRef::Other(option_shared_ref(node).into());
     assert_eq!(
-        super::tyref_ref_param_class_root(&borrowed, &llbc, tomb, None),
+        super::tyref_ref_param_class_root(&borrowed, &llbc, tomb, None, None),
         Some("option::Option<WordHasher>".into())
     );
 }
@@ -16967,7 +18212,7 @@ fn option_instantiated_dedup_skip_binder_interns_tagged_class() {
     );
     let borrowed = TyRef::Other(option_shared_ref(node).into());
     assert_eq!(
-        super::tyref_ref_param_class_root(&borrowed, &llbc, tomb, None),
+        super::tyref_ref_param_class_root(&borrowed, &llbc, tomb, None, None),
         Some("option::Option<WordHasher>".into())
     );
 }
@@ -17000,7 +18245,7 @@ fn option_of_dict_with_hasher_and_raw_ptr_interns_tagged_class() {
     );
     let borrowed = TyRef::Other(option_shared_ref(node).into());
     assert_eq!(
-        super::tyref_ref_param_class_root(&borrowed, &llbc, tomb, None),
+        super::tyref_ref_param_class_root(&borrowed, &llbc, tomb, None, None),
         root
     );
 }
@@ -17020,7 +18265,7 @@ fn control_flow_value_and_param_share_instantiation_class() {
         crate::model::ValueType::Ref(Some("ops::control_flow::ControlFlow<i64,i64>".into()))
     );
     assert_eq!(
-        super::tyref_ref_param_class_root(&ty, &llbc, super::no_tombstoned_leaves(), None),
+        super::tyref_ref_param_class_root(&ty, &llbc, super::no_tombstoned_leaves(), None, None),
         Some("ops::control_flow::ControlFlow<i64,i64>".into())
     );
 }
@@ -17985,8 +19230,8 @@ fn ambiguous_layout_pointer_field_row_projects_classdef() {
     let raw = std::collections::HashSet::new();
     let layout_ptr = TyRef::Other(serde_json::json!({"RawPtr": [adt_node(0), "Shared"]}).into());
     let plain_ptr = TyRef::Other(serde_json::json!({"RawPtr": [adt_node(2), "Shared"]}).into());
-    let unpainted_layout = super::tyref_to_field_layout_string(&layout_ptr, &llbc, &gc, &raw);
-    let unpainted_plain = super::tyref_to_field_layout_string(&plain_ptr, &llbc, &gc, &raw);
+    let unpainted_layout = super::tyref_to_field_layout_string(&layout_ptr, &llbc, &gc, &raw, None);
+    let unpainted_plain = super::tyref_to_field_layout_string(&plain_ptr, &llbc, &gc, &raw, None);
     assert_eq!(unpainted_layout, "*const Layout");
     assert_eq!(unpainted_plain, "*const PlainWord");
     let (_, _, mut fields, mut enums, mut origins, _, _, ids) =
@@ -18073,11 +19318,11 @@ fn two_same_leaf_structs_paint_distinct_class_roots() {
         Some("b::Dup")
     );
     assert_eq!(
-        super::tyref_ref_param_class_root(&a, &llbc, tomb, None).as_deref(),
+        super::tyref_ref_param_class_root(&a, &llbc, tomb, None, None).as_deref(),
         Some("a::Dup")
     );
     assert_eq!(
-        super::tyref_ref_param_class_root(&b, &llbc, tomb, None).as_deref(),
+        super::tyref_ref_param_class_root(&b, &llbc, tomb, None, None).as_deref(),
         Some("b::Dup")
     );
 }
@@ -18720,8 +19965,8 @@ fn option_of_string_is_ref_paint_and_niche() {
         "Option<String> attr paint is the payload String's Ref"
     );
     let tomb = super::no_tombstoned_leaves();
-    let option_param = super::tyref_ref_param_class_root(&option_string, &llbc, tomb, None);
-    let string_param = super::tyref_ref_param_class_root(&string, &llbc, tomb, None);
+    let option_param = super::tyref_ref_param_class_root(&option_string, &llbc, tomb, None, None);
+    let string_param = super::tyref_ref_param_class_root(&string, &llbc, tomb, None, None);
     assert_eq!(
         option_param, string_param,
         "Option<String> param class root is the payload String's class root"
@@ -18731,8 +19976,8 @@ fn option_of_string_is_ref_paint_and_niche() {
         "String class root must be named, got {option_param:?}"
     );
     assert_eq!(
-        super::tyref_input_class_root(&option_string, &llbc, tomb),
-        super::tyref_input_class_root(&string, &llbc, tomb),
+        super::tyref_input_class_root(&option_string, &llbc, tomb, None),
+        super::tyref_input_class_root(&string, &llbc, tomb, None),
         "Option<String> input class root is the payload String's class root"
     );
     with_fixture_lowering(&llbc, |lowering| {
@@ -18761,7 +20006,7 @@ fn option_of_string_is_ref_paint_and_niche() {
             "Option<&String> value paint is the payload String's Ref"
         );
         assert_eq!(
-            super::tyref_ref_param_class_root(&option_ref_string, &llbc, tomb, None),
+            super::tyref_ref_param_class_root(&option_ref_string, &llbc, tomb, None, None),
             string_param,
             "Option<&String> param class root is the payload String's class root"
         );
@@ -18777,7 +20022,7 @@ fn option_of_string_is_ref_paint_and_niche() {
             "&Option<String> attr paint is the payload String's Ref"
         );
         assert_eq!(
-            super::tyref_ref_param_class_root(&borrowed, &llbc, tomb, None),
+            super::tyref_ref_param_class_root(&borrowed, &llbc, tomb, None, None),
             string_param,
             "&Option<String> param class root is the payload String's class root"
         );
@@ -18939,7 +20184,7 @@ fn option_of_object_pointer_slice_is_nullable_list() {
     );
     let tomb = super::no_tombstoned_leaves();
     assert_eq!(
-        super::tyref_ref_param_class_root(&option_ty, &llbc, tomb, None),
+        super::tyref_ref_param_class_root(&option_ty, &llbc, tomb, None, None),
         list_root,
         "Option<&[*mut PyObject]> param seeds SomeList of PyObject"
     );
@@ -19036,7 +20281,7 @@ fn option_of_vec_of_vec_u8_is_nullable_list() {
     );
     let tomb = super::no_tombstoned_leaves();
     assert_eq!(
-        super::tyref_ref_param_class_root(&option_ty, &llbc, tomb, None),
+        super::tyref_ref_param_class_root(&option_ty, &llbc, tomb, None, None),
         list_root,
         "Option<Vec<Vec<u8>>> param seeds SomeList"
     );
@@ -19047,7 +20292,7 @@ fn option_of_vec_of_vec_u8_is_nullable_list() {
         "&Option<Vec<Vec<u8>>> value paint is the nullable list"
     );
     assert_eq!(
-        super::tyref_ref_param_class_root(&borrowed, &llbc, tomb, None),
+        super::tyref_ref_param_class_root(&borrowed, &llbc, tomb, None, None),
         list_root,
         "&Option<Vec<Vec<u8>>> param seeds SomeList"
     );
@@ -19269,18 +20514,19 @@ fn option_gc_mut_ref_none_is_mut_ref_cell_null() {
     let gc = super::harvest_declared_gc_facts(&llbc).gc_struct_ids();
     let raw = std::collections::HashSet::<String>::new();
     assert!(
-        super::tyref_option_gc_mut_ref_cell_root(&option_mut_ty, &llbc, tomb, &gc, &raw)
+        super::tyref_option_gc_mut_ref_cell_root(&option_mut_ty, &llbc, tomb, &gc, &raw, None)
             .as_deref()
             .is_some_and(|root| root.starts_with("MutRef<")),
         "Option<&mut Handle> occupies a MutRef cell"
     );
     assert!(
-        super::tyref_option_gc_mut_ref_cell_root(&option_shared_ty, &llbc, tomb, &gc, &raw)
+        super::tyref_option_gc_mut_ref_cell_root(&option_shared_ty, &llbc, tomb, &gc, &raw, None)
             .is_none(),
         "Option<&Handle> is not a MutRef cell"
     );
     assert!(
-        super::tyref_option_gc_mut_ref_cell_root(&option_raw_ty, &llbc, tomb, &gc, &raw).is_none(),
+        super::tyref_option_gc_mut_ref_cell_root(&option_raw_ty, &llbc, tomb, &gc, &raw, None)
+            .is_none(),
         "Option<*mut Handle> is not a MutRef cell"
     );
     with_fixture_lowering(&llbc, |lowering| {
@@ -19389,7 +20635,8 @@ fn mut_ref_cell_root_names_a_gc_pointer_only() {
             &llbc,
             tomb,
             &gc,
-            &std::collections::HashSet::<String>::new()
+            &std::collections::HashSet::<String>::new(),
+            None
         )
         .is_none()
     );
@@ -19401,7 +20648,8 @@ fn mut_ref_cell_root_names_a_gc_pointer_only() {
             &llbc,
             tomb,
             &gc,
-            &std::collections::HashSet::<String>::new()
+            &std::collections::HashSet::<String>::new(),
+            None
         )
         .is_none()
     );
@@ -19413,7 +20661,8 @@ fn mut_ref_cell_root_names_a_gc_pointer_only() {
             &llbc,
             tomb,
             &gc,
-            &std::collections::HashSet::<String>::new()
+            &std::collections::HashSet::<String>::new(),
+            None
         )
         .is_none()
     );
@@ -19425,7 +20674,8 @@ fn mut_ref_cell_root_names_a_gc_pointer_only() {
             &llbc,
             tomb,
             &gc,
-            &std::collections::HashSet::<String>::new()
+            &std::collections::HashSet::<String>::new(),
+            None
         )
         .as_deref(),
         Some("MutRef<*mut ??adt#7>")
@@ -19684,7 +20934,8 @@ fn mut_ref_gc_handle_method_is_function_path_cell() {
             &llbc,
             tomb,
             &gc,
-            &std::collections::HashSet::<String>::new()
+            &std::collections::HashSet::<String>::new(),
+            None
         )
         .is_some(),
         "Handle behind &mut is a cell pointee"
@@ -19695,7 +20946,8 @@ fn mut_ref_gc_handle_method_is_function_path_cell() {
             &llbc,
             tomb,
             &gc,
-            &std::collections::HashSet::<String>::new()
+            &std::collections::HashSet::<String>::new(),
+            None
         )
         .is_some(),
         "&mut Handle is a cell parameter"
@@ -20620,14 +21872,14 @@ fn opaque_gc_handle_auto_ref_wraps_as_mut_ref_cell() {
     let gc = super::harvest_declared_gc_facts(&llbc).gc_struct_ids();
     let raw = std::collections::HashSet::<String>::new();
     assert!(
-        super::mut_ref_cell_root_of(&handle, &llbc, tomb, &gc, &raw)
+        super::mut_ref_cell_root_of(&handle, &llbc, tomb, &gc, &raw, None)
             .as_deref()
             .is_some_and(|root| root.starts_with("MutRef<")),
         "Opaque Handle is a MutRef payload, ty={:?}",
         super::tyref_to_value_type(&handle, &llbc)
     );
     assert!(
-        super::tyref_gc_mut_ref_cell_root(&mut_ty, &llbc, tomb, &gc, &raw)
+        super::tyref_gc_mut_ref_cell_root(&mut_ty, &llbc, tomb, &gc, &raw, None)
             .as_deref()
             .is_some_and(|root| root.starts_with("MutRef<")),
         "&mut Opaque Handle occupies a MutRef cell"
@@ -20683,6 +21935,7 @@ fn to_string_receiver_is_float_looks_through_refs() {
             tomb,
             &gc,
             &std::collections::HashSet::<String>::new(),
+            None,
         )
     };
     let ty = |value: serde_json::Value| -> TyRef { serde_json::from_value(value).unwrap() };
@@ -21038,12 +22291,14 @@ fn policy_opaque_nullable_pointer_option_is_a_residual_stub() {
         &gc_struct_ids,
         carrier,
         &std::collections::HashSet::<String>::new(),
+        None,
     );
     let unsafe_stubs = super::collect_unsafe_fn_stubs_from_llbc(
         &llbc,
         &gc_struct_ids,
         carrier,
         &std::collections::HashSet::<String>::new(),
+        None,
     );
     fn leaf_of<'a>(
         specs: &'a [crate::translator::rtyper::cutover::ResidualStubSpec],
@@ -21113,6 +22368,7 @@ fn elidable_declaration_keeps_a_functiondesc_without_a_lowered_body() {
         &gc_struct_ids,
         crate::ErrorCarrierSpec::default(),
         &std::collections::HashSet::<String>::new(),
+        None,
     );
     let expected = [
         "pyre_object",
@@ -21150,6 +22406,7 @@ fn getset_direct_residual_keeps_a_functiondesc_without_a_jitcode_body() {
         &gc_struct_ids,
         crate::ErrorCarrierSpec::default(),
         &std::collections::HashSet::<String>::new(),
+        None,
     );
     let expected = ["pyre_interpreter", "typedef", "call_getset_fget_direct"];
     let (_, signature, token, _, _) = specs
@@ -21189,6 +22446,7 @@ fn dont_look_inside_option_objectptr_residual_is_nullable_gcref() {
         &gc_struct_ids,
         crate::ErrorCarrierSpec::default(),
         &std::collections::HashSet::<String>::new(),
+        None,
     );
     let expected = ["pyre_interpreter", "call", "metaclass_call_override"];
     let (_, signature, token, _, _) = specs
@@ -21367,7 +22625,8 @@ fn declared_gc_field0_closure_skips_integer_newtype() {
             &serial_ty,
             &llbc,
             &gc,
-            &std::collections::HashSet::<String>::new()
+            &std::collections::HashSet::<String>::new(),
+            None
         ),
         "u64"
     );
@@ -21491,7 +22750,8 @@ fn transparent_handle_over_gctype_header_pointer_is_ref() {
             &llbc,
             tomb,
             &gc,
-            &std::collections::HashSet::<String>::new()
+            &std::collections::HashSet::<String>::new(),
+            None
         ),
         ValueType::Ref(_)
     ));
@@ -21514,7 +22774,8 @@ fn transparent_handle_over_gctype_header_pointer_is_ref() {
             &llbc,
             tomb,
             &gc,
-            &std::collections::HashSet::<String>::new()
+            &std::collections::HashSet::<String>::new(),
+            None
         ),
         ValueType::Ref(_)
     ));
@@ -21535,7 +22796,8 @@ fn transparent_handle_over_gctype_header_pointer_is_ref() {
                 &llbc,
                 tomb,
                 &gc,
-                &std::collections::HashSet::<String>::new()
+                &std::collections::HashSet::<String>::new(),
+                None
             ),
             ValueType::Ref(_)
         ),
@@ -21569,6 +22831,7 @@ fn registered_gc_ptr_gcrefopaque_has_no_class_root() {
             crate::ErrorCarrierSpec::default(),
             &gc,
             &empty,
+            None,
         )
         .as_deref(),
         Some(crate::translator::rtyper::cutover::GCREF_RETURN_TYPE)
@@ -21581,6 +22844,7 @@ fn registered_gc_ptr_gcrefopaque_has_no_class_root() {
             super::no_tombstoned_leaves(),
             &gc,
             &empty,
+            None,
         ),
         None
     );
@@ -21604,7 +22868,14 @@ fn tyref_is_gcref_spelling_is_exactly_one_pointer_onto_gcrefopaque() {
             .expect("fixture TyRef")
     };
     let token = |ty: &TyRef| {
-        dont_look_inside_return_token(ty, &llbc, crate::ErrorCarrierSpec::default(), &gc, &empty)
+        dont_look_inside_return_token(
+            ty,
+            &llbc,
+            crate::ErrorCarrierSpec::default(),
+            &gc,
+            &empty,
+            None,
+        )
     };
     let gcref_alias = ty(adt(3));
     let mut_gcrefopaque = ty(serde_json::json!({"RawPtr": [adt(0), "Mut"]}));
@@ -21699,12 +22970,26 @@ fn foreign_opaque_gcrefopaque_ptr_is_gcref_ref() {
         "GcOpaqueType is not a raw Ptr"
     );
     assert_eq!(
-        super::tyref_to_value_type_with(&ty, &llbc, super::no_tombstoned_leaves(), &gc, &empty,),
+        super::tyref_to_value_type_with(
+            &ty,
+            &llbc,
+            super::no_tombstoned_leaves(),
+            &gc,
+            &empty,
+            None,
+        ),
         ValueType::Ref(None)
     );
     assert_eq!(
-        dont_look_inside_return_token(&ty, &llbc, crate::ErrorCarrierSpec::default(), &gc, &empty,)
-            .as_deref(),
+        dont_look_inside_return_token(
+            &ty,
+            &llbc,
+            crate::ErrorCarrierSpec::default(),
+            &gc,
+            &empty,
+            None,
+        )
+        .as_deref(),
         Some(crate::translator::rtyper::cutover::GCREF_RETURN_TYPE)
     );
 }
@@ -21723,10 +23008,22 @@ fn live_w_code_get_ptr_result_kind() {
         .local_fn("w_code_get_ptr")
         .expect("w_code_get_ptr in interpreter ULLBC");
     let out = &fd.signature.output;
-    let vt =
-        super::tyref_to_value_type_with(out, llbc, super::no_tombstoned_leaves(), &gc, &flavors);
-    let token =
-        dont_look_inside_return_token(out, llbc, crate::ErrorCarrierSpec::default(), &gc, &flavors);
+    let vt = super::tyref_to_value_type_with(
+        out,
+        llbc,
+        super::no_tombstoned_leaves(),
+        &gc,
+        &flavors,
+        None,
+    );
+    let token = dont_look_inside_return_token(
+        out,
+        llbc,
+        crate::ErrorCarrierSpec::default(),
+        &gc,
+        &flavors,
+        None,
+    );
     let spelling = tyref_is_gcref_spelling(out, llbc);
     assert!(
         !spelling,
@@ -21800,6 +23097,7 @@ fn collect_by_value_struct_leaves_walks_the_whole_finite_nesting() {
         super::no_tombstoned_leaves(),
         &std::collections::HashSet::new(),
         &std::collections::HashSet::new(),
+        None,
     );
     assert_eq!(leaves.len(), 1, "one scalar leaf at the innermost struct");
     let dotted = format!("{}{}", leaves[0].super_path, leaves[0].field.name);
@@ -21844,6 +23142,7 @@ fn foreign_byte_pointer_stub_keeps_the_c_address_bank() {
         &std::collections::HashSet::new(),
         crate::ErrorCarrierSpec::default(),
         &std::collections::HashSet::new(),
+        None,
     );
     let token = |leaf: &str| {
         specs

@@ -1233,6 +1233,17 @@ impl FunctionDesc {
         }
     }
 
+    /// True when this desc already holds a bodyless external
+    /// (`SourceGraph::External`). `extregistry.py`
+    /// `AutoRegisteringType._register` refuses a second registration
+    /// of the same key; later users go through `extregistry.lookup`.
+    pub(crate) fn has_external_registration(&self) -> bool {
+        matches!(
+            &*self.source_graph.borrow(),
+            Some(SourceGraph::External { .. })
+        )
+    }
+
     /// RPython `FunctionDesc.getgraphs()` (description.py).
     ///
     /// Upstream reads `_cache` alone: it holds exactly the graphs a
@@ -1262,7 +1273,18 @@ impl FunctionDesc {
     /// carries. Publishes `_signature_` through
     /// `publish_residual_result_signature`; does not overwrite an
     /// existing one. Does not write `_cache`.
+    ///
+    /// `extfunc.py` `register_external` mints one `s_result` per
+    /// registration. `extregistry.py` `AutoRegisteringType._register`
+    /// raises on a second registration of the same key
+    /// (`duplicate extregistry entry`); later users go through
+    /// `extregistry.lookup`.
     pub(crate) fn install_external_stub(&mut self, stub: Rc<PyGraph>, s_result: SomeValue) {
+        assert!(
+            !self.has_external_registration(),
+            "duplicate extregistry entry {}",
+            self.name
+        );
         *self.source_graph.borrow_mut() = Some(SourceGraph::External {
             stub,
             s_result: s_result.clone(),
@@ -4691,6 +4713,58 @@ mod tests {
                 );
             }
             other => panic!("expected Variable, got {other:?}"),
+        }
+    }
+
+    /// `extregistry.py` `AutoRegisteringType._register` raises
+    /// `duplicate extregistry entry` on a second registration of the
+    /// same key.
+    #[test]
+    #[should_panic(expected = "duplicate extregistry entry")]
+    fn install_external_stub_second_registration_panics() {
+        let (_ann, bk) = ann_bk();
+        let integer = SomeValue::Integer(SomeInteger::default());
+        let mut fd = residual_function_desc(bk, "dup", "n", integer.clone());
+        fd.install_external_stub(dont_look_inside_stub("dup", int_sig(&["n"])), integer);
+    }
+
+    /// A list-returning residual registered once: two `pycall`s return
+    /// the published listdef (`listdef.py` `ListDef.same_as`).
+    #[test]
+    fn residual_stub_list_return_two_pycalls_share_published_listdef() {
+        let (_ann, bk) = ann_bk();
+        let declared = SomeValue::List(SomeList::new(ListDef::new(
+            Some(bk.clone()),
+            SomeValue::Integer(SomeInteger::default()),
+            true,
+            true,
+        )));
+        let fd = residual_function_desc(bk, "alloc_box", "n", declared.clone());
+        let args = ArgumentsForTranslation::new(
+            vec![Some(SomeValue::Integer(SomeInteger::default()))],
+            None,
+            None,
+        );
+        let first = fd
+            .pycall(None, &args, &SomeValue::Impossible, None)
+            .expect("first pycall of a list-returning residual");
+        let second = fd
+            .pycall(None, &args, &SomeValue::Impossible, None)
+            .expect("second pycall of a list-returning residual");
+        match (&declared, &first, &second) {
+            (SomeValue::List(d), SomeValue::List(a), SomeValue::List(b)) => {
+                assert!(
+                    d.listdef.same_as(&a.listdef),
+                    "first pycall must return the published listdef"
+                );
+                assert!(
+                    d.listdef.same_as(&b.listdef),
+                    "second pycall must return the published listdef"
+                );
+            }
+            _ => panic!(
+                "list-returning residual pycall must stay a list, got {first:?} / {second:?}"
+            ),
         }
     }
 
