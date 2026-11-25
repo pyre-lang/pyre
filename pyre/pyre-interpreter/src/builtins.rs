@@ -870,9 +870,8 @@ pub(crate) unsafe fn memoryview_register_finalizer(mv: PyObjectRef) {
 /// `W_MemoryView._finalize_`: `if self.view is not None:
 /// self._release_underlying(None)`.  With no space, `_release_underlying`
 /// consults no `__release_buffer__` and calls `view.releasebuffer()`; then the
-/// view is gone.  The exporter is still reachable here because the finalizer
-/// queue kept this memoryview alive, so the release reaches its current
-/// address.
+/// view is gone. The internal cpyext carrier is registered on its own queue,
+/// so memoryview finalization only follows `_release_underlying`.
 ///
 /// # Safety
 /// `mv` must be a `W_MemoryView`.
@@ -2155,23 +2154,13 @@ fn memoryview_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
 
 /// Drop a foreign-memory view's export directly, bypassing any Python-callable
 /// release.  Returns `true` when it handled the backing.
-unsafe fn release_external_backing(mv: PyObjectRef, backing: PyObjectRef) -> bool {
+unsafe fn release_external_backing(backing: PyObjectRef) -> bool {
     #[cfg(all(any(unix, windows), not(feature = "sandbox")))]
     if pyre_object::buffer::has_external_buffer_layout(backing) {
         unsafe { pyre_object::buffer::external_buffer_release(backing) };
         return true;
     }
-    // A C exporter's `bf_releasebuffer` is handed back the exact `Py_buffer`
-    // its `bf_getbuffer` filled in, which is keyed by the exported address.
-    #[cfg(all(
-        feature = "cpyext",
-        not(feature = "sandbox"),
-        any(target_os = "macos", target_os = "linux")
-    ))]
-    if unsafe { crate::cpyext::buffer::release_view(mv, backing) } {
-        return true;
-    }
-    let _ = (mv, backing);
+    let _ = backing;
     false
 }
 
@@ -2194,7 +2183,7 @@ unsafe fn release_native_backing(mv: PyObjectRef, backing: PyObjectRef) -> bool 
             // accounting and has no Python-visible release wrapper.
             return true;
         }
-        release_external_backing(mv, backing)
+        release_external_backing(backing)
     }
 }
 

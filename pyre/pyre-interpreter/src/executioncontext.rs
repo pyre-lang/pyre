@@ -480,9 +480,11 @@ pub type ProfileFunc = fn(
 pub const TICK_COUNTER_STEP: usize = 100;
 
 #[derive(Debug, Default)]
-pub struct WRootFinalizerQueue;
+pub struct WRootFinalizerQueue {
+    _identity: u8,
+}
 
-static W_ROOT_FINALIZER_QUEUE: WRootFinalizerQueue = WRootFinalizerQueue;
+static W_ROOT_FINALIZER_QUEUE: WRootFinalizerQueue = WRootFinalizerQueue { _identity: 0 };
 
 impl WRootFinalizerQueue {
     pub fn finalizer_trigger(&mut self) {
@@ -494,6 +496,11 @@ impl WRootFinalizerQueue {
             fq: std::ptr::addr_of!(W_ROOT_FINALIZER_QUEUE) as usize,
             trigger: finalizer_queue_trigger,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fq_address_for_test() -> usize {
+        Self::fq_tag().fq
     }
 
     /// framework.py `get_finalizer_queue_index`. `tag.fq` is the address of
@@ -3887,7 +3894,7 @@ impl UserDelAction {
             finalizers_lock_count: 0,
             enabled_at_app_level: true,
             pending_with_disabled_del: None,
-            finalizer_queue: WRootFinalizerQueue,
+            finalizer_queue: WRootFinalizerQueue::default(),
         });
         let action_ptr: *mut dyn AsyncActionOps = &mut *action;
         let index = actionflag.register_nonperiodic_action(action_ptr);
@@ -4232,7 +4239,7 @@ pub fn report_error(
 
 pub fn make_finalizer_queue<WRoot>(w_root: WRoot, _space: PyObjectRef) -> WRootFinalizerQueue {
     let _ = w_root;
-    WRootFinalizerQueue
+    WRootFinalizerQueue::default()
 }
 
 #[cfg(test)]

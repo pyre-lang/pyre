@@ -249,6 +249,16 @@ pub unsafe fn w_memoryview_backing(obj: PyObjectRef) -> PyObjectRef {
     unsafe { w_memoryview_view(obj).backing().w_obj() }
 }
 
+/// The managed owner of the view's storage, including an internal cpyext
+/// carrier. This reference is for GC keepalive use, not Python object access.
+///
+/// # Safety
+/// `obj` must point to a valid `W_MemoryView`.
+#[inline]
+pub unsafe fn w_memoryview_backing_gc_owner(obj: PyObjectRef) -> PyObjectRef {
+    unsafe { w_memoryview_view(obj).backing().gc_owner() }
+}
+
 mv_view_obj!(w_memoryview_obj, w_obj);
 mv_view_scalar!(w_memoryview_itemsize, itemsize, i64);
 mv_view_scalar!(w_memoryview_ndim, ndim, i64);

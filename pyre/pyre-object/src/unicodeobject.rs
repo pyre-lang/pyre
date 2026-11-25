@@ -880,11 +880,11 @@ pub fn w_str_subclass_from_wtf8(value: Wtf8Buf, w_class: PyObjectRef) -> PyObjec
 /// table is process-global rather than an `ObjSpace` field. It must not be TLS.
 ///
 /// Allocated once when the collector starts (`init_interned_strings`), the
-/// `ObjSpace.__init__` / `ll_new_weakdict` analogue. A unit test with no GC
-/// lazily mallocs the same shape on first intern. With a stable hook the
-/// dict is a prebuilt GC object (`prebuilt_root_objects`); minors skip it
-/// and majors trace it (`seed_major_roots` /
-/// `rescan_major_nonstack_roots_and_drain`).
+/// `ObjSpace.__init__` / `ll_new_weakdict_prebuilt` / `convert_const`
+/// analogue. A unit test with no GC lazily mallocs the same shape on first
+/// intern. With a stable hook the dict is a prebuilt GC object
+/// (`prebuilt_root_objects`); minors skip it and majors trace it
+/// (`seed_major_roots` / `rescan_major_nonstack_roots_and_drain`).
 struct WeakInternTable(*mut crate::rweakvaldict::WeakDict<crate::celldict::StrKey>);
 unsafe impl Send for WeakInternTable {}
 unsafe impl Sync for WeakInternTable {}
@@ -927,7 +927,7 @@ fn intern_dict(
     table: &mut WeakInternTable,
 ) -> Option<&mut crate::rweakvaldict::WeakDict<crate::celldict::StrKey>> {
     if table.0.is_null() {
-        let dict = crate::rweakvaldict::ll_new_weakdict();
+        let dict = crate::rweakvaldict::ll_new_weakdict_prebuilt();
         if crate::gc_hook::gc_alloc_failed_pending() && dict.is_null() {
             return None;
         }
@@ -938,7 +938,8 @@ fn intern_dict(
 
 /// `interned_strings.get` (`ObjSpace.new_interned_str` / `new_interned_w_str`).
 /// Probe only: `ObjSpace.__init__` builds the table (`init_interned_strings` /
-/// `ll_new_weakdict`); a GET does not allocate it. A null table is a miss.
+/// `ll_new_weakdict_prebuilt` / `convert_const`); a GET does not allocate it.
+/// A null table is a miss.
 fn intern_lookup(llkey: crate::celldict::StrKey) -> Option<PyObjectRef> {
     let table = lock_intern();
     if table.0.is_null() {
@@ -966,16 +967,18 @@ fn intern_lookup_wtf8_prebuilt(value: &Wtf8) -> Option<PyObjectRef> {
     unsafe { (*table.0).ll_get_chars_prebuilt(value.as_bytes()) }
 }
 
-/// `ll_new_weakdict` for `interned_strings`. Called after the WEAKDICT type
-/// ids are registered and the collector singleton is live. `ObjSpace.__init__`
+/// `ll_new_weakdict_prebuilt` / `convert_const` for `interned_strings`. Called
+/// after the WEAKDICT type ids are registered and the collector singleton is
+/// live. `ObjSpace.__init__`
 /// builds this table once; a later thread entry must not replace it.
 pub fn init_interned_strings() -> bool {
     let mut table = lock_intern();
     intern_dict(&mut table).is_some()
 }
 
-/// `ObjSpace.__init__` must finish `interned_strings` (`ll_new_weakdict`)
-/// before the space is usable. Bootstrap has no Python error channel.
+/// `ObjSpace.__init__` must finish `interned_strings`
+/// (`ll_new_weakdict_prebuilt` / `convert_const`) before the space is usable.
+/// Bootstrap has no Python error channel.
 pub fn init_interned_strings_or_alloc_failed() -> ! {
     crate::gc_hook::gc_alloc_failed(std::mem::size_of::<
         crate::rweakvaldict::WeakDict<crate::celldict::StrKey>,
@@ -986,7 +989,7 @@ pub fn init_interned_strings_or_alloc_failed() -> ! {
 /// belong to that heap (`intern_dict_is_prebuilt_stable_across_minor_and_major`
 /// in pyre-interpreter eval.rs tests).
 pub fn replace_interned_strings_dict() -> bool {
-    let dict = crate::rweakvaldict::ll_new_weakdict();
+    let dict = crate::rweakvaldict::ll_new_weakdict_prebuilt();
     if crate::gc_hook::gc_alloc_failed_pending() && dict.is_null() {
         return false;
     }
@@ -997,8 +1000,9 @@ pub fn replace_interned_strings_dict() -> bool {
 
 /// The interned_strings `WEAKDICT` pointer (`WEAK_INTERN.0`).
 ///
-/// The table is a prebuilt GC object (`ll_new_weakdict` + construction write
-/// barrier / `incminimark.py remember_young_pointer`); it is reached from
+/// The table is a prebuilt GC object (`ll_new_weakdict_prebuilt` /
+/// `convert_const` + construction write barrier /
+/// `incminimark.py remember_young_pointer`); it is reached from
 /// `prebuilt_root_objects`. There is no extra-root walk for interned_strings
 /// (`baseobjspace.py interned_strings`).
 pub fn interned_strings_dict_ptr() -> *mut crate::rweakvaldict::WeakDict<crate::celldict::StrKey> {

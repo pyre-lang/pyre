@@ -6,6 +6,7 @@
 # `tp_base` and `PyErr_NewExceptionWithDoc`.
 
 import cpyext_types as m
+import gc
 import sys
 
 # ── the type itself ────────────────────────────────────────────────────
@@ -554,6 +555,9 @@ assert blob.exports() == 0
 view = memoryview(blob)
 assert blob.exports() == 1
 assert view.obj is blob
+# Internal `CPyBuffer` carriers have no typedef and must not leak through the
+# app-level object enumeration while their C export is live.
+assert all(isinstance(type(obj), type) for obj in gc.get_objects())
 assert len(view) == 6
 assert view.readonly is False
 assert view.itemsize == 1
@@ -562,11 +566,38 @@ assert bytes(view) == b'abcdef'
 assert view[0] == ord('a')
 assert list(view[1:3]) == [ord('b'), ord('c')]
 view.release()
+del view
+gc.collect()
+gc.collect()
 assert blob.exports() == 0
+
+# `wrap_getbuffer` returns a non-owning memoryview over `CPyBuffer`.  Releasing
+# that Python view invalidates only the view: a CFFI `from_buffer` carrier can
+# still read the export, and `CPyBuffer.releasebuffer` runs from its finalizer
+# once the last carrier dies.
+import _cffi_backend as B
+
+char_array = B.new_array_type(B.new_pointer_type(B.new_primitive_type('char')), None)
+held_blob = m.Blob(b'held')
+held_view = memoryview(held_blob)
+held_cdata = B.from_buffer(char_array, held_view)
+held_view.release()
+del held_view
+gc.collect()
+gc.collect()
+assert held_blob.exports() == 1
+assert b''.join(held_cdata[index] for index in range(4)) == b'held'
+del held_cdata
+gc.collect()
+gc.collect()
+assert held_blob.exports() == 0
 
 with memoryview(blob) as inner:
     assert inner[5] == ord('f')
     assert blob.exports() == 1
+del inner
+gc.collect()
+gc.collect()
 assert blob.exports() == 0
 
 # The window is the exporter's own storage, not a copy of it.
@@ -586,12 +617,16 @@ import io
 target = m.Blob(b'......')
 assert io.BytesIO(b'abcdef').readinto(target) == 6
 assert target.read(target) == b'abcdef'
+gc.collect()
+gc.collect()
 assert target.exports() == 0
 
 # A short source fills a prefix and leaves the rest, and reports what it wrote.
 short = m.Blob(b'zzzz')
 assert io.BytesIO(b'ab').readinto(short) == 2
 assert short.read(short) == b'abzz'
+gc.collect()
+gc.collect()
 assert short.exports() == 0
 
 # PyObject_GetBuffer driven from C, over a C exporter and over a pyre object.

@@ -1555,8 +1555,10 @@ unsafe fn list_user_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut 
 /// Custom trace for `W_MemoryView`.  Its geometry and backing live in an
 /// off-heap `*const BufferView` (`memoryview.rs`), so the macro's empty
 /// `gc_ptr_offsets` reach none of the refs the collector must keep alive.
-/// Forward the root exporter `PyObjectRef` of a `Buffer`, descending through
-/// any `Sub` window to the leaf whose exporter actually owns the storage.
+/// Forward the root managed reference of a `Buffer`, descending through any
+/// `Sub` window to the leaf whose exporter owns the storage. For cpyext's
+/// `External` buffer this is the headerless carrier, not a Python object; the
+/// carrier's registered pointer offset forwards its exporter separately.
 fn trace_buffer_exporter(
     buf: &mut pyre_object::buffer::Buffer,
     f: &mut dyn FnMut(*mut majit_ir::GcRef),
@@ -6179,6 +6181,24 @@ fn build_gc() -> Box<MiniMarkGC> {
     );
     pyre_object::rweakkeydict::WEAKKEYDICT_GC_TYPE_ID_CELL.set(weakkeydict_tid);
     pyre_object::rweakkeydict::set_weakkeydict_gc_type_id(weakkeydict_tid);
+    // `pypy.module.cpyext.buffer.CPyBuffer`: an interpreter-level BufferView,
+    // not a W_Root. Its exporter is the single managed pointer, and no typedef
+    // means `gc.get_objects()` expands past the carrier instead of returning it.
+    let cpybuffer_carrier_tid = gc.get_type_id(
+        GcTypeKey::of(&pyre_object::cpybuffer::CPYBUFFER_CARRIER_GC_TYPE_ID_CELL),
+        || {
+            majit_gc::trace::TypeInfo::with_gc_ptrs(
+                std::mem::size_of::<pyre_object::cpybuffer::CPyBufferCarrier>(),
+                vec![std::mem::offset_of!(
+                    pyre_object::cpybuffer::CPyBufferCarrier,
+                    w_obj
+                )],
+            )
+            .without_app_level_typedef()
+        },
+    );
+    pyre_object::cpybuffer::CPYBUFFER_CARRIER_GC_TYPE_ID_CELL.set(cpybuffer_carrier_tid);
+    pyre_object::cpybuffer::set_cpybuffer_carrier_gc_type_id(cpybuffer_carrier_tid);
     // Optional-module headerless GC instances (`OptionalModuleHooks.raw_gc_types`).
     // `func.py RawBytes` is the product case: a headerless GC instance whose
     // light destructor (`RawBytes.__del__`) frees the `str2charp` block. Same

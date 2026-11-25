@@ -34,7 +34,9 @@ pub enum Buffer {
     Byte { w_obj: PyObjectRef },
     /// `array.array` — its raw element bytes.
     Array { w_obj: PyObjectRef },
-    /// Raw foreign memory used by `ctypes.memoryview_at`.
+    /// Raw foreign memory. `w_obj` is normally its Python exporter; cpyext's
+    /// `CPyBuffer` view stores its internal GC carrier here instead, and the
+    /// carrier owns the exporter reference.
     External {
         w_obj: PyObjectRef,
         address: usize,
@@ -130,6 +132,9 @@ pub unsafe fn external_buffer_release(w_obj: PyObjectRef) {
 }
 
 unsafe fn external_release(w_obj: PyObjectRef) {
+    if crate::cpybuffer::is_carrier(w_obj) {
+        return;
+    }
     let f = EXTERNAL_RELEASE.load(core::sync::atomic::Ordering::Acquire);
     if f != 0 && !w_obj.is_null() {
         unsafe { core::mem::transmute::<usize, unsafe fn(PyObjectRef)>(f)(w_obj) }
@@ -163,7 +168,8 @@ impl Buffer {
     /// nothing.  A `Sub` answers for its parent.
     pub fn needs_release(&self) -> bool {
         match self {
-            Buffer::Byte { .. } | Buffer::Array { .. } | Buffer::External { .. } => true,
+            Buffer::Byte { .. } | Buffer::Array { .. } => true,
+            Buffer::External { w_obj, .. } => !crate::cpybuffer::is_carrier(*w_obj),
             Buffer::String { .. } => false,
             Buffer::Sub { parent, .. } => parent.needs_release(),
         }
@@ -221,17 +227,35 @@ impl Buffer {
         }
     }
 
-    /// The root exporter object whose storage this buffer reads/writes; a
-    /// `Sub` reports its parent's exporter (`SubBuffer` has no `.obj` of its
-    /// own).
+    /// The root Python exporter object whose storage this buffer reads/writes;
+    /// a `Sub` reports its parent's exporter (`SubBuffer` has no `.obj` of its
+    /// own), and an internal cpyext carrier reports the exporter it retains.
     #[inline]
     pub fn w_obj(&self) -> PyObjectRef {
+        match self {
+            Buffer::String { w_obj } | Buffer::Byte { w_obj } | Buffer::Array { w_obj } => *w_obj,
+            Buffer::External { w_obj, .. } => {
+                if crate::cpybuffer::is_carrier(*w_obj) {
+                    unsafe { crate::cpybuffer::w_obj((*w_obj).cast()) }
+                } else {
+                    *w_obj
+                }
+            }
+            Buffer::Sub { parent, .. } => parent.w_obj(),
+        }
+    }
+
+    /// The managed owner that keeps this storage alive. For cpyext this is
+    /// the internal `CPyBuffer` carrier (`W_CDataFromBuffer.buf`), whose
+    /// lifetime owns the C export independently of the Python exporter.
+    #[inline]
+    pub fn gc_owner(&self) -> PyObjectRef {
         match self {
             Buffer::String { w_obj }
             | Buffer::Byte { w_obj }
             | Buffer::Array { w_obj }
             | Buffer::External { w_obj, .. } => *w_obj,
-            Buffer::Sub { parent, .. } => parent.w_obj(),
+            Buffer::Sub { parent, .. } => parent.gc_owner(),
         }
     }
 
@@ -263,7 +287,12 @@ impl Buffer {
                     // have unmapped or moved the window it was built over.  A
                     // closed mapping reads as empty.  Any other owner keeps
                     // the window it was built with.
-                    let (address, size) = match external_buffer_view(*w_obj) {
+                    let live = if crate::cpybuffer::is_carrier(*w_obj) {
+                        None
+                    } else {
+                        external_buffer_view(*w_obj)
+                    };
+                    let (address, size) = match live {
                         Some(Ok((address, size, _))) => (address, size),
                         Some(Err(_)) => (core::ptr::NonNull::<u8>::dangling().as_ptr() as usize, 0),
                         None => (*address, *size),
@@ -325,7 +354,12 @@ impl Buffer {
                     size,
                     ..
                 } => {
-                    let (address, _) = match external_buffer_view(*w_obj) {
+                    let live = if crate::cpybuffer::is_carrier(*w_obj) {
+                        None
+                    } else {
+                        external_buffer_view(*w_obj)
+                    };
+                    let (address, _) = match live {
                         Some(Ok((address, size, _))) => (address, size),
                         Some(Err(_)) => (core::ptr::NonNull::<u8>::dangling().as_ptr() as usize, 0),
                         None => (*address, *size),

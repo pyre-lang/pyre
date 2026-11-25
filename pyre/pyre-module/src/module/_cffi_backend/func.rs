@@ -518,8 +518,8 @@ pub fn from_buffer(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     // `w_keepalive = w_object`, and `view`.  Drop of this lease covers the
     // length / address errors below. Success `disarm`s it: a made view
     // (C / ctypes fallthrough) is not released (`NonOwningReleaseView`,
-    // `wrap_getbuffer` `owns_export=False`); the cdata keeps that view as
-    // the `CPyBuffer` carrier (lease 0). The native `_exports` increment
+    // `wrap_getbuffer` `owns_export=False`); the cdata keeps that view and
+    // its hidden `CPyBuffer` carrier (lease 0). The native `_exports` increment
     // (lease 1) is the release.
     let flags = if require_writable {
         pyre_interpreter::builtins::BUF_WRITABLE
@@ -577,21 +577,20 @@ pub fn from_buffer(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     let made_view = acquired.made_view();
     let owner = roots.get(owner_slot);
     // Native `_exports` (held) keeps the owner. A made view
-    // (`acquire_buffer_w` C / ctypes fallthrough) is the `CPyBuffer`
-    // carrier: keep it and `disarm` without releasing (`NonOwningReleaseView`,
+    // (`acquire_buffer_w` C / ctypes fallthrough) retains the memoryview,
+    // whose `Buffer::External.w_obj` retains the internal `CPyBuffer` carrier:
+    // keep it and `disarm` without releasing (`NonOwningReleaseView`,
     // `wrap_getbuffer` `owns_export=False`). Otherwise a memoryview owner
-    // → `w_memoryview_backing` (null → owner); else owner. A made view is
+    // → `w_memoryview_backing_gc_owner` (null → owner); else owner. A made view is
     // lease 0: the cdata never releases it.
     let keep_owner = held || made_view;
     let backing = if !keep_owner && unsafe { pyre_object::memoryview::is_w_memoryview(owner) } {
-        // `w_memoryview_backing` is `view.backing().w_obj()`: the ultimate
-        // exporter (bytes / bytearray / array) or the GC object that owns
-        // the storage. A live view always has a backing (`w_memoryview_view`
-        // requires it). `w_obj` is that Buffer's exporter field; it is not
-        // null for bytes / bytearray / array. `ctypes.memoryview_at` stores
-        // `None`. If the pointer is null, fall back to `owner` so the
-        // memoryview that holds the off-heap view stays reachable.
-        unsafe { pyre_object::memoryview::w_memoryview_backing(owner) }
+        // `pypy.module._cffi_backend.func.from_buffer` passes the buffer to
+        // `W_CDataFromBuffer`, whose `self.buf` retains the storage owner.
+        // A cpyext view must retain its CPyBuffer carrier even after the
+        // Python memoryview is released and collected. A null backing falls
+        // back to the view itself.
+        unsafe { pyre_object::memoryview::w_memoryview_backing_gc_owner(owner) }
     } else {
         pyre_object::PY_NULL
     };
@@ -604,7 +603,9 @@ pub fn from_buffer(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     // (`StringBuffer(self._value)`), not the wrapper. bytearray
     // (`ByteArrayBuffer(self)`) and array (`ArrayBuffer(self)`) keep
     // the wrapper. `w_keepalive` is still `w_x` until release.
-    let export_owner = if unsafe { pyre_object::bytesobject::is_bytes(export_owner) } {
+    let export_owner = if !pyre_object::cpybuffer::is_carrier(export_owner)
+        && unsafe { pyre_object::bytesobject::is_bytes(export_owner) }
+    {
         unsafe { pyre_object::bytesobject::w_bytes_block(export_owner) as PyObjectRef }
     } else {
         export_owner
