@@ -1434,59 +1434,6 @@ impl<'a> Lowering<'a> {
                             alias.array_type_id.as_deref(),
                         ),
                     }
-                } else if let Some(owner) = self.string_array_remove_owner() {
-                    // Tail of RPython `ll_delitem_nonneg`: after
-                    // `ll_arraymove`, clear `l[newlength]` to the null GC
-                    // pointer before shrinking the logical length.  Rust
-                    // spells this one site as `*p = null_mut()`, but the
-                    // translated operation is a setitem on the same
-                    // GcArray(GCREF) as the move.
-                    let list = self
-                        .local_var
-                        .get(1)
-                        .and_then(Option::as_ref)
-                        .ok_or_else(|| {
-                            LowerError::Unsupported(format!(
-                                "bb{mir_bb}: string-array remove lost self before null clear"
-                            ))
-                        })?
-                        .one()?;
-                    let arr = self.emit_string_array_items_view(bb_id, list.clone(), owner);
-                    let length = self.emit_string_array_len_read(bb_id, list, owner);
-                    let one = self
-                        .graph
-                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-                        result: Some(one.clone()),
-                        kind: OpKind::ConstUInt(1),
-                    });
-                    let newlength = self
-                        .graph
-                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-                        result: Some(newlength.clone()),
-                        kind: OpKind::BinOp {
-                            op: "sub".to_string(),
-                            lhs: length,
-                            rhs: one,
-                            result_ty: ValueType::Unsigned,
-                        },
-                    });
-                    value = self.narrow_value_to_instance_root(bb_id, value, "str");
-                    OpKind::ArrayWrite {
-                        base: arr,
-                        index: newlength,
-                        value: value.clone(),
-                        item_ty: ValueType::Str,
-                        array_type_id: Some(STRING_GCREF_GCARRAY_TYPE_ID.to_string()),
-                        array: None,
-                        nolength: crate::front::typestr::nolength_from_array_type_id(Some(
-                            STRING_GCREF_GCARRAY_TYPE_ID,
-                        )),
-                        gckind: crate::front::typestr::gckind_from_array_type_id(Some(
-                            STRING_GCREF_GCARRAY_TYPE_ID,
-                        )),
-                    }
                 } else if let Some(local) = inner_local
                     && !self.index_elem_alias.contains_key(&local)
                     && let Some((item_ty, array_type_id)) =

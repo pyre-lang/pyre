@@ -7589,6 +7589,20 @@ impl<'a> Transformer<'a> {
                 op: unop_name,
                 operand,
                 ..
+            } if unop_name == "gc_identityhash" => {
+                // `jtransform.py rewrite_op_gc_identityhash =
+                // _do_builtin_call` → `direct_call(_ll_1_gc_identityhash, x)`.
+                RewriteResult::Replace(self.emit_gc_identityhash(
+                    graph,
+                    operand,
+                    op.result.clone(),
+                    graph_name,
+                ))
+            }
+            OpKind::UnaryOp {
+                op: unop_name,
+                operand,
+                ..
             } if unop_name == "abs" && self.get_value_kind_var(operand) == 'i' => {
                 // `rint.py rtype_abs` → `int_abs`.  `jtransform.py
                 // rewrite_op_int_abs = _do_builtin_call` emits
@@ -9645,6 +9659,61 @@ impl<'a> Transformer<'a> {
                     ),
                     args_i: vec![operand.clone()],
                     args_r: vec![],
+                    args_f: vec![],
+                    result_kind: 'i',
+                    indirect_targets: None,
+                },
+            },
+        ]
+    }
+
+    /// Emit `direct_call(_ll_1_gc_identityhash, x)` — `jtransform.py rewrite_op_gc_identityhash = _do_builtin_call`. `support.py` `_ll_1_gc_identityhash` is `@elidable` and cannot raise; its one argument is a GC reference.
+    fn emit_gc_identityhash(
+        &mut self,
+        graph: &mut FunctionGraph,
+        operand: &crate::flowspace::model::Variable,
+        result: Option<crate::flowspace::model::Variable>,
+        graph_name: &str,
+    ) -> Vec<SpaceOperation> {
+        let target = CallTarget::function_path(["_ll_1_gc_identityhash"]);
+        let direct_call = SpaceOperation {
+            result: result.clone(),
+            kind: OpKind::Call {
+                target: target.clone(),
+                args: crate::model::call_args(std::iter::once(operand.clone())),
+                result_ty: ValueType::Int,
+            },
+        };
+        let regular = self
+            .callcontrol
+            .as_ref()
+            .is_some_and(|cc| cc.guess_call_kind(&direct_call) == crate::call::CallKind::Regular);
+        if regular
+            && let RewriteResult::Replace(ops) = self.handle_regular_call(
+                &direct_call,
+                &target,
+                std::slice::from_ref(operand),
+                &ValueType::Int,
+                graph_name,
+                graph,
+            )
+        {
+            return ops;
+        }
+        let (funcptr, funcptr_op) = self.direct_funcptr_value(graph, &target);
+        vec![
+            funcptr_op,
+            SpaceOperation {
+                result,
+                kind: OpKind::CallResidual {
+                    funcptr: CallFuncPtr::Value(funcptr),
+                    descriptor: CallDescriptor::from_signature(
+                        &[majit_ir::value::Type::Ref],
+                        majit_ir::value::Type::Int,
+                        EffectInfo::new(ExtraEffect::ElidableCannotRaise, OopSpecIndex::None),
+                    ),
+                    args_i: vec![],
+                    args_r: vec![operand.clone()],
                     args_f: vec![],
                     result_kind: 'i',
                     indirect_targets: None,
@@ -18972,7 +19041,7 @@ fn materialize_const_result(
     }
 }
 
-fn materialize_const_result_copy(
+pub(crate) fn materialize_const_result_copy(
     result: crate::flowspace::model::Variable,
     c: &crate::flowspace::model::Constant,
 ) -> SpaceOperation {
@@ -31112,6 +31181,81 @@ mod tests {
             !ops.iter()
                 .any(|op| matches!(op.kind, OpKind::CallResidual { .. })),
             "a candidate helper is not a residual call: {ops:?}"
+        );
+    }
+
+    #[test]
+    fn gc_identityhash_lowers_to_elidable_residual_call() {
+        let mut cc = crate::call::CallControl::new();
+        cc.find_all_graphs_for_tests();
+
+        let mut graph = FunctionGraph::new("gc_identityhash_body");
+        let operand = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "p".into(),
+                    ty: ValueType::Ref(None),
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        let result_var = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::UnaryOp {
+                    op: "gc_identityhash".to_string(),
+                    operand: operand.clone(),
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(graph.startblock, Some(result_var.clone()));
+        FunctionGraph::set_concretetype_of_inline(&operand, ConcreteType::GcRef);
+        FunctionGraph::set_concretetype_of_inline(&result_var, ConcreteType::Signed);
+
+        let config = GraphTransformConfig::default();
+        let transformed = Transformer::new(&config)
+            .with_callcontrol(&mut cc)
+            .transform(&graph);
+        let ops = &transformed.graph.block(graph.startblock).operations;
+        assert!(
+            !ops.iter().any(|op| {
+                matches!(&op.kind, OpKind::UnaryOp { op, .. } if op == "gc_identityhash")
+            }),
+            "bare gc_identityhash must not survive: {ops:?}"
+        );
+        let residuals: Vec<_> = ops
+            .iter()
+            .filter_map(|op| match &op.kind {
+                OpKind::CallResidual {
+                    args_i,
+                    args_r,
+                    result_kind,
+                    descriptor,
+                    ..
+                } => Some((args_i, args_r, *result_kind, descriptor)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            residuals.len(),
+            1,
+            "expected exactly one CallResidual: {ops:?}"
+        );
+        let (args_i, args_r, result_kind, descriptor) = residuals[0];
+        assert!(args_i.is_empty(), "args_i must be empty: {ops:?}");
+        assert_eq!(args_r, &vec![operand]);
+        assert_eq!(result_kind, 'i');
+        assert_eq!(
+            descriptor.extra_info.extraeffect,
+            ExtraEffect::ElidableCannotRaise
+        );
+        assert!(
+            !ops.iter().any(|op| matches!(op.kind, OpKind::Live { .. })),
+            "ElidableCannotRaise must not append a trailing -live-: {ops:?}"
         );
     }
 

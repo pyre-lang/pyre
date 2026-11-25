@@ -342,9 +342,8 @@ unsafe fn copy_item<K: Copy + GcRefOffsets, V: Copy + GcRefOffsets>(
 /// graph, and the `length <= 1` `copy_item` head ("Hack to ensure that we
 /// get a proper effectinfo.write_descrs_arrays") is the `setinteriorfield`
 /// writeanalyze reads that ARRAY's interior-field effects off.
-/// [`crate::object_array::jit_ll_arraycopy`] copies items as `PyObjectRef`;
-/// a `DICTENTRY` is a struct, so this graph does the write barrier and
-/// memcpy itself.
+/// The object-items wrapper copies scalar `PyObjectRef` items; a `DICTENTRY`
+/// is a struct, so this graph keeps its own barrier and memcpy body.
 ///
 /// # Safety
 /// `source` and `dest` are live `GcEntries` and both ranges are in bounds.

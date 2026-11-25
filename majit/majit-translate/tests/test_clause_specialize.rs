@@ -564,22 +564,23 @@ fn set_mustfree_flag_does_not_specialize_ptradd_helpers() {
     );
 }
 
-/// `IntArray::remove` uses `base().add(index)` as a raw pointer for
-/// `ptr::copy`. `base()` stays the GcArray header; `direct_ptradd` then
-/// `rffi.cast`s that Instance onto `CArrayPtr` so `ann_direct_ptradd`
-/// sees `SomePtr`.
+/// `object_array::ll_arraymove_int_items_block` uses `base.add(source_start)`
+/// as a raw pointer for `ptr::copy`. `typed_items_block_items_base` stays the
+/// GcArray header; `direct_ptradd` then `rffi.cast`s that Instance onto
+/// `CArrayPtr` so `ann_direct_ptradd` sees `SomePtr`.
 #[test]
-fn int_array_remove_ptradd_rffi_casts_base() {
+fn ll_arraymove_int_items_block_ptradd_rffi_casts_base() {
     let llbc = load_llbc(OBJECT_LLBC);
-    let graph = lower_function(llbc, "int_array::<Impl>::remove").expect("lower IntArray::remove");
+    let graph = lower_function(llbc, "object_array::ll_arraymove_int_items_block")
+        .expect("lower ll_arraymove_int_items_block");
     assert!(
         graph_calls_leaf(&graph, "direct_ptradd"),
-        "remove must emit direct_ptradd of the items pointer, ops {:?}",
+        "ll_arraymove_int_items_block must emit direct_ptradd of the items pointer, ops {:?}",
         op_kinds(&graph)
     );
     assert!(
         graph_calls_leaf(&graph, "cast_int_to_ptr"),
-        "remove's direct_ptradd operand must be rffi.cast SomePtr, ops {:?}",
+        "ll_arraymove_int_items_block's direct_ptradd operand must be rffi.cast SomePtr, ops {:?}",
         op_kinds(&graph)
     );
 }

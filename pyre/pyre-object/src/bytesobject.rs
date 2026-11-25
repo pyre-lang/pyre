@@ -148,7 +148,12 @@ pub fn try_alloc_bytes_block(bytes: &[u8]) -> Option<*mut BytesBlock> {
         (*block).hash = 0;
         (*block).length = bytes.len();
         let chars = (block as *mut u8).add(LOWLEVEL_STRING_CHARS_OFFSET);
-        std::ptr::copy_nonoverlapping(bytes.as_ptr(), chars, bytes.len());
+        crate::lowlevel_string::copy_raw_to_string(
+            bytes.as_ptr(),
+            block as *mut u8,
+            0,
+            bytes.len(),
+        );
         chars.add(bytes.len()).write(0);
         Some(block)
     }

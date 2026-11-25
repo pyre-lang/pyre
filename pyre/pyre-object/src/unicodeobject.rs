@@ -73,8 +73,7 @@ pub fn alloc_utf8_payload(bytes: &[u8], managed: bool) -> *mut UnicodeValueStora
         std::alloc::handle_alloc_error(std::alloc::Layout::new::<Utf8Str>());
     }
     unsafe {
-        let dst = (p as *mut u8).add(LOWLEVEL_STRING_CHARS_OFFSET);
-        std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, bytes.len());
+        crate::lowlevel_string::copy_raw_to_string(bytes.as_ptr(), p as *mut u8, 0, bytes.len());
     }
     p as *mut UnicodeValueStorage
 }

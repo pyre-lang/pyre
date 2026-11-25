@@ -3537,8 +3537,16 @@ fn lowlevel_helper_graph(
         "ll_check_unichr" => lowlevel_range_check_helper_graph(name, args, result, 0x10ffff),
         "ll_min" => lowlevel_min_max_helper_graph(name, args, result, false),
         "ll_max" => lowlevel_min_max_helper_graph(name, args, result, true),
-        "ll_int_abs_ovf" => lowlevel_int_min_unary_ovf_helper_graph(name, args, result, "int_abs"),
-        "ll_int_neg_ovf" => lowlevel_int_min_unary_ovf_helper_graph(name, args, result, "int_neg"),
+        "ll_int_abs_ovf" => {
+            lowlevel_int_min_unary_ovf_helper_graph(name, args, result, "int_abs", None)
+        }
+        "ll_int_neg_ovf" => lowlevel_int_min_unary_ovf_helper_graph(
+            name,
+            args,
+            result,
+            "int_neg",
+            Some("int.neg_ovf(x)"),
+        ),
         "ll_int_lshift_ovf" => lowlevel_int_lshift_ovf_helper_graph(name, args, result),
         "ll_int_py_div" => lowlevel_int_py_div_helper_graph(name, args, result, false),
         "ll_int_py_div_nonnegargs" => lowlevel_int_py_div_helper_graph(name, args, result, true),
@@ -3562,12 +3570,14 @@ fn lowlevel_helper_graph(
         "ll_int_py_mod_ovf_zer" => {
             lowlevel_zero_check_wrapper_graph(rtyper, name, args, result, "ll_int_py_mod_ovf")
         }
+        // rint.py: @jit.oopspec("int.udiv(x, y)") / ("int.umod(x, y)") on ll_uint_py_div / ll_uint_py_mod.
         "ll_uint_py_div" => lowlevel_simple_binary_helper_graph(
             name,
             args,
             result,
             LowLevelType::Unsigned,
             "uint_floordiv",
+            Some("int.udiv(x, y)"),
         ),
         "ll_uint_py_mod" => lowlevel_simple_binary_helper_graph(
             name,
@@ -3575,6 +3585,7 @@ fn lowlevel_helper_graph(
             result,
             LowLevelType::Unsigned,
             "uint_mod",
+            Some("int.umod(x, y)"),
         ),
         "ll_uint_py_div_zer" => lowlevel_typed_zero_check_wrapper_graph(
             rtyper,
@@ -3600,6 +3611,7 @@ fn lowlevel_helper_graph(
             result,
             LowLevelType::UnsignedLongLong,
             "ullong_floordiv",
+            None,
         ),
         "ll_ullong_py_mod" => lowlevel_simple_binary_helper_graph(
             name,
@@ -3607,6 +3619,7 @@ fn lowlevel_helper_graph(
             result,
             LowLevelType::UnsignedLongLong,
             "ullong_mod",
+            None,
         ),
         "ll_ullong_py_div_zer" => lowlevel_typed_zero_check_wrapper_graph(
             rtyper,
@@ -3632,6 +3645,7 @@ fn lowlevel_helper_graph(
             result,
             LowLevelType::UnsignedLongLongLong,
             "ulllong_floordiv",
+            None,
         ),
         "ll_ulllong_py_mod" => lowlevel_simple_binary_helper_graph(
             name,
@@ -3639,6 +3653,7 @@ fn lowlevel_helper_graph(
             result,
             LowLevelType::UnsignedLongLongLong,
             "ulllong_mod",
+            None,
         ),
         "ll_ulllong_py_div_zer" => lowlevel_typed_zero_check_wrapper_graph(
             rtyper,
@@ -4803,6 +4818,7 @@ fn lowlevel_int_min_unary_ovf_helper_graph(
     args: &[LowLevelType],
     result: &LowLevelType,
     opname: &str,
+    oopspec: Option<&str>,
 ) -> Result<PyGraph, TyperError> {
     if args != [LowLevelType::Signed] || result != &LowLevelType::Signed {
         return Err(TyperError::message(format!(
@@ -4814,8 +4830,8 @@ fn lowlevel_int_min_unary_ovf_helper_graph(
     //   if x == INT_MIN: raise OverflowError
     //   return -x       # ll_int_neg_ovf
     //   return abs(x)   # ll_int_abs_ovf
-    let argnames = vec!["arg0".to_string()];
-    let x0 = variable_with_lltype("arg0", LowLevelType::Signed);
+    let argnames = vec!["x".to_string()];
+    let x0 = variable_with_lltype("x", LowLevelType::Signed);
     let x1 = variable_with_lltype("x", LowLevelType::Signed);
     let is_min = variable_with_lltype("is_min", LowLevelType::Bool);
     let op_result = variable_with_lltype("result", LowLevelType::Signed);
@@ -4874,10 +4890,13 @@ fn lowlevel_int_min_unary_ovf_helper_graph(
         .into_ref(),
     ]);
 
-    let func = GraphFunc::new(
+    let mut func = GraphFunc::new(
         name.to_string(),
         Constant::new(ConstValue::Dict(Default::default())),
     );
+    if let Some(spec) = oopspec {
+        func.oopspec = Some(spec.to_string());
+    }
     graph.func = Some(func.clone());
     Ok(helper_pygraph_from_graph(graph, argnames, func))
 }
@@ -4982,9 +5001,9 @@ fn lowlevel_int_py_div_helper_graph(
     //   if y < 0: u = p - x
     //   else:     u = x - p
     //   return r + (u >> INT_BITS_1)
-    let argnames = vec!["arg0".to_string(), "arg1".to_string()];
-    let x = variable_with_lltype("arg0", LowLevelType::Signed);
-    let y = variable_with_lltype("arg1", LowLevelType::Signed);
+    let argnames = vec!["x".to_string(), "y".to_string()];
+    let x = variable_with_lltype("x", LowLevelType::Signed);
+    let y = variable_with_lltype("y", LowLevelType::Signed);
     let r = variable_with_lltype("r", LowLevelType::Signed);
     let return_var = variable_with_lltype("result", LowLevelType::Signed);
     let startblock = Block::shared(vec![
@@ -5158,10 +5177,12 @@ fn lowlevel_int_py_div_helper_graph(
         ]);
     }
 
-    let func = GraphFunc::new(
+    let mut func = GraphFunc::new(
         name.to_string(),
         Constant::new(ConstValue::Dict(Default::default())),
     );
+    // rint.py: @jit.oopspec("int.py_div(x, y)") on ll_int_py_div / ll_int_py_div_nonnegargs.
+    func.oopspec = Some("int.py_div(x, y)".to_string());
     graph.func = Some(func.clone());
     Ok(helper_pygraph_from_graph(graph, argnames, func))
 }
@@ -5183,9 +5204,9 @@ fn lowlevel_int_py_mod_helper_graph(
     //   if y < 0: u = -r
     //   else:     u = r
     //   return r + (y & (u >> INT_BITS_1))
-    let argnames = vec!["arg0".to_string(), "arg1".to_string()];
-    let x = variable_with_lltype("arg0", LowLevelType::Signed);
-    let y = variable_with_lltype("arg1", LowLevelType::Signed);
+    let argnames = vec!["x".to_string(), "y".to_string()];
+    let x = variable_with_lltype("x", LowLevelType::Signed);
+    let y = variable_with_lltype("y", LowLevelType::Signed);
     let r = variable_with_lltype("r", LowLevelType::Signed);
     let return_var = variable_with_lltype("result", LowLevelType::Signed);
     let startblock = Block::shared(vec![
@@ -5351,10 +5372,12 @@ fn lowlevel_int_py_mod_helper_graph(
         ]);
     }
 
-    let func = GraphFunc::new(
+    let mut func = GraphFunc::new(
         name.to_string(),
         Constant::new(ConstValue::Dict(Default::default())),
     );
+    // rint.py: @jit.oopspec("int.py_mod(x, y)") on ll_int_py_mod / ll_int_py_mod_nonnegargs.
+    func.oopspec = Some("int.py_mod(x, y)".to_string());
     graph.func = Some(func.clone());
     Ok(helper_pygraph_from_graph(graph, argnames, func))
 }
@@ -5809,6 +5832,7 @@ fn lowlevel_simple_binary_helper_graph(
     result: &LowLevelType,
     lltype: LowLevelType,
     opname: &str,
+    oopspec: Option<&str>,
 ) -> Result<PyGraph, TyperError> {
     if args != [lltype.clone(), lltype.clone()] || result != &lltype {
         return Err(TyperError::message(format!(
@@ -5817,9 +5841,9 @@ fn lowlevel_simple_binary_helper_graph(
         )));
     }
 
-    let argnames = vec!["arg0".to_string(), "arg1".to_string()];
-    let x = variable_with_lltype("arg0", lltype.clone());
-    let y = variable_with_lltype("arg1", lltype.clone());
+    let argnames = vec!["x".to_string(), "y".to_string()];
+    let x = variable_with_lltype("x", lltype.clone());
+    let y = variable_with_lltype("y", lltype.clone());
     let op_result = variable_with_lltype("result", lltype.clone());
     let return_var = variable_with_lltype("result", lltype);
     let startblock = Block::shared(vec![
@@ -5846,10 +5870,13 @@ fn lowlevel_simple_binary_helper_graph(
         .into_ref(),
     ]);
 
-    let func = GraphFunc::new(
+    let mut func = GraphFunc::new(
         name.to_string(),
         Constant::new(ConstValue::Dict(Default::default())),
     );
+    if let Some(spec) = oopspec {
+        func.oopspec = Some(spec.to_string());
+    }
     graph.func = Some(func.clone());
     Ok(helper_pygraph_from_graph(graph, argnames, func))
 }
@@ -9198,5 +9225,94 @@ mod tests {
             panic!("null arm must carry LLPtr")
         };
         assert!(!null_type.nonzero());
+    }
+
+    #[test]
+    fn rint_int_helpers_carry_their_oopspec_on_the_function_object() {
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+        let check = |pygraph: PyGraph, spec: &str, argnames: &[&str]| {
+            assert_eq!(pygraph.func.oopspec.as_deref(), Some(spec));
+            let graph = pygraph.graph.borrow();
+            assert_eq!(
+                graph.func.as_ref().and_then(|f| f.oopspec.as_deref()),
+                Some(spec)
+            );
+            assert_eq!(
+                crate::codewriter::jtransform_opname::startblock_oopspec_argnames(&graph),
+                argnames.iter().map(|s| s.to_string()).collect::<Vec<_>>()
+            );
+        };
+        let s = LowLevelType::Signed;
+        let u = LowLevelType::Unsigned;
+        check(
+            lowlevel_int_py_div_helper_graph("ll_int_py_div", &[s.clone(), s.clone()], &s, false)
+                .unwrap(),
+            "int.py_div(x, y)",
+            &["x", "y"],
+        );
+        check(
+            lowlevel_int_py_div_helper_graph(
+                "ll_int_py_div_nonnegargs",
+                &[s.clone(), s.clone()],
+                &s,
+                true,
+            )
+            .unwrap(),
+            "int.py_div(x, y)",
+            &["x", "y"],
+        );
+        check(
+            lowlevel_int_py_mod_helper_graph("ll_int_py_mod", &[s.clone(), s.clone()], &s, false)
+                .unwrap(),
+            "int.py_mod(x, y)",
+            &["x", "y"],
+        );
+        check(
+            lowlevel_simple_binary_helper_graph(
+                "ll_uint_py_div",
+                &[u.clone(), u.clone()],
+                &u,
+                u.clone(),
+                "uint_floordiv",
+                Some("int.udiv(x, y)"),
+            )
+            .unwrap(),
+            "int.udiv(x, y)",
+            &["x", "y"],
+        );
+        check(
+            lowlevel_simple_binary_helper_graph(
+                "ll_uint_py_mod",
+                &[u.clone(), u.clone()],
+                &u,
+                u.clone(),
+                "uint_mod",
+                Some("int.umod(x, y)"),
+            )
+            .unwrap(),
+            "int.umod(x, y)",
+            &["x", "y"],
+        );
+        check(
+            lowlevel_int_min_unary_ovf_helper_graph(
+                "ll_int_neg_ovf",
+                &[s.clone()],
+                &s,
+                "int_neg",
+                Some("int.neg_ovf(x)"),
+            )
+            .unwrap(),
+            "int.neg_ovf(x)",
+            &["x"],
+        );
+        let abs = lowlevel_int_min_unary_ovf_helper_graph(
+            "ll_int_abs_ovf",
+            &[s.clone()],
+            &s,
+            "int_abs",
+            None,
+        )
+        .unwrap();
+        assert_eq!(abs.func.oopspec, None);
     }
 }

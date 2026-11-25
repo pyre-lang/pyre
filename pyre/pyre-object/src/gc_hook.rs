@@ -1308,6 +1308,45 @@ pub extern "C" fn try_gc_write_barrier_before_move(obj: GCREF) -> bool {
     }
 }
 
+/// `llop.gc_writebarrier_before_copy(Bool, source, dest, source_start,
+/// dest_start, length)` (`rgc.py` `ll_arraycopy`, `lloperation.py`).
+/// Translated graphs see the llop; the native body dispatches to the active
+/// collector. An unmanaged destination needs no barrier. A managed destination
+/// with an unmanaged source declines the bulk form so the caller copies through
+/// its ordinary per-item store.
+#[majit_macros::jit_llop("gc_writebarrier_before_copy")]
+#[inline(never)]
+pub fn gc_writebarrier_before_copy(
+    source: GCREF,
+    dest: GCREF,
+    source_start: i64,
+    dest_start: i64,
+    length: i64,
+) -> bool {
+    if !try_gc_owns_object(dest) {
+        return true;
+    }
+    if !try_gc_owns_object(source) {
+        return false;
+    }
+    majit_gc::gc_writebarrier_before_copy(
+        majit_ir::GcRef(source as usize),
+        majit_ir::GcRef(dest as usize),
+        source_start as usize,
+        dest_start as usize,
+        length as usize,
+    )
+}
+
+/// `llop.gc_writebarrier_before_move(array)` (`rgc.py` `ll_arraymove`,
+/// `lloperation.py`). Translated graphs see the llop; the native body
+/// asks the installed before-move hook.
+#[majit_macros::jit_llop("gc_writebarrier_before_move")]
+#[inline(never)]
+pub fn gc_writebarrier_before_move(array: GCREF) {
+    let _ = try_gc_write_barrier_before_move(array);
+}
+
 /// Run the active barrier for a pointer returned by a managed allocation
 /// hook.  The backend may omit the general hybrid-heap ownership lookup.
 /// TRACK-clear skip is valid here: the pointer is collector-owned.

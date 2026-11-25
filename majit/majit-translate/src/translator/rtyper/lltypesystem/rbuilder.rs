@@ -427,76 +427,6 @@ pub fn build_ll_bool_helper_graph(
 /// (`rbuilder.py:54`/`72`) — both baked in as `direct_call` callee consts,
 /// mirroring [`build_ll_call_lookup_function_helper_graph`]. `buf_lltype`
 /// is `STRPTR`/`UNICODEPTR` (the `current_buf` field and `mallocfn` result).
-/// Synthesise `copy_string_contents(src, dst, srcstart, dststart, length)`
-/// (`rstr.py` `copy_string_contents` / `copy_unicode_contents`): a single
-/// `copystrcontent` / `copyunicodecontent` op over whole string objects.
-/// The builder append/build trees thread this as a `direct_call` callee
-/// const (`copy_fn`), so the shared copy primitive is materialised once and
-/// baked in via [`functionptr_const`], mirroring the `ll_min` / `mallocstr`
-/// consts of [`build_ll_new_helper_graph`]. `buf_lltype` is `STRPTR` /
-/// `UNICODEPTR`; `copy_opname` selects `copystrcontent` (STR) vs
-/// `copyunicodecontent` (UNICODE). Returns `Void`.
-pub fn build_ll_copy_string_contents_helper_graph(
-    name: &str,
-    buf_lltype: LowLevelType,
-    copy_opname: &'static str,
-) -> Result<PyGraph, TyperError> {
-    let src = variable_with_lltype("src", buf_lltype.clone());
-    let dst = variable_with_lltype("dst", buf_lltype);
-    let srcstart = variable_with_lltype("srcstart", LowLevelType::Signed);
-    let dststart = variable_with_lltype("dststart", LowLevelType::Signed);
-    let length = variable_with_lltype("length", LowLevelType::Signed);
-    let startblock = Block::shared(vec![
-        Hlvalue::Variable(src.clone()),
-        Hlvalue::Variable(dst.clone()),
-        Hlvalue::Variable(srcstart.clone()),
-        Hlvalue::Variable(dststart.clone()),
-        Hlvalue::Variable(length.clone()),
-    ]);
-    let return_var = variable_with_lltype("result", LowLevelType::Void);
-    let mut graph = FunctionGraph::with_return_var(
-        name.to_string(),
-        startblock.clone(),
-        Hlvalue::Variable(return_var),
-    );
-    let void_result = variable_with_lltype("v", LowLevelType::Void);
-    startblock.borrow_mut().operations.push(SpaceOperation::new(
-        copy_opname,
-        vec![
-            Hlvalue::Variable(src),
-            Hlvalue::Variable(dst),
-            Hlvalue::Variable(srcstart),
-            Hlvalue::Variable(dststart),
-            Hlvalue::Variable(length),
-        ],
-        Hlvalue::Variable(void_result),
-    ));
-    let none_const = Hlvalue::Constant(Constant::with_concretetype(
-        ConstValue::None,
-        LowLevelType::Void,
-    ));
-    startblock.closeblock(vec![
-        Link::new(vec![none_const], Some(graph.returnblock.clone()), None).into_ref(),
-    ]);
-
-    let func = GraphFunc::new(
-        name.to_string(),
-        Constant::new(ConstValue::Dict(Default::default())),
-    );
-    graph.func = Some(func.clone());
-    Ok(helper_pygraph_from_graph(
-        graph,
-        vec![
-            "src".to_string(),
-            "dst".to_string(),
-            "srcstart".to_string(),
-            "dststart".to_string(),
-            "length".to_string(),
-        ],
-        func,
-    ))
-}
-
 pub fn build_ll_new_helper_graph(
     name: &str,
     builder_ptr_lltype: LowLevelType,
@@ -6057,8 +5987,8 @@ fn rtype_builder_getlength(
 /// here and baked in as `direct_call` callee consts by [`functionptr_const`],
 /// mirroring the `ll_min` / `mallocstr` consts of [`rtype_builder_new`].
 /// `piece_ptr_lltype` / `piece_struct` are `STRINGPIECEPTR` / `STRINGPIECE`
-/// (or the UNICODE pair); `malloc_name` and `copy_opname` select the
-/// STR (`mallocstr` / `copystrcontent`) vs UNICODE variants.
+/// (or the UNICODE pair); `malloc_name` selects the STR (`mallocstr`) vs
+/// UNICODE variants.
 #[allow(clippy::too_many_arguments)]
 fn rtype_builder_append(
     self_repr: &dyn Repr,
@@ -6069,7 +5999,6 @@ fn rtype_builder_append(
     piece_struct: LowLevelType,
     buf_lltype: LowLevelType,
     malloc_name: &'static str,
-    copy_opname: &'static str,
 ) -> RTypeResult {
     use crate::translator::rtyper::lltypesystem::rstr::{
         build_ll_mallocstr_helper_graph, chars_array_ptr_lltype_from_strptr,
@@ -6094,24 +6023,8 @@ fn rtype_builder_append(
             let chars_ptr = chars_array_ptr_lltype_from_strptr(&outer_buf)?;
 
             // copy_fn = copy_string_contents(src, dst, srcstart, dststart, length)
-            let copy_buf = outer_buf.clone();
-            let copy = rtyper.lowlevel_helper_function_with_builder(
-                "ll_copy_string_contents".to_string(),
-                vec![
-                    outer_buf.clone(),
-                    outer_buf.clone(),
-                    LowLevelType::Signed,
-                    LowLevelType::Signed,
-                    LowLevelType::Signed,
-                ],
-                LowLevelType::Void,
-                move |_r, _a, _res| {
-                    build_ll_copy_string_contents_helper_graph(
-                        "ll_copy_string_contents",
-                        copy_buf,
-                        copy_opname,
-                    )
-                },
+            let copy = crate::translator::rtyper::lltypesystem::rstr::copy_contents_helper(
+                rtyper, &outer_buf,
             )?;
             let copy_fn = functionptr_const(rtyper, &copy)?;
 
@@ -6339,7 +6252,6 @@ fn rtype_builder_append_slice(
     piece_struct: LowLevelType,
     buf_lltype: LowLevelType,
     malloc_name: &'static str,
-    copy_opname: &'static str,
 ) -> RTypeResult {
     use crate::translator::rtyper::lltypesystem::rstr::{
         build_ll_mallocstr_helper_graph, chars_array_ptr_lltype_from_strptr,
@@ -6367,24 +6279,8 @@ fn rtype_builder_append_slice(
             let chars_ptr = chars_array_ptr_lltype_from_strptr(&outer_buf)?;
 
             // copy_fn = copy_string_contents(src, dst, srcstart, dststart, length)
-            let copy_buf = outer_buf.clone();
-            let copy = rtyper.lowlevel_helper_function_with_builder(
-                "ll_copy_string_contents".to_string(),
-                vec![
-                    outer_buf.clone(),
-                    outer_buf.clone(),
-                    LowLevelType::Signed,
-                    LowLevelType::Signed,
-                    LowLevelType::Signed,
-                ],
-                LowLevelType::Void,
-                move |_r, _a, _res| {
-                    build_ll_copy_string_contents_helper_graph(
-                        "ll_copy_string_contents",
-                        copy_buf,
-                        copy_opname,
-                    )
-                },
+            let copy = crate::translator::rtyper::lltypesystem::rstr::copy_contents_helper(
+                rtyper, &outer_buf,
             )?;
             let copy_fn = functionptr_const(rtyper, &copy)?;
 
@@ -6537,7 +6433,6 @@ fn rtype_builder_build(
     piece_ptr_lltype: LowLevelType,
     buf_lltype: LowLevelType,
     malloc_name: &'static str,
-    copy_opname: &'static str,
 ) -> RTypeResult {
     use crate::translator::rtyper::lltypesystem::rstr::{
         build_ll_mallocstr_helper_graph, chars_array_ptr_lltype_from_strptr,
@@ -6566,24 +6461,8 @@ fn rtype_builder_build(
             let getlength_fn = functionptr_const(rtyper, &getlength)?;
 
             // copy_fn = copy_string_contents(src, dst, srcstart, dststart, length)
-            let copy_buf = outer_buf.clone();
-            let copy = rtyper.lowlevel_helper_function_with_builder(
-                "ll_copy_string_contents".to_string(),
-                vec![
-                    outer_buf.clone(),
-                    outer_buf.clone(),
-                    LowLevelType::Signed,
-                    LowLevelType::Signed,
-                    LowLevelType::Signed,
-                ],
-                LowLevelType::Void,
-                move |_r, _a, _res| {
-                    build_ll_copy_string_contents_helper_graph(
-                        "ll_copy_string_contents",
-                        copy_buf,
-                        copy_opname,
-                    )
-                },
+            let copy = crate::translator::rtyper::lltypesystem::rstr::copy_contents_helper(
+                rtyper, &outer_buf,
             )?;
             let copy_fn = functionptr_const(rtyper, &copy)?;
 
@@ -6823,7 +6702,6 @@ impl Repr for StringBuilderRepr {
                         STRINGPIECE.clone(),
                         STRPTR.clone(),
                         "mallocstr",
-                        "copystrcontent",
                     )
                 }
             }
@@ -6838,7 +6716,6 @@ impl Repr for StringBuilderRepr {
                     STRINGPIECE.clone(),
                     STRPTR.clone(),
                     "mallocstr",
-                    "copystrcontent",
                 )
             }
             "build" => rtype_builder_build(
@@ -6848,7 +6725,6 @@ impl Repr for StringBuilderRepr {
                 STRINGPIECEPTR.clone(),
                 STRPTR.clone(),
                 "mallocstr",
-                "copystrcontent",
             ),
             _ => Err(TyperError::message(format!(
                 "missing {}.rtype_method_{method_name}",
@@ -6948,7 +6824,6 @@ impl Repr for UnicodeBuilderRepr {
                         UNICODEPIECE.clone(),
                         UNICODEPTR.clone(),
                         "mallocunicode",
-                        "copyunicodecontent",
                     )
                 }
             }
@@ -6963,7 +6838,6 @@ impl Repr for UnicodeBuilderRepr {
                     UNICODEPIECE.clone(),
                     UNICODEPTR.clone(),
                     "mallocunicode",
-                    "copyunicodecontent",
                 )
             }
             "build" => rtype_builder_build(
@@ -6973,7 +6847,6 @@ impl Repr for UnicodeBuilderRepr {
                 UNICODEPIECEPTR.clone(),
                 UNICODEPTR.clone(),
                 "mallocunicode",
-                "copyunicodecontent",
             ),
             _ => Err(TyperError::message(format!(
                 "missing {}.rtype_method_{method_name}",
@@ -8824,7 +8697,7 @@ mod tests {
             "_ll_append",
             "ll_grow_and_append",
             "ll_grow_by",
-            "ll_copy_string_contents",
+            "copy_string_contents",
             "mallocstr",
         ] {
             assert!(
@@ -8918,7 +8791,7 @@ mod tests {
             "_ll_append",
             "ll_grow_and_append",
             "ll_grow_by",
-            "ll_copy_string_contents",
+            "copy_string_contents",
             "mallocstr",
         ] {
             assert!(
@@ -9201,7 +9074,7 @@ mod tests {
             "_ll_append",
             "ll_grow_and_append",
             "ll_grow_by",
-            "ll_copy_string_contents",
+            "copy_unicode_contents",
             "mallocunicode",
         ] {
             assert!(

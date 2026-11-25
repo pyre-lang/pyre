@@ -192,7 +192,7 @@ impl UnicodeArray {
     /// it: the referenced set is unchanged and only which card page holds each
     /// pointer moves. A minor reaches a carded array through its dirty pages
     /// alone, so a young pointer shifted into a clean page would not be
-    /// scanned. The list side spells this `list_before_move_barrier`.
+    /// scanned. The list side spells this `ll_arraymove_items_block`.
     #[inline]
     fn before_move_barrier(&self) {
         if !self.block.is_null() {
@@ -272,13 +272,19 @@ impl UnicodeArray {
     pub fn remove(&mut self, index: usize) -> *const UnicodeValueStorage {
         assert!(index < self.len_relaxed());
         let value = self.as_slice()[index];
-        self.before_move_barrier();
+        let newlength = self.len_relaxed() - 1;
         unsafe {
-            let p = self.base().add(index);
-            std::ptr::copy(p.add(1), p, self.len_relaxed() - index - 1);
-            *p.add(self.len_relaxed() - index - 1) = std::ptr::null_mut();
+            // rlist.py `ll_delitem_nonneg`: `ll_arraymove` then
+            // `ll_setitem_fast(newlength, null)` then `_ll_resize_le`.
+            crate::object_array::ll_arraymove_items_block(
+                self.block,
+                index as i64 + 1,
+                index as i64,
+                (newlength - index) as i64,
+            );
+            crate::object_array::items_block_set_ref(self.block, newlength, std::ptr::null_mut());
         }
-        self.set_len_relaxed(self.len_relaxed() - 1);
+        self.set_len_relaxed(newlength);
         value
     }
 

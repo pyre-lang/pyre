@@ -400,18 +400,11 @@ fn register_builtins() -> HashMap<String, BuiltinAnalyzer> {
         "std.ptr.copy_nonoverlapping",
         std_ptr_copy_nonoverlapping,
     );
+    analyzer_for(&mut reg, "std.ptr.copy", std_ptr_copy);
     // `core.ptr.write` is the same `HostObject` as `std.ptr.write`
     // (`flowspace/model.rs`), so this qualname covers both spellings
     // and `core.ptr.mut_ptr.<Impl>.write`.
     analyzer_for(&mut reg, "std.ptr.write", std_ptr_write);
-    // `rgc.py` `ll_arraycopy` residual. Source/dest are unconstrained
-    // (`@enforceargs(None, None, int, int, int)`), so List and
-    // Instance never union in this analyzer.
-    analyzer_for(
-        &mut reg,
-        crate::runtime_names::modules::JIT_LL_ARRAYCOPY,
-        jit_ll_arraycopy,
-    );
     // `std::alloc::alloc` / `alloc_zeroed` — `ann_malloc` (`lltype.py`)
     // returns `SomePtr` for `lltype.malloc(..., flavor='raw')`. The
     // `alloc::alloc` re-export shares the HOST_ENV callable, so this
@@ -478,11 +471,6 @@ fn register_builtins() -> HashMap<String, BuiltinAnalyzer> {
         &mut reg,
         crate::runtime_names::shims::CAST_ADDRESS,
         cast_address_intrinsic,
-    );
-    analyzer_for(
-        &mut reg,
-        crate::runtime_names::shims::LL_ARRAYMOVE,
-        ll_arraymove_intrinsic,
     );
     // Rust `String::new()` / `String::with_capacity(n)` construct an empty
     // owned UTF-8 buffer; both annotate as a mutable `SomeString` so the
@@ -1838,6 +1826,27 @@ fn std_ptr_copy_nonoverlapping(
     Ok(s_none())
 }
 
+/// `std::ptr::copy(src, dst, count) -> ()`.
+///
+/// The overlap-safe move, rtyped to `llmemory.raw_memmove`. The
+/// foreign decl is opaque. A user graph for it has one input slot
+/// per argument, and `mergeinputargs` unions every caller's pointee
+/// into that slot. `llmemory.raw_memmove` returns nothing and does
+/// not read the pointee, so this analyzer does not either: `()` is
+/// `s_None`.
+fn std_ptr_copy(
+    _bk: &Rc<Bookkeeper>,
+    args_s: &[Option<SomeValue>],
+    kwds: &HashMap<String, Option<SomeValue>>,
+) -> Result<SomeValue, AnnotatorError> {
+    if !kwds.is_empty() || args_s.len() != 3 {
+        return Err(AnnotatorError::new(
+            "std.ptr.copy expects (src, dst, count)",
+        ));
+    }
+    Ok(s_none())
+}
+
 /// `std::ptr::write(dst, src) -> ()`.
 ///
 /// Same opaque-foreign shape as `copy_nonoverlapping`: a unique graph
@@ -1852,40 +1861,6 @@ fn std_ptr_write(
 ) -> Result<SomeValue, AnnotatorError> {
     if !kwds.is_empty() || args_s.len() != 2 {
         return Err(AnnotatorError::new("std.ptr.write expects (dst, src)"));
-    }
-    Ok(s_none())
-}
-
-/// `rgc.py` `ll_arraycopy(source, dest, source_start, dest_start, length)`.
-///
-/// `@enforceargs(None, None, int, int, int)` does not constrain the
-/// ARRAY. The shared residual is `dont_look_inside` and returns
-/// nothing, so this analyzer does not read source/dest: `()` is
-/// `s_None`. `SomeBool` subclasses `SomeInteger` (`model.py`), so a
-/// bool start/length is an `int` for `@enforceargs`.
-fn jit_ll_arraycopy(
-    _bk: &Rc<Bookkeeper>,
-    args_s: &[Option<SomeValue>],
-    kwds: &HashMap<String, Option<SomeValue>>,
-) -> Result<SomeValue, AnnotatorError> {
-    if !kwds.is_empty() || args_s.len() != 5 {
-        return Err(AnnotatorError::new(
-            "object_array.jit_ll_arraycopy expects (source, dest, source_start, dest_start, length)",
-        ));
-    }
-    for index in 2..5 {
-        if !matches!(
-            arg_at(
-                args_s,
-                index,
-                crate::runtime_names::modules::JIT_LL_ARRAYCOPY
-            ),
-            SomeValue::Integer(_) | SomeValue::Bool(_)
-        ) {
-            return Err(AnnotatorError::new(format!(
-                "object_array.jit_ll_arraycopy argument {index} must be SomeInteger (SomeBool is a SomeInteger)"
-            )));
-        }
     }
     Ok(s_none())
 }
@@ -2178,44 +2153,6 @@ fn cast_address_intrinsic(
         can_be_none,
         std::collections::BTreeMap::new(),
     )))
-}
-
-/// Annotation of the Rust-adapter spelling of `ll_arraymove`.
-///
-/// The MIR front has already recovered a logical list-items array from the
-/// raw pointers before emitting this call, so the receiver arrives as the
-/// list, matching the list-taking spelling `rlist.ll_arraymove`
-/// (`rpython/rtyper/rlist.py`) rather than the ll-items one
-/// (`rgc.ll_arraymove`, `rpython/rlib/rgc.py`), which takes
-/// `lst.ll_items()`.
-///
-/// The declared signature is the whole surface, and both spellings declare
-/// the same one: `@signature(types.any(), types.int(), types.int(),
-/// types.int(), returns=types.none())` and `@enforceargs(None, int, int,
-/// int)`.  `types.any()` / `None` constrain the receiver not at all, so this
-/// port constrains it not at all either — only the three indices are checked,
-/// and there is no result.
-fn ll_arraymove_intrinsic(
-    _bk: &Rc<Bookkeeper>,
-    args_s: &[Option<SomeValue>],
-    kwds: &HashMap<String, Option<SomeValue>>,
-) -> Result<SomeValue, AnnotatorError> {
-    if !kwds.is_empty() || args_s.len() != 4 {
-        return Err(AnnotatorError::new(
-            "__majit_ll_arraymove expects (array, source_start, dest_start, length)",
-        ));
-    }
-    for index in 1..4 {
-        if !matches!(
-            arg_at(args_s, index, crate::runtime_names::shims::LL_ARRAYMOVE),
-            SomeValue::Integer(_)
-        ) {
-            return Err(AnnotatorError::new(format!(
-                "__majit_ll_arraymove argument {index} must be SomeInteger"
-            )));
-        }
-    }
-    Ok(s_none())
 }
 
 /// True when `instantiated_name` is a generic instantiation of the enum
@@ -8560,34 +8497,28 @@ mod tests {
     }
 
     #[test]
-    fn jit_ll_arraycopy_returns_none_for_a_list_and_an_instance() {
+    fn copy_returns_none_for_an_instance_and_a_string() {
         let bk = bk();
         let inst = SomeValue::Instance(SomeInstance::new(None, false, Default::default()));
-        let list = SomeValue::List(bk.newlist(&[], None).expect("empty list"));
+        let text = SomeValue::String(SomeString::new(false, false));
         let count = SomeValue::Integer(SomeInteger::new(true, true));
-        for (src, dst) in [(&inst, &inst), (&list, &list), (&list, &inst)] {
+        for (src, dst) in [(&inst, &inst), (&text, &text), (&inst, &text)] {
             let result = call_builtin(
                 &bk,
-                crate::runtime_names::modules::JIT_LL_ARRAYCOPY,
-                &[
-                    Some(src.clone()),
-                    Some(dst.clone()),
-                    Some(count.clone()),
-                    Some(count.clone()),
-                    Some(count.clone()),
-                ],
+                "std.ptr.copy",
+                &[Some(src.clone()), Some(dst.clone()), Some(count.clone())],
                 &no_kwds(),
             )
-            .expect("jit_ll_arraycopy annotates");
+            .expect("copy annotates");
             assert!(
                 matches!(result, SomeValue::None_(_)),
-                "arraycopy returns (), got {result:?}"
+                "copy returns (), got {result:?}"
             );
         }
         let err = call_builtin(
             &bk,
-            crate::runtime_names::modules::JIT_LL_ARRAYCOPY,
-            &[Some(inst.clone()), Some(count.clone())],
+            "std.ptr.copy",
+            &[Some(inst), Some(count.clone())],
             &no_kwds(),
         )
         .expect_err("two arguments are not the signature");
@@ -8595,44 +8526,7 @@ mod tests {
             err.msg
                 .as_deref()
                 .unwrap_or("")
-                .contains("expects (source, dest, source_start, dest_start, length)")
-        );
-        let s_bool = SomeValue::Bool(SomeBool::new());
-        let result = call_builtin(
-            &bk,
-            crate::runtime_names::modules::JIT_LL_ARRAYCOPY,
-            &[
-                Some(list.clone()),
-                Some(inst),
-                Some(s_bool.clone()),
-                Some(count.clone()),
-                Some(s_bool),
-            ],
-            &no_kwds(),
-        )
-        .expect("jit_ll_arraycopy annotates bool start/length");
-        assert!(
-            matches!(result, SomeValue::None_(_)),
-            "arraycopy returns (), got {result:?}"
-        );
-        let err = call_builtin(
-            &bk,
-            crate::runtime_names::modules::JIT_LL_ARRAYCOPY,
-            &[
-                Some(list.clone()),
-                Some(list),
-                Some(count.clone()),
-                Some(count),
-                Some(SomeValue::Float(SomeFloat::new())),
-            ],
-            &no_kwds(),
-        )
-        .expect_err("float length is not SomeInteger");
-        assert!(
-            err.msg
-                .as_deref()
-                .unwrap_or("")
-                .contains("must be SomeInteger")
+                .contains("expects (src, dst, count)")
         );
     }
 

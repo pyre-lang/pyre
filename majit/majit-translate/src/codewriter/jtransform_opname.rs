@@ -79,7 +79,8 @@ use crate::model::{
 use crate::parse::CallPath;
 use crate::translator::backendopt::constfold::{MALLOC_ZERO_FILLED_TAG_ID, WE_ARE_JITTED_TAG_ID};
 use crate::translator::rtyper::lltypesystem::lltype::{
-    _address, Array, ForwardReference, GcKind, LowLevelType, Ptr, PtrTarget, Struct,
+    _address, _ptr, Array, ForwardReference, GcKind, LowLevelType, LowLevelValue, Ptr, PtrTarget,
+    Struct,
 };
 use crate::translator::rtyper::lltypesystem::rbytearray::BYTEARRAYPTR;
 use crate::translator::rtyper::lltypesystem::rffi::CCHARP;
@@ -781,9 +782,7 @@ fn transduce_op(
         // `jtransform.py` `('keepalive', '-live-')`: keep the operands as
         // forced live values (`liveness.py` `-live-` args).
         "keepalive" => {
-            let forced: Vec<_> = op
-                .args
-                .iter()
+            let forced: Vec<_> = non_void_args(&op.args)
                 .map(|arg| materialize(out, block, arg))
                 .collect();
             out.block_mut(block)
@@ -852,12 +851,44 @@ fn transduce_op(
         // `STRUCT._immutable_field(name)`; a struct with the `immutable`
         // hint (`TUPLE_TYPE`) is `getfield_gc_*_pure`.
         "getfield" => {
-            let base = expect_var(&op.args[0]);
+            // `Transformer.rewrite_op_getfield` returns for a Void result.
+            if hlvalue_is_void(&op.result) {
+                return;
+            }
             let field_name = field_name_of(&op.args[1]);
-            let field = field_descriptor_of(&base, &field_name, "getfield");
+            // `Transformer.handle_getfield_typeptr`: a Constant receiver
+            // folds to `same_as` of `op.args[0].value.typeptr`.
+            if field_name == "typeptr"
+                && let Hlvalue::Constant(c) = &op.args[0]
+            {
+                let ConstValue::LLPtr(ptr) = &c.value else {
+                    panic!(
+                        "jtransform_opname::lower_graph: Constant typeptr receiver is not an LLPtr: {:?}",
+                        c.value
+                    );
+                };
+                let typeptr = constant_receiver_typeptr(ptr);
+                let result = expect_var(&op.result);
+                let result_ty = result.concretetype().expect(
+                    "jtransform_opname::lower_graph: typeptr getfield result has concretetype",
+                );
+                let cls =
+                    Constant::with_concretetype(ConstValue::LLPtr(Box::new(typeptr)), result_ty);
+                let op = crate::codewriter::jtransform::materialize_const_result_copy(result, &cls);
+                out.block_mut(block).operations.push(op);
+                return;
+            }
+            let field = field_descriptor_of_hlvalue(&op.args[0], &field_name, "getfield");
+            let pure = match &op.args[0] {
+                Hlvalue::Variable(base) => {
+                    owner_struct_of(base).is_some_and(|s| s._immutable_field(&field_name))
+                }
+                Hlvalue::Constant(c) => owner_struct_of_lltype(c.concretetype.as_ref().unwrap())
+                    .is_some_and(|s| s._immutable_field(&field_name)),
+            };
+            let base = materialize(out, block, &op.args[0]);
             let result = expect_var(&op.result);
             let ty = value_type_of(&result);
-            let pure = owner_struct_of(&base).is_some_and(|s| s._immutable_field(&field_name));
             out.push_op_with_result_var(
                 block,
                 OpKind::FieldRead {
@@ -883,7 +914,7 @@ fn transduce_op(
             let result = expect_var(&op.result);
             let result_ty = value_type_of(&result);
             if let Some(null_i) = op.args.iter().position(is_null_const) {
-                let operand = expect_var(&op.args[1 - null_i]);
+                let operand = materialize(out, block, &op.args[1 - null_i]);
                 let unop = if is_ne { "ptr_nonzero" } else { "ptr_iszero" };
                 out.push_op_with_result_var(
                     block,
@@ -895,8 +926,8 @@ fn transduce_op(
                     result,
                 );
             } else {
-                let lhs = expect_var(&op.args[0]);
-                let rhs = expect_var(&op.args[1]);
+                let lhs = materialize(out, block, &op.args[0]);
+                let rhs = materialize(out, block, &op.args[1]);
                 let bare = if is_ne { "ne" } else { "eq" };
                 out.push_op_with_result_var(
                     block,
@@ -919,7 +950,7 @@ fn transduce_op(
         // exitswitch into `goto_if_not_ptr_nonzero` /
         // `goto_if_not_ptr_iszero`.
         "ptr_nonzero" | "ptr_iszero" => {
-            let operand = expect_var(&op.args[0]);
+            let operand = materialize(out, block, &op.args[0]);
             let result = expect_var(&op.result);
             let result_ty = value_type_of(&result);
             let unop = if lltype_is_gc_ptr(&operand) {
@@ -947,9 +978,13 @@ fn transduce_op(
         // the stored value's kind: `current_buf` is a `Ref`, the size/offset
         // fields `Int`.  Void result.
         "setfield" => {
-            let base = expect_var(&op.args[0]);
+            // `Transformer.rewrite_op_setfield` returns for a Void value.
+            if hlvalue_is_void(&op.args[2]) {
+                return;
+            }
             let field_name = field_name_of(&op.args[1]);
-            let field = field_descriptor_of(&base, &field_name, "setfield");
+            let field = field_descriptor_of_hlvalue(&op.args[0], &field_name, "setfield");
+            let base = materialize(out, block, &op.args[0]);
             let value = linkarg_from_hlvalue(&op.args[2]);
             let ty = hlvalue_value_type(&op.args[2]);
             out.push_op_var(
@@ -1001,6 +1036,27 @@ fn transduce_op(
                 let result = expect_var(&op.result);
                 out.push_op_with_result_var(block, OpKind::New { owner }, result);
             }
+        }
+        // `jtransform.py rewrite_op_gc_identityhash = _do_builtin_call`:
+        // hand the one-reference `UnaryOp` to the shared `Transformer`,
+        // which emits `direct_call(_ll_1_gc_identityhash, x)` (`support.py`).
+        "gc_identityhash" => {
+            assert_eq!(
+                op.args.len(),
+                1,
+                "jtransform_opname::lower_graph: gc_identityhash takes one argument"
+            );
+            let operand = materialize(out, block, &op.args[0]);
+            let result = expect_var(&op.result);
+            out.push_op_with_result_var(
+                block,
+                OpKind::UnaryOp {
+                    op: "gc_identityhash".to_string(),
+                    operand,
+                    result_ty: value_type_of(&result),
+                },
+                result,
+            );
         }
         // `Transformer` rename table: Bool and Signed share the `i` input
         // bank, so the one backend conversion is `cast_int_to_float`.
@@ -1282,6 +1338,12 @@ fn transduce_op(
         // result is renamed to the argument, which is what the shared
         // `UnaryOp same_as` handling in `Transformer` does.
         "same_as" | "cast_pointer" | "likely" | "unlikely" | "cast_opaque_ptr" => {
+            // `Transformer.rewrite_op_same_as` returns None, so `optimize_block`
+            // renames the result. `do_rename` makes a Void result
+            // `Constant(None, lltype.Void)` and allocates no register.
+            if hlvalue_is_void(&op.args[0]) || hlvalue_is_void(&op.result) {
+                return;
+            }
             let result = expect_var(&op.result);
             if let Hlvalue::Constant(c) = &op.args[0] {
                 assert_rtyped_link_constant_kind(&out.name, c, &result);
@@ -1972,42 +2034,42 @@ pub(crate) fn materialize_constant(
                         ty: ValueType::Int,
                     }
                 }
-                _ => fail(),
+                _ => return materialize_constant_copy(out, block, c),
             },
             Some(LowLevelType::SignedLongLong) => match &c.value {
                 ConstValue::Int(n) => OpKind::ConstInt(*n),
-                _ => fail(),
+                _ => return materialize_constant_copy(out, block, c),
             },
             Some(LowLevelType::Unsigned | LowLevelType::UnsignedLongLong) => match &c.value {
                 ConstValue::UInt(n) => OpKind::ConstUInt(*n),
                 ConstValue::Int(n) if *n >= 0 => OpKind::ConstUInt(*n as u64),
-                _ => fail(),
+                _ => return materialize_constant_copy(out, block, c),
             },
             Some(LowLevelType::Bool) => match &c.value {
                 ConstValue::Bool(b) => OpKind::ConstBool(*b),
-                _ => fail(),
+                _ => return materialize_constant_copy(out, block, c),
             },
             Some(LowLevelType::Char) => match &c.value {
                 ConstValue::ByteStr(bytes) if bytes.len() == 1 => {
                     OpKind::ConstInt(i64::from(bytes[0]))
                 }
-                _ => fail(),
+                _ => return materialize_constant_copy(out, block, c),
             },
             Some(LowLevelType::UniChar) => match &c.value {
                 ConstValue::UniStr(s) if s.chars().count() == 1 => {
                     OpKind::ConstInt(s.chars().next().expect("one UniChar") as i64)
                 }
-                _ => fail(),
+                _ => return materialize_constant_copy(out, block, c),
             },
             Some(LowLevelType::Float) => match &c.value {
                 ConstValue::Float(bits) => OpKind::ConstFloat(*bits),
-                _ => fail(),
+                _ => return materialize_constant_copy(out, block, c),
             },
             Some(LowLevelType::SingleFloat) => match &c.value {
                 ConstValue::Float(bits) => {
                     OpKind::ConstSingleFloat((f64::from_bits(*bits) as f32).to_bits())
                 }
-                _ => fail(),
+                _ => return materialize_constant_copy(out, block, c),
             },
             Some(LowLevelType::Ptr(p)) => match &c.value {
                 ConstValue::LLPtr(ptr) if matches!(ptr._obj0_value(), Ok(None)) => {
@@ -2039,7 +2101,7 @@ pub(crate) fn materialize_constant(
                     Some((bytes, _)) => OpKind::ConstStr(bytes),
                     None => fail(),
                 },
-                _ => fail(),
+                _ => return materialize_constant_copy(out, block, c),
             },
             // `Assembler.emit_const` (`assembler.py`): Address → int via
             // `adr2int`. A catalogued address is relocated
@@ -2049,15 +2111,16 @@ pub(crate) fn materialize_constant(
             Some(LowLevelType::Address) => match &c.value {
                 ConstValue::LLAddress(_address::IntCast(n)) => OpKind::ConstRefAddr(*n),
                 ConstValue::LLAddress(_address::Null) => OpKind::ConstInt(0),
-                _ => fail(),
+                _ => return materialize_constant_copy(out, block, c),
             },
             None => match &c.value {
                 ConstValue::Int(n) => OpKind::ConstInt(*n),
                 ConstValue::UInt(n) => OpKind::ConstUInt(*n),
                 ConstValue::Bool(b) => OpKind::ConstBool(*b),
-                _ => fail(),
+                _ => return materialize_constant_copy(out, block, c),
             },
-            Some(_) => fail(),
+            Some(LowLevelType::Void) => fail(),
+            Some(_) => return materialize_constant_copy(out, block, c),
         };
         let lltype = match c.concretetype.clone() {
             Some(ty) => ty,
@@ -2077,6 +2140,25 @@ pub(crate) fn materialize_constant(
     // stamp the Constant's concretetype so regalloc colours it.
     result.set_concretetype(Some(lltype));
     result
+}
+
+/// Kinds with no dedicated `Const*` form (a symbolic `AddressOffset`, a
+/// prebuilt GC aggregate): `{kind}_copy(Constant)`, as
+/// `flatten.py insert_renamings`. Dedicated forms come first because
+/// `assembler.py Assembler.emit_const` pools the operand without an
+/// instruction, and a `{kind}_copy` adds one.
+fn materialize_constant_copy(
+    out: &mut crate::model::FunctionGraph,
+    block: BlockId,
+    c: &Constant,
+) -> FVar {
+    let var = out.alloc_value_var();
+    if let Some(ty) = c.concretetype.clone() {
+        var.set_concretetype(Some(ty));
+    }
+    let op = crate::codewriter::jtransform::materialize_const_result_copy(var.clone(), c);
+    out.block_mut(block).operations.push(op);
+    var
 }
 
 /// Map a flowspace operand to a model operand `Variable`, materialising
@@ -2308,6 +2390,26 @@ fn field_descriptor_of_hlvalue(
     }
 }
 
+/// `Transformer.handle_getfield_typeptr`: `cls = op.args[0].value.typeptr`.
+/// Walk `super` the way `rclass` `getattr(inst, 'typeptr')` does.
+fn constant_receiver_typeptr(ptr: &_ptr) -> _ptr {
+    let mut current = ptr.clone();
+    loop {
+        match current.getattr("typeptr") {
+            Ok(LowLevelValue::Ptr(typeptr)) => return *typeptr,
+            Ok(other) => {
+                panic!("jtransform_opname::lower_graph: typeptr field is not a Ptr: {other:?}")
+            }
+            Err(_) => match current.getattr("super") {
+                Ok(LowLevelValue::Ptr(super_ptr)) => current = *super_ptr,
+                other => panic!(
+                    "jtransform_opname::lower_graph: Constant typeptr receiver has no typeptr field ({other:?})"
+                ),
+            },
+        }
+    }
+}
+
 fn hlvalue_is_void(hlv: &Hlvalue) -> bool {
     match hlv {
         Hlvalue::Variable(v) => matches!(v.concretetype(), Some(LowLevelType::Void)),
@@ -2423,6 +2525,10 @@ fn emit_getinteriorfield(
     block: BlockId,
     op: &crate::flowspace::model::SpaceOperation,
 ) {
+    // `Transformer.rewrite_op_getinteriorfield` returns for a Void result.
+    if hlvalue_is_void(&op.result) {
+        return;
+    }
     assert_eq!(
         op.args.len(),
         3,
@@ -2473,9 +2579,6 @@ fn emit_getinteriorfield(
             },
             result,
         );
-        return;
-    }
-    if hlvalue_is_void(&op.result) {
         return;
     }
     let Some(array) = gc_array_of_operand(&op.args[0]) else {
@@ -3663,6 +3766,141 @@ mod tests {
         );
     }
 
+    fn assert_void_lowering_emits_nothing(graph: &FlowGraph) {
+        let model = lower_graph(graph);
+        for block in &model.blocks {
+            for op in &block.operations {
+                let is_const = matches!(
+                    op.kind,
+                    OpKind::ConstInt(_)
+                        | OpKind::ConstUInt(_)
+                        | OpKind::ConstInt128(_)
+                        | OpKind::ConstUInt128(_)
+                        | OpKind::ConstBool(_)
+                        | OpKind::ConstFloat(_)
+                        | OpKind::ConstSingleFloat(_)
+                        | OpKind::ConstStr(_)
+                        | OpKind::ConstInternedStr(_)
+                        | OpKind::ConstFnAddr { .. }
+                        | OpKind::ConstVtable { .. }
+                );
+                let is_copy = match &op.kind {
+                    OpKind::LoweredBlackholeOp { opname, .. } => opname.ends_with("_copy"),
+                    OpKind::UnaryOp { op, .. } => op.ends_with("_copy") || op == "same_as",
+                    _ => false,
+                };
+                panic!(
+                    "void operand must emit nothing and no Const*/_copy, got {:?} (const={is_const}, copy={is_copy})",
+                    op.kind
+                );
+            }
+        }
+    }
+
+    fn void_field_struct_ptr() -> LowLevelType {
+        let s = Struct::gc("VoidField", vec![("empty".into(), LowLevelType::Void)]);
+        LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::Struct(s),
+        }))
+    }
+
+    /// `Transformer.rewrite_op_same_as` / `do_rename`: Void is
+    /// `Constant(None, lltype.Void)` and allocates no register.
+    #[test]
+    fn void_same_as_emits_nothing() {
+        let n = variable_with_lltype("n", LowLevelType::Signed);
+        let start = Block::shared(vec![Hlvalue::Variable(n.clone())]);
+        let graph =
+            FlowGraph::with_return_var("void_same_as", start.clone(), Hlvalue::Variable(n.clone()));
+        let void_res = variable_with_lltype("v", LowLevelType::Void);
+        start.borrow_mut().operations.push(SpaceOperation::new(
+            "same_as",
+            vec![constant_with_lltype(ConstValue::None, LowLevelType::Void)],
+            Hlvalue::Variable(void_res),
+        ));
+        close_return(&start, &graph, n);
+        assert_void_lowering_emits_nothing(&graph);
+    }
+
+    /// `Transformer.rewrite_op_getfield` returns for a Void result.
+    #[test]
+    fn void_getfield_result_emits_nothing() {
+        let v = variable_with_lltype("v", void_field_struct_ptr());
+        let start = Block::shared(vec![Hlvalue::Variable(v.clone())]);
+        let graph = FlowGraph::with_return_var(
+            "void_getfield",
+            start.clone(),
+            Hlvalue::Variable(v.clone()),
+        );
+        let void_res = variable_with_lltype("empty", LowLevelType::Void);
+        start.borrow_mut().operations.push(SpaceOperation::new(
+            "getfield",
+            vec![
+                Hlvalue::Variable(v.clone()),
+                constant_with_lltype(ConstValue::byte_str("empty"), LowLevelType::Void),
+            ],
+            Hlvalue::Variable(void_res),
+        ));
+        close_return(&start, &graph, v);
+        assert_void_lowering_emits_nothing(&graph);
+    }
+
+    /// `Transformer.rewrite_op_setfield` returns for a Void stored value.
+    #[test]
+    fn void_setfield_value_emits_nothing() {
+        let v = variable_with_lltype("v", void_field_struct_ptr());
+        let start = Block::shared(vec![Hlvalue::Variable(v.clone())]);
+        let graph = FlowGraph::with_return_var(
+            "void_setfield",
+            start.clone(),
+            Hlvalue::Variable(v.clone()),
+        );
+        let void_res = variable_with_lltype("set", LowLevelType::Void);
+        start.borrow_mut().operations.push(SpaceOperation::new(
+            "setfield",
+            vec![
+                Hlvalue::Variable(v.clone()),
+                constant_with_lltype(ConstValue::byte_str("empty"), LowLevelType::Void),
+                constant_with_lltype(ConstValue::None, LowLevelType::Void),
+            ],
+            Hlvalue::Variable(void_res),
+        ));
+        close_return(&start, &graph, v);
+        assert_void_lowering_emits_nothing(&graph);
+    }
+
+    /// `Transformer.rewrite_op_getinteriorfield` returns for a Void result.
+    #[test]
+    fn void_getinteriorfield_result_emits_nothing() {
+        let entry = Struct::new("VOIDENTRY", vec![("empty".into(), LowLevelType::Void)]);
+        let array_ptr = LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::Array(Array::gc(LowLevelType::Struct(Box::new(entry)))),
+        }));
+        let arr = variable_with_lltype("arr", array_ptr);
+        let index = variable_with_lltype("i", LowLevelType::Signed);
+        let start = Block::shared(vec![
+            Hlvalue::Variable(arr.clone()),
+            Hlvalue::Variable(index.clone()),
+        ]);
+        let graph = FlowGraph::with_return_var(
+            "void_getinteriorfield",
+            start.clone(),
+            Hlvalue::Variable(arr.clone()),
+        );
+        let void_res = variable_with_lltype("empty", LowLevelType::Void);
+        start.borrow_mut().operations.push(SpaceOperation::new(
+            "getinteriorfield",
+            vec![
+                Hlvalue::Variable(arr.clone()),
+                Hlvalue::Variable(index),
+                constant_with_lltype(ConstValue::byte_str("empty"), LowLevelType::Void),
+            ],
+            Hlvalue::Variable(void_res),
+        ));
+        close_return(&start, &graph, arr);
+        assert_void_lowering_emits_nothing(&graph);
+    }
+
     /// `Transformer.rewrite_op_int_{floordiv,mod} = _do_builtin_call`.
     /// The opname spine must enter the shared rich-graph rewrite as the bare
     /// BinOp names.  With no helper graph registered, that is the
@@ -4378,30 +4616,38 @@ mod tests {
     }
 
     /// End-to-end: the restructured production `ll_strconcat` helper lowers
-    /// cleanly through Spine B.  The two `copystrcontent` ops become void
-    /// `LoweredBlackholeOp`s, the source-length reads fuse to `strlen`, and
+    /// cleanly through Spine B.  The two `copy_string_contents` `direct_call`s
+    /// become `OpKind::Call`s, the source-length reads fuse to `strlen`, and
     /// the cross-Phi `resolve_string` fail-loud is never reached because no
     /// per-char loop (strgetitem/strsetitem) survives.
     #[test]
-    fn lower_graph_lowers_strconcat_helper_to_copystrcontent() {
+    fn lower_graph_lowers_strconcat_helper_copy_calls() {
+        use crate::model::CallTarget;
         use crate::translator::rtyper::lltypesystem::rstr::{
             STRPTR, build_ll_strconcat_helper_graph,
         };
 
-        let helper = build_ll_strconcat_helper_graph("ll_strconcat", STRPTR.clone())
+        let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
+        let rtyper = crate::translator::rtyper::rtyper::RPythonTyper::new(&ann);
+        let helper = build_ll_strconcat_helper_graph(&rtyper, "ll_strconcat", STRPTR.clone())
             .expect("build strconcat helper");
         let flow = helper.graph.borrow();
         let model = lower_graph(&flow);
 
         let mut blackhole = Vec::new();
+        let mut copy_calls = 0;
         for block in &model.blocks {
             for op in &block.operations {
-                if let OpKind::LoweredBlackholeOp { opname, args } = &op.kind {
-                    blackhole.push(opname.clone());
-                    if opname == "copystrcontent" {
-                        assert_eq!(args.len(), 5, "copystrcontent has 5 operands");
-                        assert!(op.result.is_none(), "copystrcontent is void");
+                match &op.kind {
+                    OpKind::LoweredBlackholeOp { opname, .. } => {
+                        blackhole.push(opname.clone());
                     }
+                    OpKind::Call { target, .. }
+                        if *target == CallTarget::function_path(["copy_string_contents"]) =>
+                    {
+                        copy_calls += 1;
+                    }
+                    _ => {}
                 }
             }
         }
@@ -4415,9 +4661,10 @@ mod tests {
         assert_eq!(blackhole.iter().filter(|n| *n == "newstr").count(), 1);
         assert_eq!(
             blackhole.iter().filter(|n| *n == "copystrcontent").count(),
-            2,
-            "two copystrcontent bulk copies"
+            0,
+            "no copystrcontent blackhole op"
         );
+        assert_eq!(copy_calls, 2, "two copy_string_contents calls");
         // No per-char string ops: the loop is gone, so resolve_string never runs.
         assert!(
             !blackhole
@@ -7796,6 +8043,30 @@ mod tests {
         }
     }
 
+    #[test]
+    fn lower_graph_gc_identityhash_arm() {
+        let p = variable_with_lltype("p", STRPTR.clone());
+        let start = Block::shared(vec![Hlvalue::Variable(p.clone())]);
+        let h = variable_with_lltype("h", LowLevelType::Signed);
+        let graph = FlowGraph::with_return_var(
+            "gc_identityhash_arm",
+            start.clone(),
+            Hlvalue::Variable(h.clone()),
+        );
+        start.borrow_mut().operations.push(SpaceOperation::new(
+            "gc_identityhash",
+            vec![Hlvalue::Variable(p.clone())],
+            Hlvalue::Variable(h.clone()),
+        ));
+        close_return(&start, &graph, h);
+        match startblock_kinds(&graph).as_slice() {
+            [OpKind::UnaryOp { op, .. }] => {
+                assert_eq!(op, "gc_identityhash");
+            }
+            other => panic!("gc_identityhash → UnaryOp, got {other:?}"),
+        }
+    }
+
     /// Front / rtyper emit the 2-arg BinOp (offset, loop-invariant flag)
     /// `rewrite_op_threadlocalref_get` residualizes.
     #[test]
@@ -7829,5 +8100,360 @@ mod tests {
             }
             other => panic!("threadlocalref_get → BinOp, got {other:?}"),
         }
+    }
+
+    fn op_is_const_or_copy(op: &crate::model::SpaceOperation) -> bool {
+        match &op.kind {
+            OpKind::LoweredBlackholeOp { opname, .. }
+                if matches!(opname.as_str(), "int_copy" | "ref_copy" | "float_copy") =>
+            {
+                true
+            }
+            OpKind::ConstInt(_)
+            | OpKind::ConstUInt(_)
+            | OpKind::ConstBool(_)
+            | OpKind::ConstFloat(_)
+            | OpKind::ConstSingleFloat(_)
+            | OpKind::ConstRefNull
+            | OpKind::ConstStr(_)
+            | OpKind::ConstRefAddr(_)
+            | OpKind::ConstNone
+            | OpKind::ConstVtable { .. }
+            | OpKind::ConstSymbolic { .. } => true,
+            _ => false,
+        }
+    }
+
+    fn prebuilt_gc_struct_with_signed_x() -> (Hlvalue, LowLevelType) {
+        use crate::translator::rtyper::lltypesystem::lltype::{MallocFlavor, malloc};
+        let container = LowLevelType::Struct(Box::new(Struct::gc(
+            "PrebuiltX",
+            vec![("x".into(), LowLevelType::Signed)],
+        )));
+        let ptr =
+            malloc(container.clone(), None, MallocFlavor::Gc, true).expect("malloc PrebuiltX");
+        let ptr_ty = LowLevelType::Ptr(Box::new(
+            Ptr::from_container_type(container).expect("Ptr(PrebuiltX)"),
+        ));
+        (
+            constant_with_lltype(ConstValue::LLPtr(Box::new(ptr)), ptr_ty.clone()),
+            ptr_ty,
+        )
+    }
+
+    /// `Transformer.add_in_correct_list` returns early for `kind == 'void'`.
+    #[test]
+    fn keepalive_drops_void_operands() {
+        let v = variable_with_lltype("p", STRPTR.clone());
+        let start = Block::shared(vec![Hlvalue::Variable(v.clone())]);
+        let graph = FlowGraph::with_return_var(
+            "keepalive_drops_void",
+            start.clone(),
+            Hlvalue::Variable(v.clone()),
+        );
+        let void_res = variable_with_lltype("k", LowLevelType::Void);
+        start.borrow_mut().operations.push(SpaceOperation::new(
+            "keepalive",
+            vec![
+                Hlvalue::Variable(v.clone()),
+                constant_with_lltype(ConstValue::None, LowLevelType::Void),
+            ],
+            Hlvalue::Variable(void_res),
+        ));
+        close_return(&start, &graph, v.clone());
+        let model = lower_graph(&graph);
+        let ops = &model.block(model.startblock).operations;
+        let live = ops
+            .iter()
+            .find(|op| matches!(op.kind, OpKind::Live { .. }))
+            .unwrap_or_else(|| panic!("keepalive lowers to Live: {ops:?}"));
+        let OpKind::Live { forced } = &live.kind else {
+            unreachable!();
+        };
+        assert_eq!(forced.as_slice(), std::slice::from_ref(&v));
+        assert!(
+            ops.iter().all(|op| !op_is_const_or_copy(op)),
+            "Void keepalive operand emits no Const op: {ops:?}"
+        );
+    }
+
+    #[test]
+    fn prebuilt_object_getfield_receiver_is_materialized() {
+        let (receiver, ptr_ty) = prebuilt_gc_struct_with_signed_x();
+        let start = Block::shared(vec![]);
+        let result = variable_with_lltype("x", LowLevelType::Signed);
+        let graph = FlowGraph::with_return_var(
+            "prebuilt_object_getfield",
+            start.clone(),
+            Hlvalue::Variable(result.clone()),
+        );
+        start.borrow_mut().operations.push(SpaceOperation::new(
+            "getfield",
+            vec![
+                receiver,
+                constant_with_lltype(ConstValue::byte_str("x"), LowLevelType::Void),
+            ],
+            Hlvalue::Variable(result.clone()),
+        ));
+        close_return(&start, &graph, result);
+        let model = lower_graph(&graph);
+        let ops = &model.block(model.startblock).operations;
+        let base = ops
+            .iter()
+            .find_map(|op| match &op.kind {
+                OpKind::FieldRead { base, .. } => Some(base.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("getfield lowers to FieldRead: {ops:?}"));
+        assert_eq!(base.concretetype(), Some(ptr_ty));
+        assert!(
+            ops.iter()
+                .any(|op| op.result.as_ref() == Some(&base) && op_is_const_or_copy(op)),
+            "FieldRead base is defined by a const/copy op: {ops:?}"
+        );
+    }
+
+    #[test]
+    fn setfield_on_a_prebuilt_receiver_is_materialized() {
+        let (receiver, ptr_ty) = prebuilt_gc_struct_with_signed_x();
+        let dummy = variable_with_lltype("p", ptr_ty.clone());
+        let start = Block::shared(vec![Hlvalue::Variable(dummy.clone())]);
+        let graph = FlowGraph::with_return_var(
+            "prebuilt_object_setfield",
+            start.clone(),
+            Hlvalue::Variable(dummy.clone()),
+        );
+        let void_res = variable_with_lltype("set", LowLevelType::Void);
+        start.borrow_mut().operations.push(SpaceOperation::new(
+            "setfield",
+            vec![
+                receiver,
+                constant_with_lltype(ConstValue::byte_str("x"), LowLevelType::Void),
+                signed_const(1),
+            ],
+            Hlvalue::Variable(void_res),
+        ));
+        close_return(&start, &graph, dummy);
+        let model = lower_graph(&graph);
+        let ops = &model.block(model.startblock).operations;
+        let base = ops
+            .iter()
+            .find_map(|op| match &op.kind {
+                OpKind::FieldWrite { base, .. } => Some(base.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("setfield lowers to FieldWrite: {ops:?}"));
+        assert_eq!(base.concretetype(), Some(ptr_ty));
+        assert!(
+            ops.iter()
+                .any(|op| op.result.as_ref() == Some(&base) && op_is_const_or_copy(op)),
+            "FieldWrite base is defined by a const/copy op: {ops:?}"
+        );
+    }
+
+    #[test]
+    fn pointer_compare_accepts_a_prebuilt_constant_operand() {
+        let (rhs, ptr_ty) = prebuilt_gc_struct_with_signed_x();
+        let lhs = variable_with_lltype("p", ptr_ty);
+        let start = Block::shared(vec![Hlvalue::Variable(lhs.clone())]);
+        let result = variable_with_lltype("eq", LowLevelType::Bool);
+        let graph = FlowGraph::with_return_var(
+            "ptr_eq_prebuilt_const",
+            start.clone(),
+            Hlvalue::Variable(result.clone()),
+        );
+        start.borrow_mut().operations.push(SpaceOperation::new(
+            "ptr_eq",
+            vec![Hlvalue::Variable(lhs.clone()), rhs],
+            Hlvalue::Variable(result.clone()),
+        ));
+        close_return(&start, &graph, result.clone());
+        let model = lower_graph(&graph);
+        let ops = &model.block(model.startblock).operations;
+        let bin = ops
+            .iter()
+            .find(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "eq"))
+            .unwrap_or_else(|| panic!("ptr_eq lowers to binary eq: {ops:?}"));
+        let OpKind::BinOp {
+            lhs: got_lhs,
+            rhs: got_rhs,
+            ..
+        } = &bin.kind
+        else {
+            unreachable!();
+        };
+        assert_eq!(got_lhs, &lhs);
+        assert_ne!(got_rhs, &lhs);
+        assert!(
+            ops.iter()
+                .any(|op| op.result.as_ref() == Some(got_rhs) && op_is_const_or_copy(op)),
+            "ptr_eq rhs is a materialized var: {ops:?}"
+        );
+        assert_eq!(bin.result.as_ref(), Some(&result));
+    }
+
+    #[test]
+    fn constant_receiver_typeptr_read_folds_to_the_class_constant() {
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            LowLevelValue, MallocFlavor, malloc,
+        };
+        let vtable_container = LowLevelType::Struct(Box::new(Struct::new(
+            "vtable",
+            vec![("subclassrange_min".into(), LowLevelType::Signed)],
+        )));
+        let vtable =
+            malloc(vtable_container.clone(), None, MallocFlavor::Raw, true).expect("malloc vtable");
+        let vtable_ptr_ty = LowLevelType::Ptr(Box::new(
+            Ptr::from_container_type(vtable_container).expect("Ptr(vtable)"),
+        ));
+        let object_container = LowLevelType::Struct(Box::new(Struct::gc(
+            "object",
+            vec![("typeptr".into(), vtable_ptr_ty.clone())],
+        )));
+        let mut inst =
+            malloc(object_container.clone(), None, MallocFlavor::Gc, true).expect("malloc object");
+        inst.setattr("typeptr", LowLevelValue::Ptr(Box::new(vtable)))
+            .expect("set typeptr");
+        let inst_ptr_ty = LowLevelType::Ptr(Box::new(
+            Ptr::from_container_type(object_container).expect("Ptr(object)"),
+        ));
+        let receiver = constant_with_lltype(ConstValue::LLPtr(Box::new(inst)), inst_ptr_ty);
+        let start = Block::shared(vec![]);
+        let cls = variable_with_lltype("cls", vtable_ptr_ty);
+        let graph = FlowGraph::with_return_var(
+            "constant_receiver_typeptr",
+            start.clone(),
+            Hlvalue::Variable(cls.clone()),
+        );
+        start.borrow_mut().operations.push(SpaceOperation::new(
+            "getfield",
+            vec![
+                receiver,
+                constant_with_lltype(ConstValue::byte_str("typeptr"), LowLevelType::Void),
+            ],
+            Hlvalue::Variable(cls.clone()),
+        ));
+        close_return(&start, &graph, cls.clone());
+        let model = lower_graph(&graph);
+        let ops = &model.block(model.startblock).operations;
+        assert!(
+            ops.iter()
+                .all(|op| !matches!(op.kind, OpKind::FieldRead { .. })),
+            "Constant typeptr getfield emits no FieldRead: {ops:?}"
+        );
+        let defining = ops
+            .iter()
+            .find(|op| op.result.as_ref() == Some(&cls))
+            .unwrap_or_else(|| panic!("typeptr result is defined: {ops:?}"));
+        match &defining.kind {
+            OpKind::LoweredBlackholeOp { args, .. } => {
+                assert!(
+                    matches!(
+                        args.as_slice(),
+                        [LinkArg::Const(c)] if matches!(&c.value, ConstValue::LLPtr(p) if p.nonzero())
+                    ),
+                    "typeptr fold carries the vtable constant: {args:?}"
+                );
+            }
+            other => panic!("typeptr fold defines the result with a const/copy: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn address_offset_constant_reaches_the_integer_pool_unresolved() {
+        use crate::translator::rtyper::lltypesystem::llmemory::{AddressOffset, ItemOffset};
+        let v = variable_with_lltype("n", LowLevelType::Signed);
+        let start = Block::shared(vec![Hlvalue::Variable(v.clone())]);
+        let result = variable_with_lltype("sum", LowLevelType::Signed);
+        let graph = FlowGraph::with_return_var(
+            "address_offset_int_add",
+            start.clone(),
+            Hlvalue::Variable(result.clone()),
+        );
+        let offset = constant_with_lltype(
+            ConstValue::AddressOffset(AddressOffset::ItemOffset(ItemOffset {
+                TYPE: LowLevelType::Char,
+                repeat: 1,
+            })),
+            LowLevelType::Signed,
+        );
+        start.borrow_mut().operations.push(SpaceOperation::new(
+            "int_add",
+            vec![Hlvalue::Variable(v.clone()), offset],
+            Hlvalue::Variable(result.clone()),
+        ));
+        close_return(&start, &graph, result);
+        let model = lower_graph(&graph);
+        let ops = &model.block(model.startblock).operations;
+        let copy = ops
+            .iter()
+            .find(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::LoweredBlackholeOp { opname, args }
+                        if opname == "int_copy"
+                            && matches!(
+                                args.as_slice(),
+                                [LinkArg::Const(c)]
+                                    if matches!(c.value, ConstValue::AddressOffset(_))
+                            )
+                )
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "AddressOffset Constant becomes int_copy of the unresolved Constant: {ops:?}"
+                )
+            });
+        assert!(
+            !matches!(copy.kind, OpKind::ConstInt(_)),
+            "AddressOffset is not a resolved ConstInt: {ops:?}"
+        );
+    }
+
+    #[test]
+    fn leftover_constant_kind_falls_back_to_a_typed_copy() {
+        use crate::translator::rtyper::lltypesystem::lltype::{FuncType, Ptr, PtrTarget};
+
+        let (receiver, ptr_ty) = prebuilt_gc_struct_with_signed_x();
+        let leftover = match &receiver {
+            Hlvalue::Constant(c) => c.clone(),
+            other => panic!("prebuilt GcStruct is a Constant, got {other:?}"),
+        };
+        let start = Block::shared(vec![]);
+        let result = variable_with_lltype("out", LowLevelType::Signed);
+        let graph = FlowGraph::with_return_var(
+            "leftover_const_copy",
+            start.clone(),
+            Hlvalue::Variable(result.clone()),
+        );
+        let func_type = FuncType {
+            args: vec![ptr_ty],
+            result: LowLevelType::Signed,
+        };
+        let funcptr = Ptr {
+            TO: PtrTarget::Func(func_type),
+        }
+        ._example();
+        let callee = constant_with_lltype(ConstValue::LLPtr(Box::new(funcptr)), LowLevelType::Void);
+        start.borrow_mut().operations.push(SpaceOperation::new(
+            "direct_call",
+            vec![callee, receiver],
+            Hlvalue::Variable(result.clone()),
+        ));
+        close_return(&start, &graph, result);
+        let model = lower_graph(&graph);
+        let ops = &model.block(model.startblock).operations;
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::LoweredBlackholeOp { opname, args }
+                    if opname == "ref_copy"
+                        && matches!(
+                            args.as_slice(),
+                            [LinkArg::Const(c)] if c == &leftover
+                        )
+            )),
+            "leftover GcStruct Constant becomes ref_copy of that Constant: {ops:?}"
+        );
     }
 }

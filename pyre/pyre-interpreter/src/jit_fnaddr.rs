@@ -6531,6 +6531,12 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "_ll_1_int_abs",
         crate::objspace::descroperation::_ll_1_int_abs,
     );
+    cpa1!(
+        &mut entries,
+        "pyre_interpreter::objspace::descroperation::_ll_1_gc_identityhash",
+        "_ll_1_gc_identityhash",
+        crate::objspace::descroperation::_ll_1_gc_identityhash,
+    );
     cpa2!(
         &mut entries,
         "pyre_interpreter::objspace::descroperation::_ll_2_int_floordiv",

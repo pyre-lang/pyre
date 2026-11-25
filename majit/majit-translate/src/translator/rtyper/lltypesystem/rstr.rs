@@ -49,12 +49,13 @@ use std::sync::LazyLock;
 #[cfg(test)]
 use crate::annotator::annrpython::RPythonAnnotator;
 use crate::flowspace::model::{
-    Block, BlockRef, BlockRefExt, ConstValue, Constant, FunctionGraph, GraphFunc, GraphKey,
-    GraphRef, Hlvalue, Link, SpaceOperation, Variable, c_last_exception,
+    AlwaysInline, Block, BlockRef, BlockRefExt, ConstValue, Constant, FunctionGraph, GraphFunc,
+    GraphKey, GraphRef, Hlvalue, Link, SpaceOperation, Variable, c_last_exception,
 };
 use crate::flowspace::pygraph::PyGraph;
 use crate::translator::backendopt::constfold::{MALLOC_ZERO_FILLED_TAG_ID, WE_ARE_JITTED_TAG_ID};
 use crate::translator::rtyper::error::TyperError;
+use crate::translator::rtyper::lltypesystem::llmemory;
 use crate::translator::rtyper::lltypesystem::lltype::{
     _func, _ptr, _ptr_obj, Array, ForwardReference, FuncType, GCREF, GcKind, LowLevelType,
     LowLevelValue, MallocFlavor, Ptr, PtrTarget, Struct, WeakContainer,
@@ -65,8 +66,9 @@ use crate::translator::rtyper::rmodel::{
     RTypeResult, Repr, ReprState, gc_flavor_const, lowlevel_type_const,
 };
 use crate::translator::rtyper::rtyper::{
-    ConvertedTo, GenopResult, HighLevelOp, RPythonTyper, constant_with_lltype, exception_args,
-    helper_pygraph_from_graph, variable_with_lltype, void_field_const,
+    ConvertedTo, GenopResult, HighLevelOp, LowLevelFunction, RPythonTyper, constant_with_lltype,
+    exception_args, functionptr_const, helper_pygraph_from_graph, variable_with_lltype,
+    void_field_const,
 };
 
 /// RPython `STR = GcForwardReference()` resolved via
@@ -723,8 +725,9 @@ pub(crate) fn temp_ptr_lltype() -> LowLevelType {
 /// The items pointer is `Ptr(GcArray(GCREF))`, the list-of-str shape
 /// `externalvsinternal(..., gcref=True)` stores. `LLHelpers.ll_join`
 /// carries no `@jit.look_inside_iff` and no `@signature`.
-pub fn ll_join() -> Result<(), TyperError> {
-    build_ll_join_helper_graph("ll_join", gcref_items_ptr_lltype(), STRPTR.clone()).map(|_| ())
+pub fn ll_join(rtyper: &RPythonTyper) -> Result<(), TyperError> {
+    build_ll_join_helper_graph(rtyper, "ll_join", gcref_items_ptr_lltype(), STRPTR.clone())
+        .map(|_| ())
 }
 
 fn gcref_items_ptr_lltype() -> LowLevelType {
@@ -3423,37 +3426,282 @@ pub(crate) fn build_ll_join_chars_look_inside_iff_helper_graph_for(
     ))
 }
 
-/// `LLHelpers.ll_join_strs` (`lltypesystem/rstr.py`) selects
-/// `copy_string_contents` when `TYP.TO == STR` and `copy_unicode_contents`
-/// otherwise. Both come from `_new_copy_contents_fun`
-/// (`stroruni.copy_contents`) and lower to `copystrcontent` /
-/// `copyunicodecontent`.
-fn copy_contents_opname(str_ptr: &LowLevelType) -> Result<&'static str, TyperError> {
-    let chars_array_ptr_lltype = chars_array_ptr_lltype_from_strptr(str_ptr)?;
-    let LowLevelType::Ptr(chars_ptr) = &chars_array_ptr_lltype else {
-        return Err(TyperError::message(format!(
-            "join helper expects Ptr(Array(Char|UniChar)), got {chars_array_ptr_lltype:?}"
-        )));
+/// `STR` / `UNICODE` struct, its `chars` array type and that array's
+/// element type (`CHAR_TP` in `rstr.py _new_copy_contents_fun`).
+fn copy_contents_types(
+    str_ptr: &LowLevelType,
+) -> Result<(LowLevelType, LowLevelType, LowLevelType), TyperError> {
+    let str_struct = struct_lltype_from_strptr(str_ptr)?;
+    let chars_array_ty = match &str_struct {
+        LowLevelType::Struct(body) => body
+            ._flds
+            .get("chars")
+            .cloned()
+            .ok_or_else(|| TyperError::message("STR struct has no chars field"))?,
+        _ => {
+            return Err(TyperError::message(
+                "copy_string_contents: STR body is not a Struct",
+            ));
+        }
     };
-    let PtrTarget::Array(arr) = &chars_ptr.TO else {
-        return Err(TyperError::message(format!(
-            "join helper Ptr.TO must be Array, got {:?}",
-            chars_ptr.TO
-        )));
+    let char_tp = match &chars_array_ty {
+        LowLevelType::Array(arr) => arr.OF.clone(),
+        _ => {
+            return Err(TyperError::message(
+                "copy_string_contents: chars field is not an Array",
+            ));
+        }
     };
-    match &arr.OF {
-        LowLevelType::Char => Ok("copystrcontent"),
-        LowLevelType::UniChar => Ok("copyunicodecontent"),
-        other => Err(TyperError::message(format!(
-            "join helper unsupported chars element type {other:?}"
-        ))),
-    }
+    Ok((str_struct, chars_array_ty, char_tp))
+}
+
+pub(crate) fn build_copy_contents_helper_graph(
+    name: &str,
+    str_ptr: &LowLevelType,
+) -> Result<PyGraph, TyperError> {
+    let (str_struct, chars_array_ty, char_tp) = copy_contents_types(str_ptr)?;
+    let offsetof_chars = llmemory::offsetof(&str_struct, "chars").map_err(TyperError::message)?;
+    let itemoffset_chars =
+        llmemory::itemoffsetof(&chars_array_ty, 0).map_err(TyperError::message)?;
+    let sizeof_char = llmemory::sizeof(&char_tp, None).map_err(TyperError::message)?;
+
+    let signed_offset = |off: llmemory::AddressOffset| {
+        constant_with_lltype(ConstValue::AddressOffset(off), LowLevelType::Signed)
+    };
+    let push = |block: &BlockRef, op: &str, args: Vec<Hlvalue>, result: Variable| {
+        block.borrow_mut().operations.push(SpaceOperation::new(
+            op,
+            args,
+            Hlvalue::Variable(result),
+        ));
+    };
+
+    let src = variable_with_lltype("src", str_ptr.clone());
+    let dst = variable_with_lltype("dst", str_ptr.clone());
+    let srcstart = variable_with_lltype("srcstart", LowLevelType::Signed);
+    let dststart = variable_with_lltype("dststart", LowLevelType::Signed);
+    let length = variable_with_lltype("length", LowLevelType::Signed);
+    let startblock = Block::shared(vec![
+        Hlvalue::Variable(src.clone()),
+        Hlvalue::Variable(dst.clone()),
+        Hlvalue::Variable(srcstart.clone()),
+        Hlvalue::Variable(dststart.clone()),
+        Hlvalue::Variable(length.clone()),
+    ]);
+    let return_var = variable_with_lltype("result", LowLevelType::Void);
+    let mut graph = FunctionGraph::with_return_var(
+        name.to_string(),
+        startblock.clone(),
+        Hlvalue::Variable(return_var),
+    );
+
+    let ge0 = variable_with_lltype("ge0", LowLevelType::Bool);
+    push(
+        &startblock,
+        "int_ge",
+        vec![
+            Hlvalue::Variable(length.clone()),
+            constant_with_lltype(ConstValue::Int(0), LowLevelType::Signed),
+        ],
+        ge0.clone(),
+    );
+    let assert_void = variable_with_lltype("v", LowLevelType::Void);
+    push(
+        &startblock,
+        "debug_assert",
+        vec![
+            Hlvalue::Variable(ge0),
+            constant_with_lltype(
+                ConstValue::byte_str("copy_string_contents: negative length"),
+                LowLevelType::Void,
+            ),
+        ],
+        assert_void,
+    );
+
+    let src_adr = variable_with_lltype("src_adr", LowLevelType::Address);
+    push(
+        &startblock,
+        "cast_ptr_to_adr",
+        vec![Hlvalue::Variable(src.clone())],
+        src_adr.clone(),
+    );
+    let src_adr1 = variable_with_lltype("src_adr1", LowLevelType::Address);
+    push(
+        &startblock,
+        "adr_add",
+        vec![
+            Hlvalue::Variable(src_adr),
+            signed_offset(offsetof_chars.clone()),
+        ],
+        src_adr1.clone(),
+    );
+    let src_adr2 = variable_with_lltype("src_adr2", LowLevelType::Address);
+    push(
+        &startblock,
+        "adr_add",
+        vec![
+            Hlvalue::Variable(src_adr1),
+            signed_offset(itemoffset_chars.clone()),
+        ],
+        src_adr2.clone(),
+    );
+    let src_ofs = variable_with_lltype("src_ofs", LowLevelType::Signed);
+    push(
+        &startblock,
+        "int_mul",
+        vec![
+            constant_with_lltype(sizeof_char.clone(), LowLevelType::Signed),
+            Hlvalue::Variable(srcstart),
+        ],
+        src_ofs.clone(),
+    );
+    let asrc = variable_with_lltype("asrc", LowLevelType::Address);
+    push(
+        &startblock,
+        "adr_add",
+        vec![Hlvalue::Variable(src_adr2), Hlvalue::Variable(src_ofs)],
+        asrc.clone(),
+    );
+
+    let dst_adr = variable_with_lltype("dst_adr", LowLevelType::Address);
+    push(
+        &startblock,
+        "cast_ptr_to_adr",
+        vec![Hlvalue::Variable(dst.clone())],
+        dst_adr.clone(),
+    );
+    let dst_adr1 = variable_with_lltype("dst_adr1", LowLevelType::Address);
+    push(
+        &startblock,
+        "adr_add",
+        vec![Hlvalue::Variable(dst_adr), signed_offset(offsetof_chars)],
+        dst_adr1.clone(),
+    );
+    let dst_adr2 = variable_with_lltype("dst_adr2", LowLevelType::Address);
+    push(
+        &startblock,
+        "adr_add",
+        vec![Hlvalue::Variable(dst_adr1), signed_offset(itemoffset_chars)],
+        dst_adr2.clone(),
+    );
+    let dst_ofs = variable_with_lltype("dst_ofs", LowLevelType::Signed);
+    push(
+        &startblock,
+        "int_mul",
+        vec![
+            constant_with_lltype(sizeof_char.clone(), LowLevelType::Signed),
+            Hlvalue::Variable(dststart),
+        ],
+        dst_ofs.clone(),
+    );
+    let adst = variable_with_lltype("adst", LowLevelType::Address);
+    push(
+        &startblock,
+        "adr_add",
+        vec![Hlvalue::Variable(dst_adr2), Hlvalue::Variable(dst_ofs)],
+        adst.clone(),
+    );
+
+    let nbytes = variable_with_lltype("nbytes", LowLevelType::Signed);
+    push(
+        &startblock,
+        "int_mul",
+        vec![
+            constant_with_lltype(sizeof_char, LowLevelType::Signed),
+            Hlvalue::Variable(length),
+        ],
+        nbytes.clone(),
+    );
+    let copied = variable_with_lltype("copied", LowLevelType::Void);
+    push(
+        &startblock,
+        "raw_memcopy",
+        vec![
+            Hlvalue::Variable(asrc),
+            Hlvalue::Variable(adst),
+            Hlvalue::Variable(nbytes),
+        ],
+        copied,
+    );
+    let kept_src = variable_with_lltype("kept", LowLevelType::Void);
+    push(
+        &startblock,
+        "keepalive",
+        vec![Hlvalue::Variable(src)],
+        kept_src,
+    );
+    let kept_dst = variable_with_lltype("kept", LowLevelType::Void);
+    push(
+        &startblock,
+        "keepalive",
+        vec![Hlvalue::Variable(dst)],
+        kept_dst,
+    );
+    startblock.closeblock(vec![
+        Link::new(
+            vec![Hlvalue::Constant(Constant::with_concretetype(
+                ConstValue::None,
+                LowLevelType::Void,
+            ))],
+            Some(graph.returnblock.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    // `rstr.py _new_copy_contents_fun copy_string_contents`
+    let mut func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    func._always_inline_ = AlwaysInline::True;
+    func.oopspec = Some("stroruni.copy_contents(src, dst, srcstart, dststart, length)".to_string());
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(
+        graph,
+        vec!["src", "dst", "srcstart", "dststart", "length"]
+            .into_iter()
+            .map(String::from)
+            .collect(),
+        func,
+    ))
+}
+
+pub(crate) fn copy_contents_helper(
+    rtyper: &RPythonTyper,
+    str_ptr: &LowLevelType,
+) -> Result<LowLevelFunction, TyperError> {
+    let (_, _, char_tp) = copy_contents_types(str_ptr)?;
+    let name = match &char_tp {
+        LowLevelType::Char => "copy_string_contents",
+        LowLevelType::UniChar => "copy_unicode_contents",
+        other => {
+            return Err(TyperError::message(format!(
+                "copy_contents unsupported chars element type {other:?}"
+            )));
+        }
+    };
+    let str_ptr_clone = str_ptr.clone();
+    rtyper.lowlevel_helper_function_with_builder(
+        name,
+        vec![
+            str_ptr.clone(),
+            str_ptr.clone(),
+            LowLevelType::Signed,
+            LowLevelType::Signed,
+            LowLevelType::Signed,
+        ],
+        LowLevelType::Void,
+        move |_r, _a, _res| build_copy_contents_helper_graph(name, &str_ptr_clone),
+    )
 }
 
 /// `s.empty()` on `LLHelpers.ll_join` (`lltypesystem/rstr.py`):
 /// `emptystrfun` for `STR`, `emptyunicodefun` for `UNICODE`.
 fn empty_string_const(str_ptr: &LowLevelType) -> Result<Hlvalue, TyperError> {
-    let ptr = if copy_contents_opname(str_ptr)? == "copystrcontent" {
+    let (_, _, char_tp) = copy_contents_types(str_ptr)?;
+    let ptr = if matches!(char_tp, LowLevelType::Char) {
         emptystrfun().map_err(TyperError::message)?
     } else {
         emptyunicodefun().map_err(TyperError::message)?
@@ -3498,8 +3746,7 @@ fn empty_string_const(str_ptr: &LowLevelType) -> Result<Hlvalue, TyperError> {
 /// `mallocstr` / `mallocunicode` (`new_malloc`) are inlined as
 /// `malloc_varsize` plus [`close_with_mallocstr_hash_clear`].
 /// `copy_string_contents` / `copy_unicode_contents`
-/// (`_new_copy_contents_fun`) are the `copystrcontent` /
-/// `copyunicodecontent` oopspecs. `ovfcheck` is trailing `int_add_ovf`
+/// (`_new_copy_contents_fun`) are `direct_call`ed. `ovfcheck` is trailing `int_add_ovf`
 /// of its block; OverflowError raises MemoryError.
 ///
 /// `items_ptr_lltype` specializes the items pointer. `TEMP`
@@ -3507,6 +3754,7 @@ fn empty_string_const(str_ptr: &LowLevelType) -> Result<Hlvalue, TyperError> {
 /// A list of str or unicode is `GcArray(GCREF)`, so each `items[i]` is
 /// `cast_any_ptr(str_ptr, ...)` (`cast_any_ptr`).
 pub(crate) fn build_ll_join_strs_helper_graph_for(
+    rtyper: &RPythonTyper,
     name: &str,
     items_ptr_lltype: LowLevelType,
     str_ptr: LowLevelType,
@@ -3514,7 +3762,8 @@ pub(crate) fn build_ll_join_strs_helper_graph_for(
     let element_lltype = gcarray_ptr_element_lltype(&items_ptr_lltype)?;
     let chars_array_ptr_lltype = chars_array_ptr_lltype_from_strptr(&str_ptr)?;
     let str_struct_lltype = struct_lltype_from_strptr(&str_ptr)?;
-    let copy_opname = copy_contents_opname(&str_ptr)?;
+    let copy = copy_contents_helper(rtyper, &str_ptr)?;
+    let copy_fn = functionptr_const(rtyper, &copy)?;
 
     let signed_const = |n: i64| constant_with_lltype(ConstValue::Int(n), LowLevelType::Signed);
     let bool_true = || constant_with_lltype(ConstValue::Bool(true), LowLevelType::Bool);
@@ -3831,8 +4080,9 @@ pub(crate) fn build_ll_join_strs_helper_graph_for(
         .borrow_mut()
         .operations
         .push(SpaceOperation::new(
-            copy_opname,
+            "direct_call",
             vec![
+                Hlvalue::Constant(copy_fn.clone()),
                 item_for_copy,
                 Hlvalue::Variable(result_for_copy_body.clone()),
                 signed_const(0),
@@ -4278,10 +4528,10 @@ fn emit_array_item_as_strptr(
 /// `copy_unicode_contents`). `str_ptr` is `typeOf(s)`. `mallocstr` /
 /// `mallocunicode` are inlined as `malloc_varsize` plus
 /// [`close_with_mallocstr_hash_clear`]. `copy_string_contents` /
-/// `copy_unicode_contents` (`_new_copy_contents_fun`) are the
-/// `copystrcontent` / `copyunicodecontent` oopspecs. Each overflow
-/// raises `MemoryError`.
+/// `copy_unicode_contents` (`_new_copy_contents_fun`) are
+/// `direct_call`ed. Each overflow raises `MemoryError`.
 pub(crate) fn build_ll_join_helper_graph(
+    rtyper: &RPythonTyper,
     name: &str,
     items_ptr_lltype: LowLevelType,
     str_ptr: LowLevelType,
@@ -4289,7 +4539,8 @@ pub(crate) fn build_ll_join_helper_graph(
     let element_lltype = gcarray_ptr_element_lltype(&items_ptr_lltype)?;
     let chars_array_ptr_lltype = chars_array_ptr_lltype_from_strptr(&str_ptr)?;
     let str_struct_lltype = struct_lltype_from_strptr(&str_ptr)?;
-    let copy_opname = copy_contents_opname(&str_ptr)?;
+    let copy = copy_contents_helper(rtyper, &str_ptr)?;
+    let copy_fn = functionptr_const(rtyper, &copy)?;
     let empty_const = empty_string_const(&str_ptr)?;
 
     let signed_const = |n: i64| constant_with_lltype(ConstValue::Int(n), LowLevelType::Signed);
@@ -4698,8 +4949,9 @@ pub(crate) fn build_ll_join_helper_graph(
         .borrow_mut()
         .operations
         .push(SpaceOperation::new(
-            copy_opname,
+            "direct_call",
             vec![
+                Hlvalue::Constant(copy_fn.clone()),
                 item0,
                 Hlvalue::Variable(result_item0.clone()),
                 signed_const(0),
@@ -4767,8 +5019,9 @@ pub(crate) fn build_ll_join_helper_graph(
         .borrow_mut()
         .operations
         .push(SpaceOperation::new(
-            copy_opname,
+            "direct_call",
             vec![
+                Hlvalue::Constant(copy_fn.clone()),
                 Hlvalue::Variable(s_copy_body.clone()),
                 Hlvalue::Variable(result_copy_body.clone()),
                 signed_const(0),
@@ -4806,8 +5059,9 @@ pub(crate) fn build_ll_join_helper_graph(
         .borrow_mut()
         .operations
         .push(SpaceOperation::new(
-            copy_opname,
+            "direct_call",
             vec![
+                Hlvalue::Constant(copy_fn.clone()),
                 item_for_copy,
                 Hlvalue::Variable(result_copy_body.clone()),
                 signed_const(0),
@@ -13925,9 +14179,8 @@ pub(crate) fn build_ll_stritem_checked_helper_graph(
 /// ```
 ///
 /// Pyre lowers `s.malloc(N)` to a `malloc_varsize` SpaceOperation and
-/// the two `copy_contents_from_str` calls to two `copystrcontent`
-/// (`copyunicodecontent` for UNICODE) ops — the same op the JIT
-/// codewriter produces for the `stroruni.copy_contents` oopspec. Both
+/// the two `copy_contents_from_str` calls to two `direct_call`s of
+/// `copy_string_contents` (`copy_unicode_contents` for UNICODE). Both
 /// operands are whole string objects, so no interior chars pointer is
 /// materialised.
 ///
@@ -13935,14 +14188,15 @@ pub(crate) fn build_ll_stritem_checked_helper_graph(
 /// - **start**: `chars1 = getsubstruct(s1, 'chars')`,
 ///   `len1 = getarraysize(chars1)`; likewise `chars2` / `len2`;
 ///   `total = int_add(len1, len2)`; `newstr = malloc_varsize(struct,
-///   gc, total)`; `copystrcontent(s1, newstr, 0, 0, len1)`;
-///   `copystrcontent(s2, newstr, 0, len1, len2)`. Forward into
+///   gc, total)`; `copy_string_contents(s1, newstr, 0, 0, len1)`;
+///   `copy_string_contents(s2, newstr, 0, len1, len2)`. Forward into
 ///   `returnblock(newstr)`.
 ///
 /// Polymorphic over `Ptr(STR)` / `Ptr(UNICODE)`: the chars-array
-/// element type (Char / UniChar) selects `copystrcontent` vs
-/// `copyunicodecontent`.
+/// element type (Char / UniChar) selects `copy_string_contents` vs
+/// `copy_unicode_contents`.
 pub(crate) fn build_ll_strconcat_helper_graph(
+    rtyper: &RPythonTyper,
     name: &str,
     ptr_lltype: LowLevelType,
 ) -> Result<PyGraph, TyperError> {
@@ -13969,6 +14223,8 @@ pub(crate) fn build_ll_strconcat_helper_graph(
     }
 
     let struct_lltype = struct_lltype_from_strptr(&ptr_lltype)?;
+    let copy = copy_contents_helper(rtyper, &ptr_lltype)?;
+    let copy_fn = functionptr_const(rtyper, &copy)?;
 
     let signed_const = |n: i64| constant_with_lltype(ConstValue::Int(n), LowLevelType::Signed);
     let chars_field_const =
@@ -13988,10 +14244,9 @@ pub(crate) fn build_ll_strconcat_helper_graph(
     );
 
     // start: extract source lengths, malloc the result, then copy each
-    //      source's chars into it via copystrcontent.  Mirrors upstream
+    //      source's chars into it via copy_string_contents.  Mirrors upstream
     //      `ll_strconcat` (rstr.py): malloc + two `copy_contents_from_str`
-    //      calls, each rewritten by the JIT codewriter to a single
-    //      `copystrcontent` op.
+    //      calls.
     let chars1 = variable_with_lltype("chars1", chars_array_ptr_lltype.clone());
     startblock.borrow_mut().operations.push(SpaceOperation::new(
         "getsubstruct",
@@ -14035,18 +14290,14 @@ pub(crate) fn build_ll_strconcat_helper_graph(
         ],
         Hlvalue::Variable(newstr.clone()),
     ));
-    // Two bulk copies: `copystrcontent(src, dst, srcstart, dststart, length)`
-    // for STR / `copyunicodecontent` for UNICODE.  The operands are whole
+    // Two bulk copies: `copy_string_contents(src, dst, srcstart, dststart, length)`
+    // for STR / `copy_unicode_contents` for UNICODE.  The operands are whole
     // string objects, so there is no interior chars pointer to thread.
-    let copy_opname = if matches!(elem_lltype, LowLevelType::Char) {
-        "copystrcontent"
-    } else {
-        "copyunicodecontent"
-    };
     let void_copy1 = variable_with_lltype("copy1", LowLevelType::Void);
     startblock.borrow_mut().operations.push(SpaceOperation::new(
-        copy_opname,
+        "direct_call",
         vec![
+            Hlvalue::Constant(copy_fn.clone()),
             Hlvalue::Variable(s1),
             Hlvalue::Variable(newstr.clone()),
             signed_const(0),
@@ -14057,8 +14308,9 @@ pub(crate) fn build_ll_strconcat_helper_graph(
     ));
     let void_copy2 = variable_with_lltype("copy2", LowLevelType::Void);
     startblock.borrow_mut().operations.push(SpaceOperation::new(
-        copy_opname,
+        "direct_call",
         vec![
+            Hlvalue::Constant(copy_fn.clone()),
             Hlvalue::Variable(s2),
             Hlvalue::Variable(newstr.clone()),
             signed_const(0),
@@ -14120,8 +14372,8 @@ pub(crate) fn build_ll_stringslice_helper_graph(
             LowLevelType::Signed,
         ],
         ptr_lltype.clone(),
-        move |_rtyper, _args, _result| {
-            build_ll_stringslice_core_helper_graph(&core_name_owned, ptr_for_core)
+        move |rtyper, _args, _result| {
+            build_ll_stringslice_core_helper_graph(rtyper, &core_name_owned, ptr_for_core)
         },
     )?;
     let core_ptr = sub_helper_funcptr_constant(rtyper, &core)?;
@@ -14441,6 +14693,7 @@ fn emit_stringslice_direct_call(
 }
 
 fn build_ll_stringslice_core_helper_graph(
+    rtyper: &RPythonTyper,
     name: &str,
     ptr_lltype: LowLevelType,
 ) -> Result<PyGraph, TyperError> {
@@ -14452,17 +14705,14 @@ fn build_ll_stringslice_core_helper_graph(
             "stringslice chars must be an array pointer",
         ));
     };
-    let PtrTarget::Array(array) = &chars_ptr.TO else {
+    let PtrTarget::Array(_) = &chars_ptr.TO else {
         return Err(TyperError::message(
             "stringslice chars target must be an array",
         ));
     };
-    let copy_op = if array.OF == LowLevelType::Char {
-        "copystrcontent"
-    } else {
-        "copyunicodecontent"
-    };
     let struct_ty = struct_lltype_from_strptr(&ptr_lltype)?;
+    let copy = copy_contents_helper(rtyper, &ptr_lltype)?;
+    let copy_fn = functionptr_const(rtyper, &copy)?;
     let s = variable_with_lltype("s1", ptr_lltype.clone());
     let start = variable_with_lltype("start", LowLevelType::Signed);
     let stop = variable_with_lltype("stop", LowLevelType::Signed);
@@ -14542,12 +14792,15 @@ fn build_ll_stringslice_core_helper_graph(
             ],
             Hlvalue::Variable(newstr.clone()),
         ));
+    // copy_string_contents(src, dst, srcstart, dststart, length) /
+    // copy_unicode_contents(...) (`_ll_stringslice`).
     alloc_block
         .borrow_mut()
         .operations
         .push(SpaceOperation::new(
-            copy_op,
+            "direct_call",
             vec![
+                Hlvalue::Constant(copy_fn.clone()),
                 Hlvalue::Variable(alloc_s),
                 Hlvalue::Variable(newstr.clone()),
                 Hlvalue::Variable(alloc_start),
@@ -17373,15 +17626,14 @@ mod tests {
 
     /// `ll_strconcat` synthesises a straight-line `start → returnblock`
     /// CFG: start emits getsubstruct + getarraysize × 2 + int_add
-    /// (total) + **malloc_varsize** + two **copystrcontent** ops, then
-    /// forwards `newstr` into the returnblock.  Mirrors upstream
-    /// `ll_strconcat` (rstr.py): malloc + two `copy_contents_from_str`
-    /// calls (each rewritten to a single `copystrcontent`), no per-char
-    /// loop.
+    /// (total) + **malloc_varsize** + two **direct_call**s of
+    /// `copy_string_contents`, then forwards `newstr` into the
+    /// returnblock.  Mirrors upstream `ll_strconcat` (rstr.py): malloc +
+    /// two `copy_contents_from_str` calls, no per-char loop.
     ///
-    /// Pins the exact `copystrcontent` operand wiring (src/dst objects,
-    /// srcstart/dststart/length) so a transposed argument cannot slip
-    /// through structural shape checks alone.
+    /// Pins the exact `copy_string_contents` operand wiring (src/dst
+    /// objects, srcstart/dststart/length) so a transposed argument cannot
+    /// slip through structural shape checks alone.
     #[test]
     fn build_ll_strconcat_synthesizes_malloc_varsize_and_two_copystrcontent_for_str() {
         fn as_var(hlv: &Hlvalue) -> crate::flowspace::model::Variable {
@@ -17397,17 +17649,25 @@ mod tests {
         ) {
             assert!(
                 matches!(hlv, Hlvalue::Variable(v) if v == expected),
-                "copystrcontent {what} operand mismatch: {hlv:?}"
+                "copy_string_contents {what} operand mismatch: {hlv:?}"
             );
         }
         fn assert_zero(hlv: &Hlvalue, what: &str) {
             assert!(
                 matches!(hlv, Hlvalue::Constant(c) if c.value == ConstValue::Int(0)),
-                "copystrcontent {what} must be Int(0): {hlv:?}"
+                "copy_string_contents {what} must be Int(0): {hlv:?}"
             );
         }
+        fn copy_callee_name(op: &SpaceOperation) -> String {
+            assert_eq!(op.opname, "direct_call");
+            funcobj_from_funcptr_constant(&op.args[0])
+                .expect("copy callee funcptr")
+                ._name
+        }
 
-        let helper = build_ll_strconcat_helper_graph("ll_strconcat", STRPTR.clone())
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = RPythonTyper::new(&ann);
+        let helper = build_ll_strconcat_helper_graph(&rtyper, "ll_strconcat", STRPTR.clone())
             .expect("build_ll_strconcat_helper_graph for STR");
         let inner = helper.graph.borrow();
         let sb = inner.startblock.borrow();
@@ -17422,10 +17682,16 @@ mod tests {
                 "getarraysize",
                 "int_add",
                 "malloc_varsize",
-                "copystrcontent",
-                "copystrcontent",
+                "direct_call",
+                "direct_call",
             ],
-            "start emits chars1/len1/chars2/len2/total + malloc_varsize + two copystrcontent"
+            "start emits chars1/len1/chars2/len2/total + malloc_varsize + two copy_string_contents calls"
+        );
+        assert!(
+            !start_ops
+                .iter()
+                .any(|op| op == "copystrcontent" || op == "copyunicodecontent"),
+            "no copystrcontent/copyunicodecontent: {start_ops:?}"
         );
 
         // malloc_varsize (op[5]) still takes [Constant(struct lltype),
@@ -17442,32 +17708,32 @@ mod tests {
         assert!(matches!(mv_op.args[2], Hlvalue::Variable(_)));
 
         // Capture the source/length/result Variables to compare against the
-        // copystrcontent operands by identity.
+        // copy_string_contents operands by identity.
         let s1_var = as_var(&sb.operations[0].args[0]);
         let len1_var = as_var(&sb.operations[1].result);
         let s2_var = as_var(&sb.operations[2].args[0]);
         let len2_var = as_var(&sb.operations[3].result);
         let newstr_var = as_var(&sb.operations[5].result);
 
-        // copy1 = copystrcontent(s1, newstr, srcstart=0, dststart=0, length=len1).
+        // copy1 = copy_string_contents(s1, newstr, srcstart=0, dststart=0, length=len1).
         let copy1 = &sb.operations[6];
-        assert_eq!(copy1.opname, "copystrcontent");
-        assert_eq!(copy1.args.len(), 5);
-        assert_same_var(&copy1.args[0], &s1_var, "copy1 src");
-        assert_same_var(&copy1.args[1], &newstr_var, "copy1 dst");
-        assert_zero(&copy1.args[2], "copy1 srcstart");
-        assert_zero(&copy1.args[3], "copy1 dststart");
-        assert_same_var(&copy1.args[4], &len1_var, "copy1 length");
+        assert_eq!(copy_callee_name(copy1), "copy_string_contents");
+        assert_eq!(copy1.args.len(), 6);
+        assert_same_var(&copy1.args[1], &s1_var, "copy1 src");
+        assert_same_var(&copy1.args[2], &newstr_var, "copy1 dst");
+        assert_zero(&copy1.args[3], "copy1 srcstart");
+        assert_zero(&copy1.args[4], "copy1 dststart");
+        assert_same_var(&copy1.args[5], &len1_var, "copy1 length");
 
-        // copy2 = copystrcontent(s2, newstr, srcstart=0, dststart=len1, length=len2).
+        // copy2 = copy_string_contents(s2, newstr, srcstart=0, dststart=len1, length=len2).
         let copy2 = &sb.operations[7];
-        assert_eq!(copy2.opname, "copystrcontent");
-        assert_eq!(copy2.args.len(), 5);
-        assert_same_var(&copy2.args[0], &s2_var, "copy2 src");
-        assert_same_var(&copy2.args[1], &newstr_var, "copy2 dst");
-        assert_zero(&copy2.args[2], "copy2 srcstart");
-        assert_same_var(&copy2.args[3], &len1_var, "copy2 dststart");
-        assert_same_var(&copy2.args[4], &len2_var, "copy2 length");
+        assert_eq!(copy_callee_name(copy2), "copy_string_contents");
+        assert_eq!(copy2.args.len(), 6);
+        assert_same_var(&copy2.args[1], &s2_var, "copy2 src");
+        assert_same_var(&copy2.args[2], &newstr_var, "copy2 dst");
+        assert_zero(&copy2.args[3], "copy2 srcstart");
+        assert_same_var(&copy2.args[4], &len1_var, "copy2 dststart");
+        assert_same_var(&copy2.args[5], &len2_var, "copy2 length");
 
         // start has a single unconditional exit to the returnblock carrying [newstr].
         assert_eq!(sb.exits.len(), 1, "start has a single unconditional exit");
@@ -17485,44 +17751,71 @@ mod tests {
     /// the same straight-line CFG as `ll_strconcat` modulo elem type:
     /// the malloc_varsize struct const differs (otherwise the
     /// helper-cache families would alias) and the bulk copies select
-    /// `copyunicodecontent` rather than `copystrcontent`.
+    /// `copy_unicode_contents` rather than `copy_string_contents`.
     #[test]
-    fn build_ll_strconcat_unicode_differs_in_struct_const_and_copy_opname() {
-        let str_helper =
-            build_ll_strconcat_helper_graph("ll_strconcat", STRPTR.clone()).expect("STR strconcat");
-        let uni_helper = build_ll_strconcat_helper_graph("ll_unicode_concat", UNICODEPTR.clone())
-            .expect("UNICODE strconcat");
+    fn build_ll_strconcat_unicode_differs_in_struct_const_and_copy_callee() {
+        fn copy_callee_names(graph: &crate::flowspace::model::FunctionGraph) -> Vec<String> {
+            let sb = graph.startblock.borrow();
+            let mv = &sb.operations[5];
+            assert_eq!(mv.opname, "malloc_varsize");
+            sb.operations[6..8]
+                .iter()
+                .map(|op| {
+                    assert_eq!(op.opname, "direct_call");
+                    funcobj_from_funcptr_constant(&op.args[0])
+                        .expect("copy callee funcptr")
+                        ._name
+                })
+                .collect()
+        }
+        fn has_inline_copy(graph: &crate::flowspace::model::FunctionGraph) -> bool {
+            graph
+                .startblock
+                .borrow()
+                .operations
+                .iter()
+                .any(|op| op.opname == "copystrcontent" || op.opname == "copyunicodecontent")
+        }
+
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = RPythonTyper::new(&ann);
+        let str_helper = build_ll_strconcat_helper_graph(&rtyper, "ll_strconcat", STRPTR.clone())
+            .expect("STR strconcat");
+        let uni_helper =
+            build_ll_strconcat_helper_graph(&rtyper, "ll_unicode_concat", UNICODEPTR.clone())
+                .expect("UNICODE strconcat");
         let str_inner = str_helper.graph.borrow();
         let uni_inner = uni_helper.graph.borrow();
 
-        let (str_struct_const, str_copy_opnames) = {
+        let str_struct_const = {
             let sb = str_inner.startblock.borrow();
             let mv = &sb.operations[5];
             assert_eq!(mv.opname, "malloc_varsize");
-            let copies: Vec<String> = sb.operations[6..8]
-                .iter()
-                .map(|op| op.opname.clone())
-                .collect();
-            (mv.args[0].clone(), copies)
+            mv.args[0].clone()
         };
-        let (uni_struct_const, uni_copy_opnames) = {
+        let uni_struct_const = {
             let sb = uni_inner.startblock.borrow();
             let mv = &sb.operations[5];
             assert_eq!(mv.opname, "malloc_varsize");
-            let copies: Vec<String> = sb.operations[6..8]
-                .iter()
-                .map(|op| op.opname.clone())
-                .collect();
-            (mv.args[0].clone(), copies)
+            mv.args[0].clone()
         };
+        let str_copy_callees = copy_callee_names(&str_inner);
+        let uni_copy_callees = copy_callee_names(&uni_inner);
         assert!(
             format!("{str_struct_const:?}") != format!("{uni_struct_const:?}"),
             "STR and UNICODE malloc_varsize struct constants must differ"
         );
-        assert_eq!(str_copy_opnames, vec!["copystrcontent", "copystrcontent"]);
         assert_eq!(
-            uni_copy_opnames,
-            vec!["copyunicodecontent", "copyunicodecontent"]
+            str_copy_callees,
+            vec!["copy_string_contents", "copy_string_contents"]
+        );
+        assert_eq!(
+            uni_copy_callees,
+            vec!["copy_unicode_contents", "copy_unicode_contents"]
+        );
+        assert!(
+            !has_inline_copy(&str_inner) && !has_inline_copy(&uni_inner),
+            "no copystrcontent/copyunicodecontent"
         );
     }
 
@@ -17530,7 +17823,9 @@ mod tests {
     /// `@jit.oopspec('stroruni.concat(s1, s2)')`.
     #[test]
     fn strconcat_helper_carries_stroruni_concat_oopspec() {
-        let helper = build_ll_strconcat_helper_graph("ll_strconcat", STRPTR.clone())
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = RPythonTyper::new(&ann);
+        let helper = build_ll_strconcat_helper_graph(&rtyper, "ll_strconcat", STRPTR.clone())
             .expect("build_ll_strconcat_helper_graph");
         assert_eq!(
             helper.func.oopspec.as_deref(),
@@ -18990,13 +19285,19 @@ mod tests {
     }
 
     /// `LLHelpers.ll_join_strs` inlines `mallocstr` then copies with
-    /// `copy_string_contents` (`copystrcontent`). The original is
-    /// `unroll_safe` (`look_inside_iff`).
+    /// `copy_string_contents`. The original is `unroll_safe`
+    /// (`look_inside_iff`).
     #[test]
     fn build_ll_join_strs_synthesizes_malloc_varsize_and_copy_helper() {
-        let helper =
-            build_ll_join_strs_helper_graph_for("ll_join_strs", temp_ptr_lltype(), STRPTR.clone())
-                .expect("build_ll_join_strs_helper_graph_for");
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = RPythonTyper::new(&ann);
+        let helper = build_ll_join_strs_helper_graph_for(
+            &rtyper,
+            "ll_join_strs",
+            temp_ptr_lltype(),
+            STRPTR.clone(),
+        )
+        .expect("build_ll_join_strs_helper_graph_for");
         assert_eq!(helper.func.name, "ll_join_strs");
         assert_eq!(helper.graph.borrow().name, "ll_join_strs");
         assert!(
@@ -19022,7 +19323,7 @@ mod tests {
             .collect();
         for name in [
             "malloc_varsize",
-            "copystrcontent",
+            "direct_call",
             "int_add_ovf",
             "getarrayitem",
         ] {
@@ -19031,6 +19332,20 @@ mod tests {
                 "expected {name} in {all_ops:?}"
             );
         }
+        assert!(
+            !all_ops
+                .iter()
+                .any(|op| op == "copystrcontent" || op == "copyunicodecontent"),
+            "no copystrcontent/copyunicodecontent: {all_ops:?}"
+        );
+        let copy_calls = direct_call_funcobjs(&inner)
+            .into_iter()
+            .filter(|func| func._name == "copy_string_contents")
+            .count();
+        assert!(
+            copy_calls >= 1,
+            "expected copy_string_contents direct_call, got {copy_calls}"
+        );
     }
 
     /// `rlib/jit.py look_inside_iff` wrapper around `ll_join_strs` with
@@ -19167,8 +19482,10 @@ mod tests {
     /// plain `itemslen + seplen` malloc and three `copy_string_contents`.
     #[test]
     fn build_ll_join_synthesizes_separator_copy_helper() {
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = RPythonTyper::new(&ann);
         let items = super::gcref_items_ptr_lltype();
-        let helper = super::build_ll_join_helper_graph("ll_join", items, STRPTR.clone())
+        let helper = super::build_ll_join_helper_graph(&rtyper, "ll_join", items, STRPTR.clone())
             .expect("build_ll_join_helper_graph");
         assert!(
             !helper.func._jit_unroll_safe_,
@@ -19233,7 +19550,13 @@ mod tests {
         assert!(counts.get("int_add").copied().unwrap_or(0) >= 1);
         assert_eq!(counts.get("malloc_varsize").copied().unwrap_or(0), 1);
         assert_eq!(counts.get("setfield").copied().unwrap_or(0), 1);
-        assert_eq!(counts.get("copystrcontent").copied().unwrap_or(0), 3);
+        assert_eq!(counts.get("copystrcontent").copied().unwrap_or(0), 0);
+        assert_eq!(counts.get("copyunicodecontent").copied().unwrap_or(0), 0);
+        let copy_calls = direct_call_funcobjs(&inner)
+            .into_iter()
+            .filter(|func| func._name == "copy_string_contents")
+            .count();
+        assert_eq!(copy_calls, 3);
         assert_eq!(counts.get("getarrayitem").copied().unwrap_or(0), 3);
         assert_eq!(counts.get("cast_opaque_ptr").copied().unwrap_or(0), 3);
         assert_eq!(malloc_prev.as_deref(), Some("int_add"));
@@ -19245,7 +19568,9 @@ mod tests {
         assert!(err.is_missing_rtype_operation());
         assert!(err.to_string().contains("new_malloc"));
 
-        ll_join().expect("ll_join");
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = RPythonTyper::new(&ann);
+        ll_join(&rtyper).expect("ll_join");
 
         let err = ll_striter().expect_err("iterator helper is deferred");
         assert!(err.is_missing_rtype_operation());
@@ -19769,5 +20094,80 @@ mod tests {
             },
             other => panic!("etype must be a Constant, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn copy_string_contents_helper_carries_the_stroruni_copy_contents_oopspec() {
+        let pygraph = build_copy_contents_helper_graph("copy_string_contents", &STRPTR)
+            .expect("build_copy_contents_helper_graph");
+        assert_eq!(
+            pygraph.func.oopspec.as_deref(),
+            Some("stroruni.copy_contents(src, dst, srcstart, dststart, length)")
+        );
+        let names = crate::codewriter::jtransform_opname::startblock_oopspec_argnames(
+            &pygraph.graph.borrow(),
+        );
+        assert_eq!(names, ["src", "dst", "srcstart", "dststart", "length"]);
+    }
+
+    #[test]
+    fn copy_string_contents_body_is_raw_memcopy_between_keepalives() {
+        fn assert_copy_contents_opnames(pygraph: &PyGraph) {
+            let opnames: Vec<String> = pygraph
+                .graph
+                .borrow()
+                .startblock
+                .borrow()
+                .operations
+                .iter()
+                .map(|op| op.opname.clone())
+                .collect();
+            assert_eq!(
+                opnames
+                    .iter()
+                    .filter(|n| n.as_str() == "raw_memcopy")
+                    .count(),
+                1,
+                "raw_memcopy once: {opnames:?}"
+            );
+            let memcopy_pos = opnames
+                .iter()
+                .position(|n| n == "raw_memcopy")
+                .expect("raw_memcopy");
+            let keepalive_positions: Vec<usize> = opnames
+                .iter()
+                .enumerate()
+                .filter(|(_, n)| n.as_str() == "keepalive")
+                .map(|(i, _)| i)
+                .collect();
+            assert_eq!(keepalive_positions.len(), 2, "keepalive twice: {opnames:?}");
+            assert!(
+                keepalive_positions.iter().all(|&i| i > memcopy_pos),
+                "both keepalives after raw_memcopy: {opnames:?}"
+            );
+            assert_eq!(
+                opnames
+                    .iter()
+                    .filter(|n| n.as_str() == "cast_ptr_to_adr")
+                    .count(),
+                2,
+                "cast_ptr_to_adr twice: {opnames:?}"
+            );
+            assert!(
+                !opnames.iter().any(|n| n == "copystrcontent"),
+                "no copystrcontent: {opnames:?}"
+            );
+            assert!(
+                !opnames.iter().any(|n| n == "copyunicodecontent"),
+                "no copyunicodecontent: {opnames:?}"
+            );
+        }
+
+        let str_graph = build_copy_contents_helper_graph("copy_string_contents", &STRPTR)
+            .expect("copy_string_contents");
+        assert_copy_contents_opnames(&str_graph);
+        let uni_graph = build_copy_contents_helper_graph("copy_unicode_contents", &UNICODEPTR)
+            .expect("copy_unicode_contents");
+        assert_copy_contents_opnames(&uni_graph);
     }
 }

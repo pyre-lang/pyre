@@ -140,6 +140,21 @@ pub fn mallocstr(length: usize) -> i64 {
     ptr as i64
 }
 
+/// `rstr.py _new_copy_contents_fun.copy_raw_to_string`: copy `length` bytes
+/// from the raw buffer `ptrsrc` into the low-level string `dst` starting at
+/// char `dststart`. `@jit.dont_look_inside`: the JIT sees a residual call,
+/// never the raw copy.
+///
+/// # Safety
+/// `ptrsrc` names `length` readable bytes, and `dst` is a live low-level
+/// string block with at least `dststart + length` chars.
+#[majit_macros::dont_look_inside]
+pub unsafe fn copy_raw_to_string(ptrsrc: *const u8, dst: *mut u8, dststart: usize, length: usize) {
+    // from here, no GC operations can happen
+    let adst = unsafe { dst.add(LOWLEVEL_STRING_CHARS_OFFSET + dststart) };
+    unsafe { std::ptr::copy_nonoverlapping(ptrsrc, adst, length) };
+}
+
 fn alloc_lowlevel_string(
     length: usize,
     base_size: usize,

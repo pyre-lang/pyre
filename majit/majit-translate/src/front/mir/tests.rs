@@ -26523,9 +26523,9 @@ fn unwrapped_array_pushes_lower_to_rpython_gcarray_writes() {
                     OpKind::Call {
                         target: CallTarget::FunctionPath { segments, .. },
                         ..
-                    } if segments == &[crate::runtime_names::shims::LL_ARRAYMOVE.to_string()]
+                    } if segments.last().is_some_and(|leaf| leaf == "ll_arraymove_items_block")
                 )),
-                "{function} must restore ptr::copy to RPython rgc.ll_arraymove"
+                "{function} must call object_array::ll_arraymove_items_block"
             );
             assert!(
                 !operations.iter().any(|operation| matches!(

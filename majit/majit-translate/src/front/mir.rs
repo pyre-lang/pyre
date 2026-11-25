@@ -3793,16 +3793,6 @@ impl<'l> CrateLowering<'l> {
         if fun_decl_is_jit_conditional_call(fd) {
             return false;
         }
-        // `rgc.py` `ll_arraycopy` `@specialize.ll()` is one ARRAY per
-        // graph. Harvesting the erased residual FunDecl makes every
-        // wrapper share one `FunctionGraph` whose `mergeinputargs`
-        // slot=0 unions List and Instance(PyObject). Same skip as
-        // `ConditionalCallEntry` above; an erased ARRAY residualizes
-        // through HOST_ENV (`rtype_jit_ll_arraycopy`) rather than this
-        // FunDecl.
-        if fun_decl_is_jit_ll_arraycopy(fd) {
-            return false;
-        }
         // A foreign generic template is not a graph of this artefact
         // (`specialize.py` `FunctionDesc.cachedgraph`). Spec copies are
         // declared from the caller's concrete arguments. A local generic
@@ -4695,23 +4685,6 @@ fn fun_decl_is_jit_conditional_call(fd: &FunDecl) -> bool {
         || crate::local_crates::strip_alias_crate_prefix(&segs)
             .as_deref()
             .is_some_and(crate::flowspace::model::is_jit_conditional_call_path)
-}
-
-/// `rgc.py` `ll_arraycopy` residual named by the FunDecl's real path
-/// (`pyre_object::object_array::jit_ll_arraycopy`), or the
-/// local-crate-stripped `object_array::jit_ll_arraycopy`.
-fn fun_decl_is_jit_ll_arraycopy(fd: &FunDecl) -> bool {
-    let segs: Vec<String> = fd
-        .item_meta
-        .name_path_str()
-        .split("::")
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .collect();
-    crate::flowspace::model::is_jit_ll_arraycopy_path(&segs)
-        || crate::local_crates::strip_alias_crate_prefix(&segs)
-            .as_deref()
-            .is_some_and(crate::flowspace::model::is_jit_ll_arraycopy_path)
 }
 
 /// Harvest the crate root of a FunDecl whose body is present so

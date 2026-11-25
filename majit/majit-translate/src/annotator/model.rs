@@ -2802,7 +2802,8 @@ impl SomeValue {
                 if let Some(c) = sb.base.const_box.as_ref()
                     && let crate::flowspace::model::ConstValue::HostObject(_) = &c.value
                     && let Some(entry) = crate::translator::rtyper::extregistry::lookup(&c.value)
-                    && matches!(
+                {
+                    if matches!(
                         entry,
                         crate::translator::rtyper::extregistry::ExtRegistryEntry::EnterLeaveMarker { .. }
                             | crate::translator::rtyper::extregistry::ExtRegistryEntry::LoopHeader { .. }
@@ -2810,9 +2811,18 @@ impl SomeValue {
                             | crate::translator::rtyper::extregistry::ExtRegistryEntry::JitForceVirtualizable
                             | crate::translator::rtyper::extregistry::ExtRegistryEntry::JitForceQuasiImmutable
                             | crate::translator::rtyper::extregistry::ExtRegistryEntry::AddMemoryPressure
-                    )
-                {
-                    return entry.compute_annotation_with_kwds(&bk, &kwds_s).map(Some);
+                    ) {
+                        return entry.compute_annotation_with_kwds(&bk, &kwds_s).map(Some);
+                    }
+                    // `_LLOpEntry.compute_result_annotation(RESULTTYPE, *args)`
+                    // needs the positional RESULTTYPE; `compute_annotation_with_kwds`
+                    // does not receive it.
+                    if let crate::translator::rtyper::extregistry::ExtRegistryEntry::LLOp {
+                        ..
+                    } = entry
+                    {
+                        return entry.compute_llop_result_annotation(&args_s_opt).map(Some);
+                    }
                 }
                 super::builtin::call_builtin(&bk, &sb.analyser_name, &args_s_opt, &kwds_s).map(Some)
             }

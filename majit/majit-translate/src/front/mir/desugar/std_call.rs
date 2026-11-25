@@ -6955,8 +6955,7 @@ impl<'a> Lowering<'a> {
 
     /// Later intercepts in this same `RegularCall` match already lower
     /// some `.add` calls: items-base accessors alias to the header
-    /// (brick 1), string-array remove aliases the interior pointer,
-    /// and a `.add` consumed by one deref becomes getarrayitem
+    /// (brick 1), and a `.add` consumed by one deref becomes getarrayitem
     /// (brick 3).  Those must run instead of `direct_ptradd`.
     pub(in crate::front::mir) fn ptr_add_has_later_intercept(
         &self,
@@ -6967,9 +6966,6 @@ impl<'a> Lowering<'a> {
         dest_local: usize,
     ) -> bool {
         (args_len == 2 && self.is_items_block_base_ptr_add(reg))
-            || (args_len == 2
-                && self.string_array_remove_owner().is_some()
-                && regular_call_is_ptr_add(reg, self.llbc))
             || self
                 .string_items_elem_ptr_add(reg, args_len, arg_locals, first_arg_ty, dest_local)
                 .is_some()
@@ -8148,31 +8144,6 @@ impl<'a> Lowering<'a> {
             )),
             _ => None,
         }
-    }
-
-    /// Owner of the two Rust storage adapters whose `remove` body is the
-    /// concrete spelling of RPython `rlist.ll_delitem_nonneg`.
-    pub(in crate::front::mir) fn string_array_remove_owner(&self) -> Option<&'static str> {
-        match self.graph.name.as_str() {
-            "pyre_object::bytes_array::<Impl>::remove" => Some("BytesArray"),
-            "pyre_object::unicode_array::<Impl>::remove" => Some("UnicodeArray"),
-            _ => None,
-        }
-    }
-
-    /// `std::ptr::copy` inside the exact string-list `remove` adapters.  The
-    /// caller reconstructs the logical array and indices and emits the
-    /// RPython `rgc.ll_arraymove` marker; no arbitrary raw copy qualifies.
-    pub(in crate::front::mir) fn is_string_array_remove_ptr_copy(&self, reg: &RegularCall) -> bool {
-        if self.string_array_remove_owner().is_none() {
-            return false;
-        }
-        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
-            return false;
-        };
-        self.llbc
-            .fn_by_id(*id)
-            .is_some_and(|fd| fd.item_meta.name_path_str() == "core::ptr::copy")
     }
 
     /// `core::ptr::copy_nonoverlapping` / `std::ptr::copy_nonoverlapping`.

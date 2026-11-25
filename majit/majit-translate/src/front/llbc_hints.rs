@@ -1928,14 +1928,14 @@ mod tests {
             .find(|(prefix, _)| *prefix == "_annspecialcase_ll_")
             .unwrap();
         assert_eq!(*hints, &["specialize:ll"]);
-        let functions = HashSet::from(["object_array::jit_ll_arraycopy".to_string()]);
+        let functions = HashSet::from(["fixture::specialized".to_string()]);
         assert_eq!(
             marker_path_to_fn_path(
-                "pyre_object::object_array::jit_ll_arraycopy::_annspecialcase_ll_jit_ll_arraycopy",
+                "crate::fixture::specialized::_annspecialcase_ll_specialized",
                 prefix,
                 &functions,
             ),
-            "object_array::jit_ll_arraycopy"
+            "fixture::specialized"
         );
     }
 

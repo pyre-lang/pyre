@@ -1205,8 +1205,8 @@ fn ll_join_helper(
         "ll_join".to_string(),
         vec![str_ptr.clone(), LowLevelType::Signed, items_ptr],
         str_ptr,
-        move |_rtyper, _args, _result| {
-            build_ll_join_helper_graph("ll_join", items_for_builder, str_for_builder)
+        move |rtyper, _args, _result| {
+            build_ll_join_helper_graph(rtyper, "ll_join", items_for_builder, str_for_builder)
         },
     )
 }
@@ -1252,8 +1252,8 @@ fn ll_join_strs_helper_for(
         body_name.to_string(),
         orig_args.clone(),
         str_ptr.clone(),
-        move |_r, _a, _res| {
-            build_ll_join_strs_helper_graph_for(body_name, items_for_orig, str_for_orig)
+        move |rtyper, _a, _res| {
+            build_ll_join_strs_helper_graph_for(rtyper, body_name, items_for_orig, str_for_orig)
         },
     )?;
     let trampoline = {
@@ -2636,8 +2636,8 @@ fn pair_same_string_rtype_add(
         helper_name_owned.clone(),
         vec![ptr_lltype.clone(), ptr_lltype.clone()],
         ptr_lltype,
-        move |_rtyper, _args, _result| {
-            build_ll_strconcat_helper_graph(&helper_name_owned, ptr_for_builder)
+        move |rtyper, _args, _result| {
+            build_ll_strconcat_helper_graph(rtyper, &helper_name_owned, ptr_for_builder)
         },
     )?;
     hop.gendirectcall(&helper, vlist)
@@ -5969,7 +5969,7 @@ mod tests {
         let body_graph = body_ref.borrow();
         let mut malloc_ty = None;
         let mut copies = 0usize;
-        let mut other_copy = false;
+        let mut saw_inline_copy = false;
         for block in body_graph.iterblocks() {
             for body_op in &block.borrow().operations {
                 match body_op.opname.as_str() {
@@ -5982,8 +5982,14 @@ mod tests {
                         };
                         malloc_ty = Some(ty.clone());
                     }
-                    name if name == copy_op => copies += 1,
-                    "copystrcontent" | "copyunicodecontent" => other_copy = true,
+                    "direct_call" => {
+                        if let Some(func) = funcobj_from_funcptr_constant(&body_op.args[0]) {
+                            if func._name == copy_op {
+                                copies += 1;
+                            }
+                        }
+                    }
+                    "copystrcontent" | "copyunicodecontent" => saw_inline_copy = true,
                     _ => {}
                 }
             }
@@ -5996,8 +6002,8 @@ mod tests {
         assert_eq!(st._name, malloc_struct);
         assert_eq!(copies, copy_count, "{body_name} {copy_op}");
         assert!(
-            !other_copy,
-            "{body_name} must not mix copystrcontent and copyunicodecontent"
+            !saw_inline_copy,
+            "{body_name} must not contain copystrcontent or copyunicodecontent"
         );
 
         if check_empty {
@@ -6071,7 +6077,7 @@ mod tests {
             "ll_join_strs",
             &UNICODEPTR,
             "rpy_unicode",
-            "copyunicodecontent",
+            "copy_unicode_contents",
             1,
             false,
         );
@@ -6089,7 +6095,7 @@ mod tests {
             "ll_join_strs",
             &STRPTR,
             "rpy_string",
-            "copystrcontent",
+            "copy_string_contents",
             1,
             false,
         );
@@ -6111,7 +6117,7 @@ mod tests {
             "ll_join",
             &UNICODEPTR,
             "rpy_unicode",
-            "copyunicodecontent",
+            "copy_unicode_contents",
             3,
             true,
         );

@@ -232,6 +232,13 @@ pub enum ExtRegistryEntry {
     /// specializes to that same llop instead of lifting the native
     /// invalidation body.
     JitForceQuasiImmutable,
+    /// RPython `lloperation.py` `_LLOpEntry` (`class Entry(ExtRegistryEntry):
+    /// _type_ = LLOp`): `llop.<opname>(RESULTTYPE, *args)`.
+    ///
+    /// `compute_result_annotation` is `lltype_to_annotation(RESULTTYPE.const)`.
+    /// `specialize_call` genops `op.opname` over the remaining arguments.
+    /// `opname` is the `LL_OPERATIONS` catalog key (`ll_operations()`).
+    LLOp { opname: &'static str },
     /// `BigInt::from(i64) -> BigInt` — the `From<i64>` impl that boxes a
     /// machine int into the foreign opaque `BigInt` (Python `long`) on the
     /// cold `int_add`/`int_sub`/… overflow→long arm.  Modeled as a
@@ -400,6 +407,9 @@ pub enum ExtRegistryEntryKey {
     },
     JitForceVirtualizable,
     JitForceQuasiImmutable,
+    LLOp {
+        opname: &'static str,
+    },
     /// Singleton key for the `BigInt.from` residual-external entry. No
     /// per-instance identity — the variant tag alone supplies
     /// `self.__class__` and there is no `self.instance`.
@@ -464,6 +474,7 @@ impl ExtRegistryEntry {
             }
             ExtRegistryEntry::JitForceVirtualizable => ExtRegistryEntryKey::JitForceVirtualizable,
             ExtRegistryEntry::JitForceQuasiImmutable => ExtRegistryEntryKey::JitForceQuasiImmutable,
+            ExtRegistryEntry::LLOp { opname } => ExtRegistryEntryKey::LLOp { opname },
             ExtRegistryEntry::BigIntFrom => ExtRegistryEntryKey::BigIntFrom,
             ExtRegistryEntry::Float2LongLong => ExtRegistryEntryKey::Float2LongLong,
             ExtRegistryEntry::LongLong2Float => ExtRegistryEntryKey::LongLong2Float,
@@ -619,6 +630,13 @@ impl ExtRegistryEntry {
                 None,
                 Some("jit_force_quasi_immutable".to_string()),
             ))),
+            // `_LLOpEntry.compute_annotation` is the base
+            // `SomeBuiltin(compute_result_annotation, methodname=...)`.
+            ExtRegistryEntry::LLOp { opname } => Ok(SomeValue::Builtin(SomeBuiltin::new(
+                format!("rpython.rtyper.lltypesystem.lloperation.llop.{opname}"),
+                None,
+                Some(opname.to_string()),
+            ))),
             // The annotation half is served by the `BigInt.from`
             // `BUILTIN_ANALYZERS` entry (`bigint_from`), which
             // `immutablevalue_hostobject` resolves before the
@@ -753,6 +771,34 @@ impl ExtRegistryEntry {
         }
     }
 
+    /// `lloperation.py` `_LLOpEntry.compute_result_annotation(self,
+    /// RESULTTYPE, *args)`: `lltype_to_annotation(RESULTTYPE.const)`.
+    ///
+    /// `compute_annotation_with_kwds` does not receive the positional
+    /// args; the annotator calls this with `args_s` from `SomeBuiltin.call`.
+    pub fn compute_llop_result_annotation(
+        &self,
+        args_s_opt: &[Option<SomeValue>],
+    ) -> Result<SomeValue, AnnotatorError> {
+        let ExtRegistryEntry::LLOp { opname } = self else {
+            return Err(AnnotatorError::new(format!(
+                "compute_llop_result_annotation called on non-LLOp variant: {self:?}"
+            )));
+        };
+        let s_resulttype = args_s_opt
+            .first()
+            .and_then(|slot| slot.as_ref())
+            .ok_or_else(|| AnnotatorError::new(format!("llop.{opname}: RESULTTYPE is missing")))?;
+        match s_resulttype.const_() {
+            Some(ConstValue::LowLevelType(ll)) => {
+                Ok(super::llannotation::lltype_to_annotation((**ll).clone()))
+            }
+            _ => Err(AnnotatorError::new(format!(
+                "llop.{opname}: RESULTTYPE must be a constant LowLevelType"
+            ))),
+        }
+    }
+
     /// rbuiltin.py `entry.specialize_call` attribute lookup.
     ///
     /// Upstream `ExtRegistryEntry` (extregistry.py) does not
@@ -837,6 +883,8 @@ impl ExtRegistryEntry {
             ExtRegistryEntry::JitForceQuasiImmutable => {
                 Ok(super::rbuiltin::rtype_jit_force_quasi_immutable as BuiltinTyperFn)
             }
+            // `lloperation.py` `_LLOpEntry.specialize_call`.
+            ExtRegistryEntry::LLOp { .. } => Ok(super::rbuiltin::rtype_llop as BuiltinTyperFn),
             // `BigInt.from` lowers to a residual `direct_call` to the
             // external `bigint_from` (extfunc.py:55-64
             // `ExternalFunctionRepr.rtype_simple_call` shape) whose result
@@ -1188,6 +1236,16 @@ fn lookup_host_object(host: &HostObject) -> Option<ExtRegistryEntry> {
     }
     if host.qualname() == "rpython.rtyper.lltypesystem.lloperation.llop.jit_force_quasi_immutable" {
         return Some(ExtRegistryEntry::JitForceQuasiImmutable);
+    }
+    // `lloperation.py` `_LLOpEntry` (`_type_ = LLOp`): every other
+    // catalogued `llop.<opname>` is one ExtRegistry entry whose
+    // instance is that LLOp. The catalog key is `'static`.
+    const LLOP_PREFIX: &str = "rpython.rtyper.lltypesystem.lloperation.llop.";
+    if let Some(opname) = host.qualname().strip_prefix(LLOP_PREFIX)
+        && let Some((&key, _)) =
+            super::lltypesystem::lloperation::ll_operations().get_key_value(opname)
+    {
+        return Some(ExtRegistryEntry::LLOp { opname: key });
     }
     // `rlib/nonconst.py class EntryNonConstant(ExtRegistryEntry): _about_ =
     // NonConstant` — keyed by the same qualname `annotator/builtin.rs`
@@ -1547,6 +1605,30 @@ mod tests {
         assert!(matches!(
             entry.compute_annotation_with_kwds(&bookkeeper, &std::collections::HashMap::new()),
             Ok(SomeValue::None_(_))
+        ));
+    }
+
+    #[test]
+    fn llop_lookup_resolves_any_catalogued_opname() {
+        let host = HostObject::new_builtin_callable(
+            "rpython.rtyper.lltypesystem.lloperation.llop.gc_writebarrier_before_move",
+        );
+        match lookup(&ConstValue::HostObject(host)) {
+            Some(ExtRegistryEntry::LLOp { opname }) => {
+                assert_eq!(opname, "gc_writebarrier_before_move");
+            }
+            other => panic!("catalogued llop must surface LLOp, got {other:?}"),
+        }
+        let missing = HostObject::new_builtin_callable(
+            "rpython.rtyper.lltypesystem.lloperation.llop.no_such_op",
+        );
+        assert!(lookup(&ConstValue::HostObject(missing)).is_none());
+        let quasi = HostObject::new_builtin_callable(
+            "rpython.rtyper.lltypesystem.lloperation.llop.jit_force_quasi_immutable",
+        );
+        assert!(matches!(
+            lookup(&ConstValue::HostObject(quasi)),
+            Some(ExtRegistryEntry::JitForceQuasiImmutable)
         ));
     }
 

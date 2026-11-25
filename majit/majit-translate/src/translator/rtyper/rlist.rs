@@ -3471,14 +3471,7 @@ fn build_ll_arraymove_arm(
 ///   guards the memmove, and here each per-item `setarrayitem` marks its
 ///   own card.  Emitting the barrier would only mean something alongside a
 ///   memmove arm for it to gate.
-pub(crate) fn build_ll_arraymove_helper_graph(
-    name: &str,
-    item_lltype: LowLevelType,
-) -> Result<PyGraph, TyperError> {
-    let items_ptr = items_array_ptr_lltype(&item_lltype);
-    build_ll_arraymove_helper_graph_with_items_ptr(name, item_lltype, items_ptr)
-}
-
+///
 /// `rgc.ll_arraymove` over `items_ptr`. A resized list's items array is
 /// `Ptr(GcArray(ITEM))`; a RustVec header's `ptr` is a nolength
 /// `Ptr(Array(ITEM))` (`rust_vec_items_array_ptr_lltype`). The helper
@@ -14850,8 +14843,12 @@ mod tests {
     /// served to whichever producer minted second.
     #[test]
     fn build_ll_arraymove_dispatches_on_delta_and_carries_both_directions() {
-        let helper = build_ll_arraymove_helper_graph("ll_arraymove", LowLevelType::Signed)
-            .expect("build_ll_arraymove_helper_graph");
+        let helper = build_ll_arraymove_helper_graph_with_items_ptr(
+            "ll_arraymove",
+            LowLevelType::Signed,
+            items_array_ptr_lltype(&LowLevelType::Signed),
+        )
+        .expect("build_ll_arraymove_helper_graph_with_items_ptr");
         assert_eq!(helper.func.name, "ll_arraymove");
         let inner = helper.graph.borrow();
 
@@ -16311,7 +16308,13 @@ mod tests {
                 {
                     let item = item.clone();
                     move |_r, _a, _res| {
-                        build_ll_arraymove_helper_graph("ll_arraymove", item.clone())
+                        let item = item.clone();
+                        let items_ptr = items_array_ptr_lltype(&item);
+                        build_ll_arraymove_helper_graph_with_items_ptr(
+                            "ll_arraymove",
+                            item,
+                            items_ptr,
+                        )
                     }
                 },
             )
@@ -16418,7 +16421,13 @@ mod tests {
                 {
                     let item = item_ll.clone();
                     move |_r, _a, _res| {
-                        build_ll_arraymove_helper_graph("ll_arraymove", item.clone())
+                        let item = item.clone();
+                        let items_ptr = items_array_ptr_lltype(&item);
+                        build_ll_arraymove_helper_graph_with_items_ptr(
+                            "ll_arraymove",
+                            item,
+                            items_ptr,
+                        )
                     }
                 },
             )

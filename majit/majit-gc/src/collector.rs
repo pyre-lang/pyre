@@ -10602,19 +10602,19 @@ impl MiniMarkGC {
     /// `alloc_varsize_nonmoving_prefer_young`, so production list storage can
     /// carry cards. The sites that owe this call are the item moves in
     /// `pyre_object::listobject`'s `W_ListObject` — `object_insert`,
-    /// `object_remove` and `object_drain` each shift items with a bare
-    /// `ptr::copy`. `object_reverse` follows `rlist.py ll_reverse` and
-    /// stores through `ll_list_obj_setitem_fast` (`setarrayitem_gc`): the
-    /// host setter (`items_block_set_ref`) is `write_barrier_from_array`.
-    /// `object_splice` is not on this list —
-    /// it already calls `list_write_barrier` before its copies.
+    /// `object_remove`, `object_drain` and `object_splice` each shift items
+    /// through `object_array::ll_arraymove_items_block`. `object_reverse`
+    /// follows `rlist.py ll_reverse` and stores through
+    /// `ll_list_obj_setitem_fast` (`setarrayitem_gc`): the host setter
+    /// (`items_block_set_ref`) is `write_barrier_from_array`.
     ///
     /// Upstream reaches this barrier from those operations through
     /// `rgc.ll_arraymove`, which `ll_insert_nonneg`, `ll_pop_zero`,
-    /// `ll_delitem_nonneg` and `ll_listdelslice_startstop` all call; pyre's
-    /// list is not an rtyper-lowered list, so it has no such seam, and the
-    /// three calls are written out at those sites as
-    /// `listobject::list_before_move_barrier`.
+    /// `ll_delitem_nonneg`, `ll_listdelslice_startstop` and `ll_listsetslice`
+    /// all call. pyre's object list uses the same seam:
+    /// `object_array::ll_arraymove_items_block` / `jit_ll_arraymove` runs
+    /// `gc_writebarrier_before_move` (`_contains_gcptr(TP.OF)`) then the
+    /// overlap-safe memmove.
     ///
     /// The order was not free. Those sites are prerequisites of a production
     /// card allocator, not siblings of it: with cards live and a move

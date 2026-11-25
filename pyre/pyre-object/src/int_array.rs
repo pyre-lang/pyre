@@ -370,8 +370,13 @@ impl IntArray {
         assert!(index < self.len_relaxed());
         let value = self.as_slice()[index];
         unsafe {
-            let p = self.base().add(index);
-            std::ptr::copy(p.add(1), p, self.len_relaxed() - index - 1);
+            // rlist.py ll_delitem_nonneg: ll_arraymove(l, index + 1, index, newlength - index)
+            crate::object_array::ll_arraymove_int_items_block(
+                self.block,
+                index as i64 + 1,
+                index as i64,
+                (self.len_relaxed() - index - 1) as i64,
+            );
         }
         self.set_len_relaxed(self.len_relaxed() - 1);
         value
@@ -497,5 +502,12 @@ mod tests {
         assert!(empty.block.is_null());
         let arr = IntArray::try_with_len(5).unwrap();
         assert_eq!(arr.as_slice(), &[0, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn remove_shifts_tail_left() {
+        let mut arr = IntArray::from_vec(vec![0, 1, 2, 3, 4, 5]);
+        assert_eq!(arr.remove(1), 1);
+        assert_eq!(arr.as_slice(), &[0, 2, 3, 4, 5]);
     }
 }
