@@ -55,6 +55,10 @@ pub(in crate::front::mir) struct StructAggregateCtorSite {
     pub(in crate::front::mir) op_idx: usize,
     pub(in crate::front::mir) result: Variable,
     pub(in crate::front::mir) owner: String,
+    /// The allocated STRUCT's identity carried by the constructor call
+    /// (`CallTarget::allocated_struct_id`), the TYPE `malloc.py
+    /// recreate_malloc` keeps for the recreated malloc.
+    pub(in crate::front::mir) owner_id: Option<majit_ir::descr::StructId>,
 }
 
 #[expect(
@@ -121,11 +125,16 @@ pub(in crate::front::mir) fn next_struct_aggregate_ctor(
             if layout_empty && struct_ctor_has_whole_value_use(graph, result) {
                 continue;
             }
+            let OpKind::Call { target, .. } = &op.kind else {
+                unreachable!("matched as a Call above");
+            };
+            let owner_id = target.allocated_struct_id();
             return Some(StructAggregateCtorSite {
                 block_idx,
                 op_idx,
                 result: result.clone(),
                 owner: owner.clone(),
+                owner_id,
             });
         }
     }
@@ -978,6 +987,7 @@ pub(in crate::front::mir) fn scalar_replace_one_struct_aggregate(
         op_idx,
         result,
         owner,
+        owner_id,
     } = site;
     let foreign_field_ops = graph.blocks.iter().enumerate().any(|(idx, block)| {
         idx != block_idx
@@ -1003,7 +1013,7 @@ pub(in crate::front::mir) fn scalar_replace_one_struct_aggregate(
         let has_vtable =
             crate::codewriter::heaptracker::attrs_have_vtable(&owner, struct_field_attrs);
         graph.blocks[block_idx].operations[op_idx].kind =
-            crate::model::malloc_opkind(owner.clone(), has_vtable);
+            crate::model::malloc_opkind(owner.clone(), has_vtable, owner_id);
         materialize_whole_value_copies_in_block(
             graph, block_idx, op_idx, &result, &owner, has_vtable,
         );
@@ -1402,9 +1412,21 @@ pub(in crate::front::mir) fn emit_materialized_struct_copy(
         }
     }
     let result = graph.alloc_value_var();
+    // A materialized copy has no constructor call; every field row of the
+    // copied value names the same STRUCT (`heaptracker.all_fielddescrs`).
+    let mut owner_ids = fields.iter().filter_map(|(field, _, _)| {
+        (field.owner_root.as_deref() == Some(owner))
+            .then_some(field.owner_id)
+            .flatten()
+    });
+    let owner_id = owner_ids.next();
+    debug_assert!(
+        owner_ids.all(|other| Some(other) == owner_id),
+        "materialized copy of {owner} mixes field STRUCT ids"
+    );
     out.push(crate::model::SpaceOperation {
         result: Some(result.clone()),
-        kind: crate::model::malloc_opkind(owner.to_string(), has_vtable),
+        kind: crate::model::malloc_opkind(owner.to_string(), has_vtable, owner_id),
     });
     for (field, value, ty) in fields {
         // Keep the typeptr store on the copy. `fuse_boxing_alloc`

@@ -2396,11 +2396,12 @@ impl AssemblerEncode for Assembler {
             }
             // RPython `jtransform.py rewrite_op_malloc`: a fixed-size
             // GC struct without a vtable lowers to `new(descr)`.
-            OpKind::New { owner } => {
+            OpKind::New { owner, owner_id } => {
                 let opname = "new";
-                let spec = bh_size_spec_from_callcontrol(
+                let spec = bh_size_spec_for(
                     callcontrol.expect("new assembly requires a CallControl"),
                     owner,
+                    *owner_id,
                 )
                 .unwrap_or_else(|| {
                     panic!("{opname}: no struct layout registered for owner {owner:?}")
@@ -9896,6 +9897,95 @@ mod tests {
             bh_size_spec_from_callcontrol(&cc, owner).expect("instantiated Option variant size");
         assert_eq!(spec.type_id, concrete_id.as_u64());
         assert_eq!(spec.all_fielddescrs.len(), 2);
+    }
+
+    /// `descr.py` `get_size_descr(STRUCT)` and
+    /// `heaptracker.py` `all_fielddescrs(STRUCT)` consume the same concrete
+    /// lltype STRUCT.  An intern spelling can retain a reference in its
+    /// generic suffix while `concrete_adt_struct_id` deliberately renders the
+    /// physical instantiation without it; NEW must use the latter identity
+    /// when the aggregate's setfields do.
+    #[test]
+    fn new_size_spec_uses_the_field_stores_concrete_variant_struct() {
+        use crate::call::{CallControl, StructFieldLayout, StructLayout};
+        use majit_ir::descr::ArrayFlag;
+        use majit_ir::value::Type;
+
+        let owner = "ops::range::Bound<&i64>::Included";
+        let template = majit_ir::descr::StructId::from_canonical("ops::range::Bound::Included");
+        let intern_id = majit_ir::descr::StructId::from_canonical_spelling(owner);
+        let concrete_id = template.instantiate("<i64>");
+        assert_ne!(intern_id, concrete_id);
+        let _registry =
+            register_struct_ids_serialized(HashMap::from([(owner.to_string(), Some(intern_id))]));
+
+        let mut cc = CallControl::new();
+        let mut struct_fields = crate::front::StructFieldRegistry::default();
+        struct_fields.fields.insert(
+            owner.to_string(),
+            vec![("__pos_0".to_string(), "i64".to_string())],
+        );
+        cc.set_struct_fields(struct_fields);
+        let mut intern_layout = StructLayout::from_type_strings(
+            &[("__pos_0".to_string(), "i64".to_string())],
+            &std::collections::HashSet::new(),
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &std::collections::HashSet::new(),
+        );
+        intern_layout.gckind = crate::translator::rtyper::lltypesystem::lltype::GcKind::Gc;
+        cc.set_struct_layout(intern_id, intern_layout);
+        cc.set_struct_layout(
+            concrete_id,
+            StructLayout {
+                size: 16,
+                align: 8,
+                gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Gc,
+                repr_transparent: false,
+                fields: vec![
+                    StructFieldLayout {
+                        name: "__discriminant".to_string(),
+                        offset: 0,
+                        size: 8,
+                        flag: ArrayFlag::Signed,
+                        field_type: Type::Int,
+                        rank: None,
+                    },
+                    StructFieldLayout {
+                        name: "__pos_0".to_string(),
+                        offset: 8,
+                        size: 8,
+                        flag: ArrayFlag::Signed,
+                        field_type: Type::Int,
+                        rank: None,
+                    },
+                ],
+                host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(HashMap::new()),
+            },
+        );
+
+        let intern_spec = bh_size_spec_from_callcontrol(&cc, owner)
+            .expect("intern spelling has a payload-only C-order layout");
+        assert_eq!(intern_spec.size, 8);
+
+        let new_spec = bh_size_spec_for(&cc, owner, Some(concrete_id))
+            .expect("NEW uses the concrete variant STRUCT");
+        assert_eq!(new_spec.type_id, concrete_id.as_u64());
+        assert_eq!(new_spec.size, 16);
+        assert_eq!(new_spec.all_fielddescrs.len(), 2);
+        assert_eq!(new_spec.all_fielddescrs[0].field_key(), "__discriminant");
+        assert_eq!(new_spec.all_fielddescrs[0].offset, 0);
+        assert_eq!(new_spec.all_fielddescrs[1].field_key(), "__pos_0");
+        assert_eq!(new_spec.all_fielddescrs[1].offset, 8);
+        assert!(
+            new_spec
+                .all_fielddescrs
+                .iter()
+                .all(|field| { field.offset + field.field_size <= new_spec.size })
+        );
     }
 
     /// `descr.py` `get_field_descr(STRUCT, fieldname)` keys on the

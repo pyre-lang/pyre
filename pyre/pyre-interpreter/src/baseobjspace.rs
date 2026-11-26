@@ -1180,10 +1180,41 @@ pub(crate) unsafe fn issubtype_w(w_type: PyObjectRef, cls: PyObjectRef) -> bool 
     if !is_type_like_w(w_type) {
         return false;
     }
-    // One owner for `_issubtype`: under the JIT this registered
-    // `dont_look_inside` helper is the residual scan inside PyPy's
-    // `_pure_issubtype`; it also owns the partially-initialized slow path.
-    pyre_object::w_type_issubtype(w_type, cls)
+    // typeobject.py `W_TypeObject.issubtype` (promote + `_pure_issubtype`).
+    type_issubtype(w_type, cls)
+}
+
+/// typeobject.py `W_TypeObject.issubtype`: both types are promoted, and
+/// under the JIT a pair with version tags goes through the
+/// `@elidable_promote` [`_pure_issubtype`], so the MRO scan folds away on
+/// the trace.
+///
+/// # Safety
+/// `w_sub` and `w_type` must be live type objects.
+pub(crate) unsafe fn type_issubtype(w_sub: PyObjectRef, w_type: PyObjectRef) -> bool {
+    let w_sub = majit_metainterp::jit::promote(w_sub);
+    let w_type = majit_metainterp::jit::promote(w_type);
+    if majit_metainterp::jit::we_are_jitted() {
+        let version_tag1 = w_type_version_tag(w_sub);
+        let version_tag2 = w_type_version_tag(w_type);
+        if version_tag1 != 0 && version_tag2 != 0 {
+            return _pure_issubtype(w_sub, w_type, version_tag1, version_tag2);
+        }
+    }
+    pyre_object::w_type_issubtype(w_sub, w_type)
+}
+
+/// typeobject.py `_pure_issubtype`, keyed on both version tags.
+#[majit_macros::elidable_promote]
+/// # Safety
+/// `w_sub` and `w_type` must be live type objects.
+pub unsafe fn _pure_issubtype(
+    w_sub: PyObjectRef,
+    w_type: PyObjectRef,
+    _version_tag1: u64,
+    _version_tag2: u64,
+) -> bool {
+    unsafe { pyre_object::w_type_issubtype(w_sub, w_type) }
 }
 
 /// JIT walker accessor for `issubtype_w` without exposing the internal helper

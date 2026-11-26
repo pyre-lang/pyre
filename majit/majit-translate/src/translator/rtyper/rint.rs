@@ -2894,7 +2894,7 @@ mod tests {
                     target: CallTarget::SyntheticTransparentCtor { name, .. },
                     ..
                 } => name.contains("ObjPtrKey"),
-                OpKind::New { owner } => owner.contains("ObjPtrKey"),
+                OpKind::New { owner, .. } => owner.contains("ObjPtrKey"),
                 _ => false,
             })
         });

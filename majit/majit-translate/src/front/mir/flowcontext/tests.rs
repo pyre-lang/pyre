@@ -1915,7 +1915,7 @@ fn malloc_removal_keeps_an_escaping_aggregate() {
             .blocks
             .iter()
             .flat_map(|block| &block.operations)
-            .any(|op| { matches!(op.kind, OpKind::New { ref owner } if owner == "Pair") })
+            .any(|op| { matches!(op.kind, OpKind::New { ref owner, .. } if owner == "Pair") })
     );
 }
 
@@ -1971,7 +1971,7 @@ fn malloc_removal_header_type_is_plain_new() {
             .blocks
             .iter()
             .flat_map(|block| &block.operations)
-            .any(|op| matches!(op.kind, OpKind::New { ref owner } if owner == "PyObject"))
+            .any(|op| matches!(op.kind, OpKind::New { ref owner, .. } if owner == "PyObject"))
     );
     assert!(
         !graph
@@ -2091,7 +2091,7 @@ fn malloc_removal_stamps_nested_header_typeptr_as_new_with_vtable() {
             .blocks
             .iter()
             .flat_map(|block| &block.operations)
-            .any(|op| matches!(op.kind, OpKind::New { ref owner } if owner == "Boxed")),
+            .any(|op| matches!(op.kind, OpKind::New { ref owner, .. } if owner == "Boxed")),
         "vtable-bearing Boxed must not lower to plain New"
     );
     assert!(

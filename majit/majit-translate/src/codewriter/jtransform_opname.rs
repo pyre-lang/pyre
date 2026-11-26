@@ -1034,7 +1034,14 @@ fn transduce_op(
                 );
                 let owner = malloc_struct_owner(&op.args[0]);
                 let result = expect_var(&op.result);
-                out.push_op_with_result_var(block, OpKind::New { owner }, result);
+                out.push_op_with_result_var(
+                    block,
+                    OpKind::New {
+                        owner,
+                        owner_id: None,
+                    },
+                    result,
+                );
             }
         }
         // `jtransform.py rewrite_op_gc_identityhash = _do_builtin_call`.
@@ -4982,7 +4989,7 @@ mod tests {
         for block in &model.blocks {
             for op in &block.operations {
                 match &op.kind {
-                    OpKind::New { owner } => news.push(owner.clone()),
+                    OpKind::New { owner, .. } => news.push(owner.clone()),
                     OpKind::FieldWrite {
                         field, value, ty, ..
                     } => {

@@ -472,7 +472,7 @@ pub(in crate::front::mir) fn emit_aggregate_ctor_with_pairs(
     graph.block_mut(block).operations.push(SpaceOperation {
         result: Some(res.clone()),
         kind: OpKind::Call {
-            target: ctor.target.clone(),
+            target: ctor.target.clone().with_allocated_struct_id(ctor.owner_id),
             args: Vec::new(),
             result_ty: ValueType::Ref(Some(ctor.result_owner.clone())),
         },
@@ -606,7 +606,7 @@ pub(in crate::front::mir) fn emit_aggregate_ctor(
     graph.block_mut(block).operations.push(SpaceOperation {
         result: Some(res.clone()),
         kind: OpKind::Call {
-            target: ctor.target.clone(),
+            target: ctor.target.clone().with_allocated_struct_id(ctor.owner_id),
             args: Vec::new(),
             result_ty: ValueType::Ref(Some(ctor.result_owner.clone())),
         },

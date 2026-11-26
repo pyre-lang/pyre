@@ -5018,6 +5018,7 @@ impl<'a> Transformer<'a> {
         graph: &mut FunctionGraph,
         result: Option<crate::flowspace::model::Variable>,
         owner: String,
+        owner_id: Option<majit_ir::descr::StructId>,
         has_vtable: bool,
         extra_ops: Vec<SpaceOperation>,
     ) -> RewriteResult {
@@ -5046,7 +5047,7 @@ impl<'a> Transformer<'a> {
             let mut ops = Vec::with_capacity(1 + extra_ops.len());
             ops.push(SpaceOperation {
                 result,
-                kind: crate::model::malloc_opkind(owner, has_vtable),
+                kind: crate::model::malloc_opkind(owner, has_vtable, owner_id),
             });
             ops.extend(extra_ops);
             RewriteResult::Replace(ops)
@@ -6226,7 +6227,7 @@ impl<'a> Transformer<'a> {
             // first-field chain reaches a typeptr header is
             // `new_with_vtable`. scalar_replace may have already emitted
             // `New` before this pass sees the constructor.
-            OpKind::New { owner } => {
+            OpKind::New { owner, owner_id } => {
                 if self.callcontrol.as_deref().is_some_and(|cc| {
                     crate::front::llbc_hints::alloc_flavor_raw_contains(
                         &cc.raw_alloc_flavor_structs,
@@ -6245,6 +6246,7 @@ impl<'a> Transformer<'a> {
                     graph,
                     op.result.clone(),
                     owner.clone(),
+                    *owner_id,
                     has_vtable,
                     Vec::new(),
                 )
@@ -12275,6 +12277,7 @@ impl<'a> Transformer<'a> {
             "CallTarget::Indirect must be lowered by translator/rtyper/rpbc.rs \
              before reaching rewrite_op_direct_call",
         );
+        let allocated_struct_id = target.allocated_struct_id();
         // A function item used as a *value* (`DecodedConst::FnPath`) is a
         // synthetic 0-arg Call with a `__fn_const` head. Its value is the
         // function's address (`rtyper.getcallable` / `getfunctionptr`), not
@@ -13013,6 +13016,7 @@ impl<'a> Transformer<'a> {
                 graph,
                 op.result.clone(),
                 owner.clone(),
+                allocated_struct_id,
                 false,
                 Vec::new(),
             );
@@ -13078,6 +13082,7 @@ impl<'a> Transformer<'a> {
                     graph,
                     op.result.clone(),
                     owner.clone(),
+                    allocated_struct_id,
                     false,
                     Vec::new(),
                 );
@@ -13161,6 +13166,7 @@ impl<'a> Transformer<'a> {
                 graph,
                 op.result.clone(),
                 alloc_owner,
+                allocated_struct_id,
                 has_vtable,
                 Vec::new(),
             );
@@ -13231,6 +13237,7 @@ impl<'a> Transformer<'a> {
                 graph,
                 Some(result),
                 alloc_owner,
+                allocated_struct_id,
                 false,
                 extra,
             );
@@ -13250,6 +13257,7 @@ impl<'a> Transformer<'a> {
                 graph,
                 op.result.clone(),
                 owner.clone(),
+                allocated_struct_id,
                 false,
                 Vec::new(),
             );
@@ -13277,6 +13285,7 @@ impl<'a> Transformer<'a> {
                     graph,
                     Some(result),
                     owner.clone(),
+                    allocated_struct_id,
                     true,
                     Vec::new(),
                 );
@@ -13347,6 +13356,7 @@ impl<'a> Transformer<'a> {
                     graph,
                     Some(result),
                     owner.clone(),
+                    allocated_struct_id,
                     false,
                     extra,
                 );
@@ -40260,7 +40270,10 @@ mod tests {
             &ops[0],
             SpaceOperation {
                 result: Some(result),
-                kind: OpKind::New { owner: allocated },
+                kind: OpKind::New {
+                    owner: allocated,
+                    ..
+                },
             } if result == &result_var && allocated == &owner
         ));
         assert!(matches!(
@@ -40343,7 +40356,10 @@ mod tests {
             &ops[0],
             SpaceOperation {
                 result: Some(result),
-                kind: OpKind::New { owner: allocated },
+                kind: OpKind::New {
+                    owner: allocated,
+                    ..
+                },
             } if result == &result_var && allocated == &owner
         ));
         assert!(matches!(
@@ -40585,6 +40601,7 @@ mod tests {
             &mut extra_graph,
             Some(extra_result),
             "synth::Del::B".to_string(),
+            None,
             true,
             vec![extra_write],
         ) else {
@@ -41155,7 +41172,10 @@ mod tests {
             &ops[0],
             SpaceOperation {
                 result: Some(result),
-                kind: OpKind::New { owner: allocated },
+                kind: OpKind::New {
+                    owner: allocated,
+                    ..
+                },
             } if result == &result_var && allocated == &base
         ));
         assert!(matches!(
@@ -41210,7 +41230,7 @@ mod tests {
             ops.as_slice(),
             [SpaceOperation {
                 result: Some(result),
-                kind: OpKind::New { owner },
+                kind: OpKind::New { owner, .. },
             }] if result == &result_var && owner == &allocation_owner
         ));
     }
@@ -42327,7 +42347,10 @@ mod tests {
             ops.as_slice(),
             [SpaceOperation {
                 result: Some(result),
-                kind: OpKind::New { owner: allocated },
+                kind: OpKind::New {
+                    owner: allocated,
+                    ..
+                },
             }] if result == &result_var && allocated == &owner
         ));
     }
@@ -42441,7 +42464,7 @@ mod tests {
         );
         assert!(
             !ops.iter()
-                .any(|kind| matches!(kind, OpKind::New { owner } if owner.contains("Array<"))),
+                .any(|kind| matches!(kind, OpKind::New { owner, .. } if owner.contains("Array<"))),
             "escaping array must not be a struct new: {ops:?}"
         );
     }
@@ -43287,10 +43310,9 @@ mod tests {
             ) else {
                 panic!("u32 alloc");
             };
-            assert!(
-                ops.iter()
-                    .any(|op| matches!(&op.kind, OpKind::New { owner } if owner == "Array<u32;4>"))
-            );
+            assert!(ops.iter().any(
+                |op| matches!(&op.kind, OpKind::New { owner, .. } if owner == "Array<u32;4>")
+            ));
             assert!(!ops.iter().any(|op| matches!(
                 &op.kind,
                 OpKind::NewArray { .. } | OpKind::NewArrayClear { .. }
@@ -43401,11 +43423,9 @@ mod tests {
             ) else {
                 panic!("nested alloc");
             };
-            assert!(
-                ops.iter().any(
-                    |op| matches!(&op.kind, OpKind::New { owner } if owner == "Array<[u8;4];2>")
-                )
-            );
+            assert!(ops.iter().any(
+                |op| matches!(&op.kind, OpKind::New { owner, .. } if owner == "Array<[u8;4];2>")
+            ));
             let field =
                 crate::model::FieldDescriptor::new("__pos_1", Some("Array<[u8;4];2>".into()));
             let read = SpaceOperation {
@@ -43684,7 +43704,10 @@ mod tests {
                 !matches!(
                     ops.as_slice(),
                     [SpaceOperation {
-                        kind: OpKind::New { owner: allocated },
+                        kind: OpKind::New {
+                            owner: allocated,
+                            ..
+                        },
                         ..
                     }] if allocated == &owner
                 ),
@@ -43783,7 +43806,10 @@ mod tests {
                 ops.as_slice(),
                 [SpaceOperation {
                     result: Some(result),
-                    kind: OpKind::New { owner: allocated },
+                    kind: OpKind::New {
+                        owner: allocated,
+                        ..
+                    },
                 }] if result == &result_var && allocated == owner
             ),
             "expected New of {owner}, ops={ops:?}"
@@ -48738,6 +48764,7 @@ mod tests {
                 bb,
                 OpKind::New {
                     owner: "PyObject".into(),
+                    owner_id: None,
                 },
                 true,
             )
@@ -48822,6 +48849,7 @@ mod tests {
                 bb,
                 OpKind::New {
                     owner: "PyObject".into(),
+                    owner_id: None,
                 },
                 true,
             )

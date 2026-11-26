@@ -26276,6 +26276,33 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
         }
     }
 
+    // Rich COMPARE lowers to `inline_call_ir_r` of `compare_value_from_tag`,
+    // so the residual COMPARE gate never sees `p < q`.  Re-run its
+    // user-dunder admission before the callee walk, as the BINARY block
+    // above does.  Only a constant tag selects the dunder: a variable tag
+    // is left to the callee walk, whose switch on it records the guard
+    // (`pyjitpl.py MIFrame.opimpl_switch`).
+    if dst_bank == 'r'
+        && ref_args.len() == 2
+        && int_args.first().is_some_and(|tag| tag.is_constant())
+        && super::specialize::jitcode_is_compare_value_from_tag(
+            ctx.raw_descrs,
+            sub_index,
+            &sub_body,
+        )
+        && let Some(ConcreteValue::Int(cmp_tag)) = int_arg_concretes.first().copied()
+    {
+        let dst = code[op.pc + 1 + 2 + int_width + ref_width] as usize;
+        if let Ok(setup) =
+            inline_fnaddr_call_setup(ctx, op.pc, descr_index, &int_args, &ref_args, &[])
+            && let Some(_) = setup.descr.as_call_descr()
+            && let Some(inlined) =
+                try_walker_inline_user_compareop(ctx, op, code, cmp_tag, &ref_args, dst, dst_bank)?
+        {
+            return Ok(inlined);
+        }
+    }
+
     // `w_complex_new` is `malloc_typed` of a header-plus-payload struct.
     // Walking `binary_value_from_tag` records that allocation as a bare
     // `object` (`<object object at ...>`), so a compiled `abs(x - y)`

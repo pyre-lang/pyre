@@ -308,6 +308,14 @@ pub enum CallTarget {
         name: String,
         #[serde(default)]
         owner_path: Vec<String>,
+        /// Concrete low-level STRUCT allocated for this aggregate.
+        ///
+        /// `rpython/jit/codewriter/jtransform.py` `rewrite_op_malloc` passes
+        /// the malloc's STRUCT to `cpu.sizeof`, while the following setfields
+        /// pass that same STRUCT to `cpu.fielddescrof`.  The Rust frontend
+        /// keeps the corresponding identity on `AggregateCtor::owner_id`.
+        #[serde(default)]
+        owner_id: Option<majit_ir::descr::StructId>,
         /// `true` when the constructed ADT is a `struct`, whose value is
         /// described entirely by the field writes that follow it.
         ///
@@ -559,6 +567,7 @@ impl CallTarget {
         Self::SyntheticTransparentCtor {
             name: name.into(),
             owner_path: Vec::new(),
+            owner_id: None,
             is_struct: false,
             variant_tag: None,
             payload_void: false,
@@ -577,6 +586,7 @@ impl CallTarget {
         Self::SyntheticTransparentCtor {
             name: name.into(),
             owner_path,
+            owner_id: None,
             is_struct: false,
             variant_tag: None,
             payload_void: false,
@@ -598,6 +608,7 @@ impl CallTarget {
         Self::SyntheticTransparentCtor {
             name: name.into(),
             owner_path,
+            owner_id: None,
             is_struct: false,
             variant_tag: Some(variant_tag),
             payload_void: false,
@@ -620,6 +631,7 @@ impl CallTarget {
         Self::SyntheticTransparentCtor {
             name: name.into(),
             owner_path,
+            owner_id: None,
             is_struct: true,
             variant_tag: None,
             payload_void: false,
@@ -643,6 +655,7 @@ impl CallTarget {
             Self::SyntheticTransparentCtor {
                 name,
                 owner_path,
+                owner_id,
                 is_struct,
                 variant_tag,
                 payload_void,
@@ -650,12 +663,33 @@ impl CallTarget {
             } => Self::SyntheticTransparentCtor {
                 name,
                 owner_path,
+                owner_id,
                 is_struct,
                 variant_tag,
                 payload_void,
                 repr_transparent: true,
             },
             other => other,
+        }
+    }
+
+    /// Preserve the concrete STRUCT identity from an aggregate's field
+    /// descriptors through its synthetic constructor call.
+    pub fn with_allocated_struct_id(mut self, owner_id: Option<majit_ir::descr::StructId>) -> Self {
+        if let Self::SyntheticTransparentCtor {
+            owner_id: target_id,
+            ..
+        } = &mut self
+        {
+            *target_id = owner_id;
+        }
+        self
+    }
+
+    pub fn allocated_struct_id(&self) -> Option<majit_ir::descr::StructId> {
+        match self {
+            Self::SyntheticTransparentCtor { owner_id, .. } => *owner_id,
+            _ => None,
         }
     }
 
@@ -1442,6 +1476,10 @@ pub enum OpKind {
     /// using the aggregate owner to resolve its size descriptor.
     New {
         owner: String,
+        /// Concrete STRUCT passed to `jtransform.py` `rewrite_op_malloc`'s
+        /// `cpu.sizeof`, identical to the STRUCT used by the matching
+        /// `cpu.fielddescrof` calls. `None` for untyped/synthetic producers.
+        owner_id: Option<majit_ir::descr::StructId>,
     },
     /// `lltype.malloc(T, flavor='raw')` for a fixed-size struct, or
     /// `malloc_varsize` with `flavor='raw'` when `length` is set.
@@ -4442,11 +4480,15 @@ fn synthetic_transparent_ctor_owner(
 /// chain reaches a typeptr header is `new_with_vtable`; otherwise `new`.
 /// The vtable word on the op is 0: `descr.get_vtable()` is the runtime
 /// size descr (`heaptracker.get_vtable_for_gcstruct`).
-pub fn malloc_opkind(owner: String, has_vtable: bool) -> OpKind {
+pub fn malloc_opkind(
+    owner: String,
+    has_vtable: bool,
+    owner_id: Option<majit_ir::descr::StructId>,
+) -> OpKind {
     if has_vtable {
         OpKind::NewWithVtable { owner, vtable: 0 }
     } else {
-        OpKind::New { owner }
+        OpKind::New { owner, owner_id }
     }
 }
 
@@ -7049,7 +7091,7 @@ pub(crate) fn fuse_boxing_alloc_with(
         }
         let fused = rewrites.len();
         for (bi, oi, owner, has_vtable) in rewrites {
-            graph.blocks[bi].operations[oi].kind = malloc_opkind(owner, has_vtable);
+            graph.blocks[bi].operations[oi].kind = malloc_opkind(owner, has_vtable, None);
         }
         fused
     };
@@ -7626,7 +7668,20 @@ pub(crate) fn fuse_boxing_alloc_with(
                         owner: site.owner,
                         vtable,
                     },
-                    None => OpKind::New { owner: site.owner },
+                    None => {
+                        let owner_id = extras.iter().find_map(|op| match &op.kind {
+                            OpKind::FieldWrite { field, .. }
+                                if field.owner_root.as_deref() == Some(site.owner.as_str()) =>
+                            {
+                                field.owner_id
+                            }
+                            _ => None,
+                        });
+                        OpKind::New {
+                            owner: site.owner,
+                            owner_id,
+                        }
+                    }
                 },
             };
             // The kept stores follow the allocation, in struct order: the header's
@@ -22086,6 +22141,7 @@ mod tests {
                 entry,
                 OpKind::New {
                     owner: "pyframe::FrameBox".into(),
+                    owner_id: None,
                 },
                 true,
             )
@@ -22612,7 +22668,7 @@ mod tests {
                 "{label}: the residual malloc must survive exactly when the cluster declines"
             );
             let allocation = ops.iter().find(|op| match &op.kind {
-                OpKind::NewWithVtable { owner, .. } | OpKind::New { owner } => {
+                OpKind::NewWithVtable { owner, .. } | OpKind::New { owner, .. } => {
                     owner == "W_IntObject"
                 }
                 _ => false,
@@ -23167,7 +23223,7 @@ mod tests {
             graph.block(entry).operations.iter().any(|op| {
                 matches!(
                     &op.kind,
-                    OpKind::NewWithVtable { owner, .. } | OpKind::New { owner }
+                    OpKind::NewWithVtable { owner, .. } | OpKind::New { owner, .. }
                         if owner == "W_FloatObject"
                 )
             }),

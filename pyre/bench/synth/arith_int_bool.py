@@ -1,6 +1,6 @@
 # pyre-check: max-pypy-ratio=3.7
 # main CI 10-24..10-26 (6 runs, all native legs): 1.5x-2.7x; ceiling = max x 1.35. Derived floor 0.925x.
-# pyre-check: spec-folds=binary_op_descent,compare_op_descent
+# pyre-check: spec-folds=binary_op_descent
 # Merged synth parity smoke suite: independent feature-level hot loops, each
 # kept verbatim from its former standalone file with module-level names prefixed
 # by the source name. Bug-repro / resume / kept-stack tests are NOT merged (they

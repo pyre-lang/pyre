@@ -2772,7 +2772,7 @@ mod opname_spine_prejit_tests {
             .iter()
             .filter_map(|insn| match insn {
                 FlatOp::Op(op) => match &op.kind {
-                    OpKind::New { owner } => Some(owner.as_str()),
+                    OpKind::New { owner, .. } => Some(owner.as_str()),
                     _ => None,
                 },
                 _ => None,

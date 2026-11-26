@@ -6491,7 +6491,7 @@ impl<'a> Lowering<'a> {
         self.graph.block_mut(bb_id).operations.push(SpaceOperation {
             result: Some(res.clone()),
             kind: OpKind::Call {
-                target: ctor.target.clone(),
+                target: ctor.target.clone().with_allocated_struct_id(ctor.owner_id),
                 args: Vec::new(),
                 result_ty: ValueType::Ref(Some(ctor.result_owner.clone())),
             },

@@ -6437,7 +6437,10 @@ fn search_transduce_op(out: &mut ModelGraph, block: BlockId, op: &SpaceOperation
                     None,
                 )
             } else {
-                OpKind::New { owner }
+                OpKind::New {
+                    owner,
+                    owner_id: None,
+                }
             };
             out.push_op_with_result_var(block, kind, result);
         }

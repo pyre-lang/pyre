@@ -24,7 +24,7 @@ fn op_brief(op: &majit_translate::model::SpaceOperation) -> String {
         .map(|v| format!("v{}", v.id()))
         .unwrap_or_else(|| "_".into());
     match &op.kind {
-        OpKind::New { owner } => format!("{result} = New {owner}"),
+        OpKind::New { owner, .. } => format!("{result} = New {owner}"),
         OpKind::NewWithVtable { owner, vtable } => {
             format!("{result} = NewWithVtable {owner} vtable={vtable:#x}")
         }

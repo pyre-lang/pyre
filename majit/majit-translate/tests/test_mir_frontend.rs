@@ -4008,7 +4008,7 @@ fn frame_box_owner_root_word_roundtrips() {
             .iter()
             .flat_map(|block| &block.operations)
             .filter_map(|op| match &op.kind {
-                OpKind::New { owner } | OpKind::NewWithVtable { owner, .. }
+                OpKind::New { owner, .. } | OpKind::NewWithVtable { owner, .. }
                     if owner_is_frame_box(Some(owner.as_str())) =>
                 {
                     Some(owner.as_str())

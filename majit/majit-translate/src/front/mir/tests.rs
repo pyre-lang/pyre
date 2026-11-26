@@ -466,7 +466,7 @@ pub(in crate::front::mir) fn struct_ctor_ops(graph: &FunctionGraph) -> (usize, u
                     },
                 ..
             } => ctors += 1,
-            OpKind::New { owner } if owner == "error::DictKeyError" => news += 1,
+            OpKind::New { owner, .. } if owner == "error::DictKeyError" => news += 1,
             OpKind::FieldWrite { field, .. } if field.name == "kind" => field_writes += 1,
             _ => {}
         }
@@ -498,7 +498,7 @@ pub(in crate::front::mir) fn struct_news(graph: &FunctionGraph) -> Vec<Variable>
         .iter()
         .flat_map(|block| &block.operations)
         .filter_map(|op| match &op.kind {
-            OpKind::New { owner } if owner == "error::DictKeyError" => op.result.clone(),
+            OpKind::New { owner, .. } if owner == "error::DictKeyError" => op.result.clone(),
             _ => None,
         })
         .collect()
@@ -34918,7 +34918,9 @@ fn assert_nth_struct_payload_writes_value(graph: &crate::model::FunctionGraph, h
             // `simplify_lowered_graph` (`scalar_replace_named_struct_aggregates`,
             // `malloc.py` `rewrite_op_malloc`) rewrites the payload ctor to
             // `New` + `setfield` at the `Some.__pos_0` escape.
-            OpKind::New { owner } | OpKind::NewWithVtable { owner, .. } if payload_owner(owner) => {
+            OpKind::New { owner, .. } | OpKind::NewWithVtable { owner, .. }
+                if payload_owner(owner) =>
+            {
                 if let Some(result) = &op.result {
                     ctor_results.push(result.clone());
                 }
@@ -34945,7 +34947,7 @@ fn assert_nth_struct_payload_writes_value(graph: &crate::model::FunctionGraph, h
     let new_owners: Vec<&str> = ops
         .iter()
         .filter_map(|op| match &op.kind {
-            OpKind::New { owner } | OpKind::NewWithVtable { owner, .. } => Some(owner.as_str()),
+            OpKind::New { owner, .. } | OpKind::NewWithVtable { owner, .. } => Some(owner.as_str()),
             _ => None,
         })
         .collect();
@@ -35141,7 +35143,7 @@ fn pyerror_ptr_ctor_emits_one_cast_instance() {
             .iter()
             .flat_map(|block| &block.operations)
             .any(|op| match &op.kind {
-                crate::model::OpKind::New { owner }
+                crate::model::OpKind::New { owner, .. }
                 | crate::model::OpKind::NewWithVtable { owner, .. } => {
                     owner.contains("PyError") && !owner.contains("PyErrorObject")
                 }

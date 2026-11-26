@@ -4260,15 +4260,27 @@ where
     let rhs_operand = flatten_arg_with_lowering(&op.args[1], get_register, lower_constant);
     // `is` / `is_not` are `pyopcode.py IS_OP`: an `inline_call_ir_r` of
     // `runtime_ops::is_op`, whose `space.is_w` the walk traces, when this
-    // build carries that body fully bound.  Other COMPARE tags stay
-    // residual so `CompareOpDescent` and `finishframe_exception` own the
-    // portal-frame raise.
+    // build carries that body fully bound.  Rich comparisons are an
+    // `inline_call_ir_r` of `compare_value_from_tag`
+    // (`jtransform.py handle_regular_call`).  A build without either body
+    // bound keeps the `compare_op_fn_idx` residual; so do the `in` /
+    // `not in` and exception-match tags.
     if pyre_interpreter::runtime_ops::compare_op_tag_is_identity(op_val)
         && let Some(insn) = build_orthodox_inline_call_ir_r(
             inline_call_targets::IS_OP,
             vec![Operand::ConstInt(
                 (op_val == pyre_interpreter::runtime_ops::COMPARE_OP_IS_NOT) as i64,
             )],
+            vec![lhs_operand.clone(), rhs_operand.clone()],
+            result_reg,
+        )
+    {
+        return Some(insn);
+    }
+    if (0..=5).contains(&op_val)
+        && let Some(insn) = build_orthodox_inline_call_ir_r(
+            inline_call_targets::COMPARE_VALUE_FROM_TAG,
+            vec![Operand::ConstInt(op_val)],
             vec![lhs_operand.clone(), rhs_operand.clone()],
             result_reg,
         )
@@ -6775,6 +6787,9 @@ where
 pub(crate) mod inline_call_targets {
     /// BINARY_OP family — `lower_binary_op_hlop_to_insn`.
     pub const BINARY_VALUE_FROM_TAG: &str = "pyre_interpreter::opcode_ops::binary_value_from_tag";
+    /// COMPARE_OP rich comparisons — `opcode_ops::compare_value_from_tag`,
+    /// `lower_compare_op_hlop_to_insn`.
+    pub const COMPARE_VALUE_FROM_TAG: &str = "pyre_interpreter::opcode_ops::compare_value_from_tag";
     /// BINARY_SLICE — `lower_binary_slice_hlop_to_insn`.
     pub const BINARY_SLICE_VALUES: &str =
         "pyre_interpreter::runtime_ops::binary_slice_values_inner";
@@ -10501,11 +10516,11 @@ mod tests {
 
     #[test]
     fn lower_compare_op_hlop_to_insn_emits_residual_call_ir_r() {
-        // Lowering an `lt(lhs, rhs) → result`
-        // HLOp must produce the same Insn shape that
-        // `build_compare_op_residual_call_ir_r_insn` produces inline at the
-        // CompareOp callsite (codewriter.rs's `Instruction::CompareOp` arm):
-        // `residual_call_ir_r` with args `[ConstInt(fn_idx),
+        // Lowering an `lt(lhs, rhs) → result` HLOp emits `inline_call_ir_r`
+        // of `compare_value_from_tag` when that body is bound, and the residual
+        // otherwise. The residual arm matches
+        // `build_compare_op_residual_call_ir_r_insn` at the CompareOp
+        // callsite: `residual_call_ir_r` with args `[ConstInt(fn_idx),
         // ListI([ConstInt(op_val)]), ListR([lhs, rhs]), Descr]`.
         let lhs = Variable::new(VariableId(0), Kind::Ref);
         let rhs = Variable::new(VariableId(1), Kind::Ref);
@@ -10567,6 +10582,62 @@ mod tests {
                 }
             }
             other => panic!("expected Insn::Op, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lower_compare_op_hlop_emits_inline_call_when_body_is_bound() {
+        // `compare_value_from_tag` is fully bound, so the HLOp lowers to
+        // `jtransform.py handle_regular_call`'s `inline_call_ir_r`.
+        let lhs = Variable::new(VariableId(0), Kind::Ref);
+        let rhs = Variable::new(VariableId(1), Kind::Ref);
+        let result = Variable::new(VariableId(2), Kind::Ref);
+        let ctx = LoweringContext {
+            compare_op_fn_idx: 13,
+            ..Default::default()
+        };
+
+        let hlop = SpaceOperation::new("lt", vec![lhs.into(), rhs.into()], Some(result.into()), 0);
+        let mut get_register = identity_register_mapper();
+        let mut lower_constant = test_constant_lowering();
+        let lowered =
+            lower_compare_op_hlop_to_insn(&hlop, &ctx, &mut get_register, &mut lower_constant)
+                .expect("COMPARE_OP HLOp must lower");
+
+        match lowered {
+            Insn::Op {
+                opname,
+                args,
+                result: Some(reg),
+            } => {
+                assert_eq!(opname, "inline_call_ir_r");
+                assert_eq!(reg, Register::new(Kind::Ref, 2));
+                assert_eq!(args.len(), 3);
+                match &args[0] {
+                    Operand::Descr(descr) => match &**descr {
+                        DescrOperand::JitCode(jc) => {
+                            assert_eq!(jc.name(), "compare_value_from_tag");
+                        }
+                        other => panic!("expected JitCode, got {other:?}"),
+                    },
+                    other => panic!("expected Descr(JitCode), got {other:?}"),
+                }
+                match &args[1] {
+                    Operand::ListOfKind(list) => {
+                        assert_eq!(list.kind, Kind::Int);
+                        assert!(matches!(list.content.as_slice(), [Operand::ConstInt(0)]));
+                    }
+                    other => panic!("expected ListI([0]), got {other:?}"),
+                }
+                match &args[2] {
+                    Operand::ListOfKind(list) => {
+                        assert_eq!(list.kind, Kind::Ref);
+                        assert_eq!(list.content.len(), 2);
+                    }
+                    other => panic!("expected ListR([lhs, rhs]), got {other:?}"),
+                }
+            }
+            other => panic!("expected inline_call_ir_r, got {other:?}"),
         }
     }
 

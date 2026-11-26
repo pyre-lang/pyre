@@ -3993,10 +3993,10 @@ pub(crate) fn complex_hash(obj: PyObjectRef, real: f64, imag: f64) -> i64 {
 
 // ── Public dispatch API ───────────────────────────────────────────────
 
-/// Check if w_type is a subtype of cls — delegates to the single MRO
-/// membership scan in `pyre_object::w_type_issubtype`.
+/// Check if w_type is a subtype of cls — typeobject.py
+/// `W_TypeObject.issubtype` ([`crate::baseobjspace::type_issubtype`]).
 unsafe fn issubtype_cached(w_type: PyObjectRef, cls: PyObjectRef) -> bool {
-    pyre_object::w_type_issubtype(w_type, cls)
+    crate::baseobjspace::type_issubtype(w_type, cls)
 }
 
 /// Comparison special-method dispatch.
@@ -7150,7 +7150,8 @@ pub fn compare_slot(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
     // the codewriter looks inside a loop-free graph only
     // (`policy.py look_inside_graph`), and a traced `int < int` must reach
     // `int_lt` through here.  Exact float/float is the same shape
-    // (`_float_lt` after `_to_float`).  Long/long (`rbigint.lt`), mixed
+    // (`_float_lt` after `_to_float`), and so is float against int or long
+    // (`float_compare`).  Long/long (`rbigint.lt`), mixed
     // long/int (`rbigint.int_lt` via [`long_int_compare`]), and str/str
     // (`W_UnicodeObject.descr_eq` / `descr_lt`: `ll_streq` / `ll_strcmp`
     // over the two `_utf8` payloads) are loop-free too and must live here,
@@ -7183,6 +7184,20 @@ pub fn compare_slot(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
                 CompareOp::Eq => _float_eq(x, y),
                 CompareOp::Ne => _float_ne(x, y),
             };
+        }
+        // floatobject.py `make_compare_func._compare` against an int or a
+        // long: loop-free, so it lives here rather than behind
+        // [`compare_slot_rest`]'s stack check.  `float_compare` keeps the
+        // `int_between(-1, i2 >> 48, 1)` exactness test and calls
+        // `do_compare_bigint` for the rest.  `_compare` is a method on the
+        // float operand; the int-left order reaches it through the reflected
+        // comparison, with the relation reversed.
+        if is_float_pair(a, b) {
+            return Ok(w_bool_from(if is_float(a) {
+                float_compare(a, b, op)
+            } else {
+                float_compare(b, a, reverse_compare_op(op))
+            }));
         }
         // longobject.py `_make_descr_cmp` and intobject.py
         // `_make_descr_cmp`: both mixed orders call an rbigint.int_* method
@@ -7263,7 +7278,7 @@ unsafe fn view_operand_is_set_like(obj: PyObjectRef) -> bool {
 }
 
 /// [`compare_slot`] for layouts whose comparison iterates (containers) or
-/// is not the loop-free long/int/str arm.
+/// is not one of its loop-free int/float/long/str arms.
 #[inline(never)]
 fn compare_slot_rest(mut a: PyObjectRef, mut b: PyObjectRef, op: CompareOp) -> PyResult {
     // RPython inserts a stack check on this recursive object-space call.
@@ -7275,19 +7290,6 @@ fn compare_slot_rest(mut a: PyObjectRef, mut b: PyObjectRef, op: CompareOp) -> P
     // residual call on every traced `int < int`.
     crate::stack_check::stack_check()?;
     unsafe {
-        if is_float_pair(a, b) {
-            // Exact float/float already returned from [`compare_slot`].
-            // Mixed int/long keeps `float_compare` for the mantissa / bigint
-            // arm (`int_between(-1, i2 >> 48, 1)`).
-            // `_compare` is a method on the float operand; the int-left order
-            // reaches it through the reflected comparison, with the relation
-            // reversed.
-            return Ok(w_bool_from(if is_float(a) {
-                float_compare(a, b, op)
-            } else {
-                float_compare(b, a, reverse_compare_op(op))
-            }));
-        }
         // complexobject.py only implements equality here.  Its ordering
         // dunders return NotImplemented, which must continue through the
         // reflected comparison and the generic TypeError fallback below.

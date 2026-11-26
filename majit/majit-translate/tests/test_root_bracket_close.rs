@@ -1927,7 +1927,7 @@ fn w_list_adopt_int_items_fuses_to_new_with_vtable() {
         .flat_map(|b| &b.operations)
         .map(|op| match &op.kind {
             OpKind::NewWithVtable { owner, .. } => format!("NewWithVtable:{owner}"),
-            OpKind::New { owner } => format!("New:{owner}"),
+            OpKind::New { owner, .. } => format!("New:{owner}"),
             OpKind::Call {
                 target: CallTarget::FunctionPath { segments, .. },
                 ..

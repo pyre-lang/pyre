@@ -2101,7 +2101,7 @@ fn infer_op_type(kind: &OpKind) -> ValueType {
         OpKind::FieldWrite { .. } => ValueType::Void,
         // `rstr.py` `mallocstr` → `malloc(STR, n)` → `Ptr(STR)` /
         // `SomeString`. A str-family owner is `Str`, not `Ref(PyObject)`.
-        OpKind::New { owner } => malloc_new_result_type(owner),
+        OpKind::New { owner, .. } => malloc_new_result_type(owner),
         OpKind::NewWithVtable { owner, .. } => malloc_new_result_type(owner),
         // Fixed-size `lltype.malloc(T, flavor='raw')` returns a Signed
         // address except str-family TYPE/owner (`mallocstr`). Immortal
@@ -4816,6 +4816,7 @@ mod tests {
                 pred_gc,
                 OpKind::New {
                     owner: "unicodeobject::Utf8Str".into(),
+                    owner_id: None,
                 },
                 true,
             )
@@ -4865,6 +4866,7 @@ mod tests {
                 pred_obj,
                 OpKind::New {
                     owner: "pyobject::PyObject".into(),
+                    owner_id: None,
                 },
                 true,
             )

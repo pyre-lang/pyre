@@ -3843,7 +3843,7 @@ pub fn translate_op(
         // `SomeInstance(owner)`.  `getuniqueclassdef_for_struct_root` first
         // forces the struct's field rows to be projected so the trailing
         // payload `FieldWrite(result, …)` resolves.
-        OpKind::New { owner } | OpKind::NewWithVtable { owner, .. } => {
+        OpKind::New { owner, .. } | OpKind::NewWithVtable { owner, .. } => {
             let bk = call_registry.bookkeeper();
             bk.getuniqueclassdef_for_struct_root(owner).map_err(|e| {
                 TyperError::message(format!(
@@ -19282,6 +19282,7 @@ mod tests {
         assert_eq!(
             opkind_variant_name(&OpKind::New {
                 owner: "PlainObject".into(),
+                owner_id: None,
             }),
             "New"
         );
@@ -19312,6 +19313,7 @@ mod tests {
         for kind in [
             OpKind::New {
                 owner: "PlainObject".into(),
+                owner_id: None,
             },
             OpKind::NewWithVtable {
                 owner: "TypedObject".into(),

@@ -7331,6 +7331,22 @@ pub(crate) fn jitcode_is_binary_value_from_tag(
     })
 }
 
+/// True when `sub_body` is the `compare_value_from_tag` helper the
+/// codewriter inlines for rich COMPARE.  The target is identified by the
+/// pathed jitcode's index or code pointer, never by a name suffix
+/// (`jtransform.py handle_regular_call` names the callee graph itself).
+pub(crate) fn jitcode_is_compare_value_from_tag(
+    pool: super::RawDescrPool<'_>,
+    sub_index: usize,
+    sub_body: &super::SubJitCodeBody,
+) -> bool {
+    crate::jitcode_runtime::pathed_jitcode_cached(COMPARE_OP_DESCENT.path).is_some_and(|jc| {
+        (matches!(pool, super::RawDescrPool::Global) && jc.index() == sub_index)
+            || std::ptr::eq(jc.code.as_ptr(), sub_body.code.as_ptr())
+            || sub_body.jitcode_index == Some(jc.index())
+    })
+}
+
 /// Tag for a declined helper walk that is `binary_value_from_tag` or a
 /// named `add`/`sub`/`int_add` body.  Used so a bridge that cannot
 /// stamp the helper resume word still emits `int_add` instead of

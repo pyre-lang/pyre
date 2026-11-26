@@ -4743,10 +4743,12 @@ impl OpCode {
             OpCode::UintLe => Some(OpCode::UintGt),
             OpCode::FloatEq => Some(OpCode::FloatNe),
             OpCode::FloatNe => Some(OpCode::FloatEq),
-            OpCode::FloatLt => Some(OpCode::FloatGe),
-            OpCode::FloatGe => Some(OpCode::FloatLt),
-            OpCode::FloatGt => Some(OpCode::FloatLe),
-            OpCode::FloatLe => Some(OpCode::FloatGt),
+            // `resoperation.py opboolinvers` also pairs FLOAT_LT/FLOAT_GE
+            // and FLOAT_GT/FLOAT_LE.  Those are not inverses once an operand
+            // is NaN (every ordered comparison is false), and
+            // `rewrite.py find_rewritable_bool` would then answer
+            // `nan > 0` with `not (nan <= 0)`, i.e. True.  Only the
+            // FLOAT_EQ/FLOAT_NE pair holds for NaN, so only it is kept.
             OpCode::PtrEq => Some(OpCode::PtrNe),
             OpCode::PtrNe => Some(OpCode::PtrEq),
             _ => None,
@@ -6937,7 +6939,12 @@ mod tests {
         assert_eq!(OpCode::IntGt.bool_inverse(), Some(OpCode::IntLe));
         assert_eq!(OpCode::IntLe.bool_inverse(), Some(OpCode::IntGt));
         assert_eq!(OpCode::FloatEq.bool_inverse(), Some(OpCode::FloatNe));
-        assert_eq!(OpCode::FloatLt.bool_inverse(), Some(OpCode::FloatGe));
+        assert_eq!(OpCode::FloatNe.bool_inverse(), Some(OpCode::FloatEq));
+        // NaN: ordered float comparisons have no boolean inverse.
+        assert_eq!(OpCode::FloatLt.bool_inverse(), None);
+        assert_eq!(OpCode::FloatGe.bool_inverse(), None);
+        assert_eq!(OpCode::FloatGt.bool_inverse(), None);
+        assert_eq!(OpCode::FloatLe.bool_inverse(), None);
         assert_eq!(OpCode::UintLt.bool_inverse(), Some(OpCode::UintGe));
         assert_eq!(OpCode::PtrEq.bool_inverse(), Some(OpCode::PtrNe));
         assert_eq!(OpCode::IntAdd.bool_inverse(), None);
