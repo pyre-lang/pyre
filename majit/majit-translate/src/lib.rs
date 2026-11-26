@@ -1877,6 +1877,24 @@ fn analyze_pipeline_from_module_paths(
                 crate::front::semantic::FieldRow::named("items", "&()"),
             ]
         });
+    // `Ptr._interior_ptr_type_with_index` (`lltype.py`) synthesises
+    // `GcStruct("Interior", ("ptr", Ptr(ARRAY)), ("index", Signed),
+    // hints={'interior_ptr_type': True})`. `rtype_interior_getitem_malloc`
+    // (`rptr.py` `pairtype(PtrRepr, IntegerRepr).rtype_getitem`) mallocs
+    // that object. It is not a Charon TypeDecl, so the same `struct_fields`
+    // seed as `"list"` is required or `new(descr)` of owner `"Interior"`
+    // panics in `bh_size_spec_from_callcontrol`. `ptr` is a GCREF word
+    // (`&()` classifies as `(Pointer, Ref, word)`); `index` is Signed.
+    program
+        .struct_fields
+        .fields
+        .entry("Interior".to_string())
+        .or_insert_with(|| {
+            vec![
+                crate::front::semantic::FieldRow::named("ptr", "&()"),
+                crate::front::semantic::FieldRow::named("index", "i64"),
+            ]
+        });
     let mut canonical_trait_impls = Vec::new();
     let mut canonical_inherent_methods = Vec::new();
     // `(trait_leaf, trait_qualified, method_name, owner, return_type,

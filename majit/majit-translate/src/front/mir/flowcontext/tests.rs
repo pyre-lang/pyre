@@ -9052,6 +9052,88 @@ fn binary_value_from_tag_inner_add_is_not_direct_ptradd() {
     crate::translator::rtyper::legacy_annotator::annotate(&graph);
 }
 
+/// `LiveIter::entry_at` is `entries_item_ptr(*self.entries).add(i)` then
+/// `e.f_valid` / `&e.key` / `&e.value`. `ARRAY.OF` is a Struct
+/// (`rptr.py` `pairtype(PtrRepr, IntegerRepr).rtype_getitem`), so the
+/// add is `getitem` of the Entry ARRAY (an InteriorPtr) and field uses
+/// are `getinteriorfield` (`InteriorPtrRepr.rtype_getattr`).
+#[test]
+fn liveiter_entry_at_lowers_ptr_add_as_interior_ptr() {
+    let path = crate::runtime_names::artifacts::OBJECT_ULLBC;
+    let Some(llbc) = crate::test_support::load_ullbc_if_present(path) else {
+        return;
+    };
+    let fds: Vec<_> = llbc
+        .iter_local_fns()
+        .filter(|fd| {
+            let p = fd.item_meta.name_path();
+            p.contains("rordereddict") && p.contains("entry_at")
+        })
+        .collect();
+    assert!(
+        !fds.is_empty(),
+        "rordereddict entry_at FunDecls in pyre-object LLBC"
+    );
+    let context = super::LowerContext::new(&llbc);
+    let mut saw_f_valid = false;
+    let mut saw_key = false;
+    let mut saw_value = false;
+    let mut saw_getitem = false;
+    let mut reports = Vec::new();
+    for fd in fds {
+        let path = fd.item_meta.name_path();
+        let graph =
+            super::lower_fun_decl(&context, fd).unwrap_or_else(|err| panic!("lower {path}: {err}"));
+        let ops: Vec<_> = graph.blocks.iter().flat_map(|b| &b.operations).collect();
+        // `getitem(entries, i)` of the struct ARRAY: the annotator's
+        // `SomeInteriorPtr` (`rtype_getitem` mallocs `{ptr, index}`).
+        let has_interior_getitem = ops.iter().any(|op| match &op.kind {
+            OpKind::ArrayRead {
+                array_type_id: Some(id),
+                ..
+            } => id.contains("Entry"),
+            _ => false,
+        });
+        // A body that only reads fields through the alias leaves the
+        // getitem dead; the one returning `&Entry` keeps it.
+        saw_getitem |= has_interior_getitem;
+        assert!(
+            !calls_leaf(&graph, "add"),
+            "entry_at {path} must not residualize host add, ops={:?}",
+            graph_call_leaves(&graph)
+        );
+        let interior_fields: Vec<&str> = ops
+            .iter()
+            .filter_map(|op| match &op.kind {
+                OpKind::InteriorFieldRead { field, .. } => Some(field.name.as_str()),
+                _ => None,
+            })
+            .collect();
+        for name in ["f_valid", "key", "value"] {
+            let ordinary = ops.iter().any(|op| match &op.kind {
+                OpKind::FieldRead { field, .. } => field.name == name,
+                _ => false,
+            });
+            assert!(
+                !ordinary,
+                "entry_at {path} {name} must be getinteriorfield, ops={ops:?}"
+            );
+        }
+        saw_f_valid |= interior_fields.iter().any(|n| *n == "f_valid");
+        saw_key |= interior_fields.iter().any(|n| *n == "key");
+        saw_value |= interior_fields.iter().any(|n| *n == "value");
+        reports.push(format!("{path} interior={interior_fields:?}"));
+    }
+    assert!(
+        saw_f_valid && saw_key && saw_value,
+        "LiveIter::entry_at must getinteriorfield f_valid/key/value; {reports:?}"
+    );
+    assert!(
+        saw_getitem,
+        "RDict::entry_at returns the Entry ARRAY getitem (InteriorPtr); {reports:?}"
+    );
+}
+
 #[test]
 fn spec_segments_adt_owned_trait_impl_keeps_identity_not_owner_leaf() {
     // rustc method-call: inherent `OwnerFlags::bits` owns owner-leaf;

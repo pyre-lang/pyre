@@ -217,6 +217,22 @@ pub enum OpKind {
     GetAttr,
     SimpleCall,
     CallArgs,
+    /// Address-of a field of a GcArray-element InteriorPtr.
+    ///
+    /// Adapter spelling of `_interior_ptr._expose` applied to a field
+    /// address: offsets carry `Field(name)` and `TO` is the field type.
+    /// Rust takes the address of a GCREF/primitive field; that is
+    /// distinct from getattr-as-load (`GetAttr`).
+    InteriorPtrExpose,
+    /// Store through a leaf-TO InteriorPtr. Setattr-shaped: operands
+    /// are the pointer and the value, with no field name. The rtyper
+    /// form is `InteriorPtrRepr.getinteriorfieldargs` plus
+    /// `setinteriorfield`.
+    StoreThroughPtr,
+    /// Load through a call-returned scalar reference. Operands are the
+    /// pointer and the TYPE constant; the rtyper form is
+    /// `getinteriorfield` or `raw_load` from the pointer's repr.
+    LoadThroughPtr,
 }
 
 /// RPython `operation.py` `canraise` entries reference the Python
@@ -390,6 +406,9 @@ impl OpKind {
             "getattr" => OpKind::GetAttr,
             "simple_call" => OpKind::SimpleCall,
             "call_args" => OpKind::CallArgs,
+            "interior_ptr_expose" => OpKind::InteriorPtrExpose,
+            "store_through_ptr" => OpKind::StoreThroughPtr,
+            "load_through_ptr" => OpKind::LoadThroughPtr,
             _ => return None,
         })
     }
@@ -501,6 +520,9 @@ impl OpKind {
             OpKind::GetAttr => "getattr",
             OpKind::SimpleCall => "simple_call",
             OpKind::CallArgs => "call_args",
+            OpKind::InteriorPtrExpose => "interior_ptr_expose",
+            OpKind::StoreThroughPtr => "store_through_ptr",
+            OpKind::LoadThroughPtr => "load_through_ptr",
         }
     }
 
@@ -594,7 +616,10 @@ impl OpKind {
             | OpKind::Coerce
             | OpKind::Delete
             | OpKind::Contains
-            | OpKind::GetAttr => Some(2),
+            | OpKind::GetAttr
+            | OpKind::InteriorPtrExpose
+            | OpKind::StoreThroughPtr
+            | OpKind::LoadThroughPtr => Some(2),
 
             // ternary
             OpKind::SetAttr
@@ -700,7 +725,8 @@ impl OpKind {
             | OpKind::Get
             | OpKind::Buffer
             | OpKind::NewTuple
-            | OpKind::Pow => true,
+            | OpKind::Pow
+            | OpKind::InteriorPtrExpose => true,
 
             // `_ovf` siblings: HLOperation default (no constfold).
             OpKind::NegOvf
@@ -759,7 +785,9 @@ impl OpKind {
             | OpKind::Iter
             | OpKind::Next
             | OpKind::SimpleCall
-            | OpKind::CallArgs => false,
+            | OpKind::CallArgs
+            | OpKind::StoreThroughPtr
+            | OpKind::LoadThroughPtr => false,
         }
     }
 
@@ -825,7 +853,10 @@ impl OpKind {
             | OpKind::Next
             | OpKind::GetAttr
             | OpKind::SimpleCall
-            | OpKind::CallArgs => Dispatch::Single,
+            | OpKind::CallArgs
+            | OpKind::InteriorPtrExpose
+            | OpKind::StoreThroughPtr
+            | OpKind::LoadThroughPtr => Dispatch::Single,
 
             // DoubleDispatchMixin: `add_operator(…, dispatch=2)`.
             OpKind::Is
@@ -5301,6 +5332,9 @@ mod tests {
             OpKind::GetAttr,
             OpKind::NewRustVec,
             OpKind::NewRustVecFixed,
+            OpKind::InteriorPtrExpose,
+            OpKind::StoreThroughPtr,
+            OpKind::LoadThroughPtr,
         ] {
             let name = kind.opname();
             assert_eq!(

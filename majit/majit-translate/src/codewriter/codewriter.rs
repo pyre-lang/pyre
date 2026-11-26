@@ -506,7 +506,9 @@ impl CodeWriter {
                 // decode helper's argument list is partitioned off the legacy
                 // key Variable's cell, so it has to carry the real kind
                 // before jtransform partitions it.  This is the only copy:
-                // jtransform's own retypes stand after it.
+                // jtransform's own retypes stand after it. Annotation
+                // (`SomeInteriorPtr.offsets`) is copied too, so
+                // `rewrite_store_through_ptr` can read the field name.
                 crate::codewriter::type_state::apply_from_flowspace_variables(&real_value_to_var);
                 crate::codewriter::type_state::apply_from_flowspace_constants(&real_constants);
                 Some((real_value_to_var, const_results))
@@ -806,6 +808,17 @@ impl CodeWriter {
                 value_to_var,
                 callcontrol,
             );
+            crate::codewriter::interior_ptr::rewrite_store_through_ptr(
+                &mut graph_owned,
+                value_to_var,
+                &|name| {
+                    callcontrol
+                        .struct_layout_for(name)
+                        .is_some_and(|layout| layout.repr_transparent)
+                },
+            );
+        } else {
+            crate::codewriter::interior_ptr::lower_through_ptr_without_annotation(&mut graph_owned);
         }
         // rstr.py `StringRepr.convert_const` resolves string literals into
         // prebuilt `Ptr(STR)` constants before the codewriter sees the
@@ -816,6 +829,13 @@ impl CodeWriter {
         // box call receives a proven literal, the interned `W_UnicodeObject`
         // is one Ref constant — not an rstr `Ptr(STR)`.
         crate::translator::rtyper::box_str_const_fold::fold_box_str_constants(&mut graph_owned);
+
+        // `all.py backend_optimizations` runs
+        // `simplify.transform_dead_op_vars(graph, translator)` before
+        // `CodeWriter.transform_graph_to_jitcode` reaches jtransform. Spine A
+        // ports only its translator-gated dead `direct_call` arm here; the
+        // general dead-op pass remains outside this pipeline's scope.
+        crate::model::prune_dead_direct_calls(&mut graph_owned, callcontrol);
 
         // RPython codewriter.py:37 `portal_jd =
         // self.callcontrol.jitdriver_sd_from_portal_graph(graph)` — look

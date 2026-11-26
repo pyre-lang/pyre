@@ -6397,8 +6397,12 @@ pub(in crate::front::mir) fn scan_rvalue_struct_field(
             bump_struct_field_use(operand_struct_field_use(lhs, dest), fields, other);
             bump_struct_field_use(operand_struct_field_use(rhs, dest), fields, other);
         }
-        Rvalue::Ref { place, .. } | Rvalue::RawPtr { place, .. } => {
+        // A shared borrow of a word field reads it (`ll_getitem_fast`). A
+        // mutable borrow is the address a later store goes through, so it
+        // is the InteriorPtr element (`rtype_getitem`), not a value.
+        Rvalue::Ref { place, kind, .. } | Rvalue::RawPtr { place, kind, .. } => {
             if struct_field_place_local(place) == Some(dest)
+                && kind.as_str() == Some("Shared")
                 && tyref_is_identity_field_word(&place.ty, llbc)
             {
                 *fields += 1;
@@ -6471,7 +6475,7 @@ pub(in crate::front::mir) fn struct_field_census(
         }
         match bb.term_ref(llbc) {
             Ok(TermKind::Switch { discr, .. }) => bump_struct_field_use(
-                operand_struct_field_use(discr, dest),
+                operand_struct_field_use(&discr, dest),
                 &mut census.fields,
                 &mut census.other,
             ),
@@ -6701,6 +6705,219 @@ fn fused_get_assign_ok(
     let mut other = 0;
     scan_rvalue_struct_field(rvalue, dest, llbc, &mut 0, &mut other);
     other == 0
+}
+
+/// `&(*dest).field` / `&mut (*dest).field`, or a reborrow `&mut *dest`.
+pub(in crate::front::mir) fn place_is_struct_elem_use_of(place: &Place, dest: usize) -> bool {
+    place_is_immediate_struct_field_of(place, dest) || place_is_immediate_deref_of(place, dest)
+}
+
+pub(in crate::front::mir) fn scan_rvalue_struct_elem(
+    rvalue: &Rvalue,
+    dest: usize,
+    elems: &mut usize,
+    other: &mut usize,
+) {
+    let mut unused_fields = 0usize;
+    match rvalue {
+        Rvalue::Use(op, _)
+        | Rvalue::UnaryOp(_, op)
+        | Rvalue::Cast(_, op, _)
+        | Rvalue::Repeat { operand: op, .. }
+        | Rvalue::ShallowInitBox(op, _) => {
+            bump_struct_field_use(
+                operand_struct_field_use(op, dest),
+                &mut unused_fields,
+                other,
+            );
+        }
+        Rvalue::BinaryOp(_, lhs, rhs) => {
+            bump_struct_field_use(
+                operand_struct_field_use(lhs, dest),
+                &mut unused_fields,
+                other,
+            );
+            bump_struct_field_use(
+                operand_struct_field_use(rhs, dest),
+                &mut unused_fields,
+                other,
+            );
+        }
+        // Address-of a field, or a reborrow of the element, is the getitem
+        // producer. Fusion still counts these Other (`scan_rvalue_struct_field`).
+        Rvalue::Ref { place, .. } => {
+            if place_is_struct_elem_use_of(place, dest) {
+                *elems += 1;
+            } else if place_references_local(place, dest) {
+                *other += 1;
+            }
+        }
+        Rvalue::RawPtr { place, .. } => {
+            if place_references_local(place, dest) {
+                *other += 1;
+            }
+        }
+        Rvalue::Len(place) | Rvalue::Discriminant(place) => {
+            if place_references_local(place, dest) {
+                *other += 1;
+            }
+        }
+        Rvalue::Aggregate(_, operands) => {
+            for op in operands {
+                bump_struct_field_use(
+                    operand_struct_field_use(op, dest),
+                    &mut unused_fields,
+                    other,
+                );
+            }
+        }
+        Rvalue::NullaryOp(_, _) | Rvalue::Unknown => {}
+    }
+    let _ = unused_fields;
+}
+
+pub(in crate::front::mir) struct StructElemCensus {
+    pub(in crate::front::mir) defs: usize,
+    pub(in crate::front::mir) elems: usize,
+    pub(in crate::front::mir) other: usize,
+    pub(in crate::front::mir) copies: Vec<usize>,
+}
+
+pub(in crate::front::mir) fn struct_elem_census(
+    llbc: &Llbc,
+    body: &Unstructured,
+    dest: usize,
+) -> StructElemCensus {
+    let mut census = StructElemCensus {
+        defs: 0,
+        elems: 0,
+        other: 0,
+        copies: Vec::new(),
+    };
+    let mut unused_fields = 0usize;
+    let forward_blocks = forward_reachable_mask(llbc, body);
+    for (bb_idx, bb) in body.body().iter().enumerate() {
+        if !forward_blocks[bb_idx] {
+            continue;
+        }
+        for stmt in &bb.statements {
+            match stmt.stmt_kind_ref() {
+                Ok(StmtKind::Assign(place, rvalue)) => {
+                    if let Rvalue::Use(Operand::Copy(p) | Operand::Move(p), _) = &rvalue
+                        && matches!(p.kind, PlaceKind::Local(local) if local as usize == dest)
+                        && let PlaceKind::Local(x) = &place.kind
+                    {
+                        census.copies.push(*x as usize);
+                    } else {
+                        scan_rvalue_struct_elem(
+                            &rvalue,
+                            dest,
+                            &mut census.elems,
+                            &mut census.other,
+                        );
+                    }
+                    classify_struct_field_write(
+                        &place,
+                        dest,
+                        &mut census.defs,
+                        &mut unused_fields,
+                        &mut census.other,
+                    );
+                }
+                Ok(StmtKind::Assert(assert)) => bump_struct_field_use(
+                    operand_struct_field_use(&assert.cond, dest),
+                    &mut unused_fields,
+                    &mut census.other,
+                ),
+                _ => {}
+            }
+        }
+        match bb.term_ref(llbc) {
+            Ok(TermKind::Switch { discr, .. }) => bump_struct_field_use(
+                operand_struct_field_use(&discr, dest),
+                &mut unused_fields,
+                &mut census.other,
+            ),
+            Ok(TermKind::Call { call, .. }) => {
+                if let CallFunc::Dynamic(op, _) = &call.func {
+                    bump_struct_field_use(
+                        operand_struct_field_use(op, dest),
+                        &mut unused_fields,
+                        &mut census.other,
+                    );
+                }
+                for arg in &call.args {
+                    bump_struct_field_use(
+                        operand_struct_field_use(arg, dest),
+                        &mut unused_fields,
+                        &mut census.other,
+                    );
+                }
+                classify_struct_field_write(
+                    &call.dest,
+                    dest,
+                    &mut census.defs,
+                    &mut unused_fields,
+                    &mut census.other,
+                );
+            }
+            Ok(TermKind::Assert { assert, .. }) => bump_struct_field_use(
+                operand_struct_field_use(&assert.cond, dest),
+                &mut unused_fields,
+                &mut census.other,
+            ),
+            _ => {}
+        }
+    }
+    let _ = unused_fields;
+    census
+}
+
+/// `ptr::add` dest used as a GcArray element: address-of a field or a
+/// reborrow of the dest. The dest and every value-copy of it must have
+/// one definition and no escaping use, and some node in that tree must
+/// be an element use.
+pub(in crate::front::mir) fn add_dest_used_as_struct_elem(
+    llbc: &Llbc,
+    body: &Unstructured,
+    dest: usize,
+) -> bool {
+    let census = struct_elem_census(llbc, body, dest);
+    if !(census.defs == 1 && census.other == 0 && (census.elems >= 1 || !census.copies.is_empty()))
+    {
+        return false;
+    }
+    if !census
+        .copies
+        .iter()
+        .all(|&x| copy_used_as_struct_elem(llbc, body, x, 1))
+    {
+        return false;
+    }
+    census.elems >= 1 || copies_tree_has_elem(llbc, body, &census.copies, 1)
+}
+
+fn copy_used_as_struct_elem(llbc: &Llbc, body: &Unstructured, dest: usize, depth: usize) -> bool {
+    if depth > 8 {
+        return false;
+    }
+    let census = struct_elem_census(llbc, body, dest);
+    census.defs == 1
+        && census.other == 0
+        && census
+            .copies
+            .iter()
+            .all(|&x| copy_used_as_struct_elem(llbc, body, x, depth + 1))
+}
+
+fn copies_tree_has_elem(llbc: &Llbc, body: &Unstructured, copies: &[usize], depth: usize) -> bool {
+    if depth > 8 {
+        return false;
+    }
+    copies.iter().any(|&x| {
+        let census = struct_elem_census(llbc, body, x);
+        census.elems >= 1 || copies_tree_has_elem(llbc, body, &census.copies, depth + 1)
+    })
 }
 
 /// Header recovered from the add's base before any flowspace Variable exists.
@@ -6938,7 +7155,7 @@ pub(in crate::front::mir) fn term_has_struct_field_value_use(term: &TermKind, de
     match term {
         TermKind::Switch { discr, .. } => {
             bump_struct_field_use(
-                operand_struct_field_use(discr, dest),
+                operand_struct_field_use(&discr, dest),
                 &mut fields,
                 &mut other,
             );
@@ -7259,6 +7476,40 @@ pub(in crate::front::mir) fn struct_field_ptr_add_trace(
     {
         return None;
     }
+    Some(StructFieldPtrAdd {
+        header,
+        index_local,
+        array_type_id,
+    })
+}
+
+/// Same header recovery as [`struct_field_ptr_add_trace`], for a dest used
+/// as a GcArray element (address-of a field or a reborrow). Getitem is
+/// emitted at the add, so a later reassignment of header/index is not a
+/// miss for this path; [`Lowering::try_lower_struct_field_ptr_add`] still
+/// declines when those locals are assigned on the successor.
+#[allow(clippy::too_many_arguments)]
+pub(in crate::front::mir) fn struct_elem_ptr_add_trace(
+    reg: &RegularCall,
+    args_len: usize,
+    base_local: Option<usize>,
+    base_ty: Option<&TyRef>,
+    index_local: Option<usize>,
+    dest_local: usize,
+    body: &Unstructured,
+    llbc: &Llbc,
+    tombstoned: &std::collections::HashSet<String>,
+) -> Option<StructFieldPtrAdd> {
+    if args_len != 2 || !regular_call_is_ptr_add(reg, llbc) {
+        return None;
+    }
+    let base_local = base_local?;
+    let index_local = index_local?;
+    let array_type_id = struct_pointee_array_type_id(base_ty?, llbc, tombstoned)?;
+    if !add_dest_used_as_struct_elem(llbc, body, dest_local) {
+        return None;
+    }
+    let header = trace_struct_ptr_add_header(body, llbc, base_local)?;
     Some(StructFieldPtrAdd {
         header,
         index_local,

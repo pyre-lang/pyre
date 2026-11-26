@@ -10982,6 +10982,37 @@ mod tests {
     }
 
     #[test]
+    fn getuniqueclassdef_for_struct_root_interior_index_is_plain_signed() {
+        use crate::front::StructFieldRegistry;
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            "Interior".to_string(),
+            vec![
+                ("ptr".to_string(), "&()".to_string()),
+                ("index".to_string(), "i64".to_string()),
+            ],
+        );
+        bk.set_struct_fields(Rc::new(reg));
+        let cd = bk
+            .getuniqueclassdef_for_struct_root("Interior")
+            .expect("Interior intern's a ClassDef");
+        let s_index = super::super::classdesc::ClassDef::about_attribute(&cd, "index")
+            .expect("Interior.index attr");
+        match &s_index {
+            SomeValue::Integer(i) => {
+                assert!(!i.nonneg, "lltype index is Signed, unproved");
+                assert!(!i.unsigned, "lltype index is Signed");
+            }
+            other => panic!("expected SomeInteger, got {other:?}"),
+        }
+        assert!(
+            super::super::model::union(&s_index, &super::super::model::s_uint()).is_err(),
+            "plain Signed does not unify with r_uint; writers convert first"
+        );
+    }
+
+    #[test]
     fn getuniqueclassdef_for_struct_root_interns_zst_strategy_singleton() {
         use crate::front::StructFieldRegistry;
         let bk = bk();

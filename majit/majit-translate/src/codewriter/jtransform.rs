@@ -1211,6 +1211,25 @@ pub(crate) fn is_same_as_identity_call_path(segments: &[String]) -> bool {
         || crate::front::std_identity::is_manually_drop_new_path(segments)
 }
 
+/// The lloperation name produced when `rewrite_op_direct_call` lowers a
+/// model-call spelling of an rtyper pointer cast.
+///
+/// Spine A's registered graphs retain these host-call spellings until
+/// jtransform.  Consumers that must apply an lloperation property before
+/// jtransform use this same classifier, then consult `LL_OPERATIONS` for the
+/// property itself.
+pub(crate) fn model_call_llop_name(segments: &[String]) -> Option<&'static str> {
+    if is_same_as_identity_call_path(segments) {
+        Some("same_as")
+    } else if is_lltype_cast_path(segments, "cast_ptr_to_int") {
+        Some("cast_ptr_to_int")
+    } else if is_lltype_cast_path(segments, "cast_int_to_ptr") {
+        Some("cast_int_to_ptr")
+    } else {
+        None
+    }
+}
+
 /// Identity-cast markers `rewrite_op_direct_call` folds to `same_as`
 /// (`__cast_pointer`, `__cast_instance_intrinsic`,
 /// `__cast_address_intrinsic`).
@@ -6383,6 +6402,20 @@ impl<'a> Transformer<'a> {
             } if unop_name == "unichr" => {
                 self.rewrite_char_int_cast(op, operand, "cast_int_to_unichar", graph_name, graph)
             }
+            OpKind::InteriorPtrExpose { .. } => panic!(
+                "OpKind::InteriorPtrExpose reached jtransform; the rtyper must lower \
+                 _interior_ptr._expose before codewriter emission (InteriorPtrRepr)"
+            ),
+            OpKind::StoreThroughPtr { .. } => panic!(
+                "OpKind::StoreThroughPtr reached jtransform; the rtyper must lower \
+                 this store-through to setinteriorfield \
+                 (InteriorPtrRepr.rtype_store_through_ptr)"
+            ),
+            OpKind::LoadThroughPtr { .. } => panic!(
+                "OpKind::LoadThroughPtr reached jtransform; the rtyper must lower \
+                 this load-through to getinteriorfield \
+                 (InteriorPtrRepr.rtype_load_through_ptr)"
+            ),
             // `jtransform.py rewrite_op_force_cast`: same-size raw ptr/int
             // is `_int_to_int_cast` returning None (identity).
             OpKind::UnaryOp {
@@ -19888,10 +19921,24 @@ fn remap_op_renamings(
             base: remap_value(base, aliases),
             index: remap_value(index, aliases),
             field: field.clone(),
-            value: remap_value(value, aliases),
+            value: remap_link_arg(value, aliases, constants),
             item_ty: item_ty.clone(),
             array_type_id: array_type_id.clone(),
             array: array.clone(),
+        },
+        OpKind::InteriorPtrExpose { base, field, ty } => OpKind::InteriorPtrExpose {
+            base: remap_value(base, aliases),
+            field: field.clone(),
+            ty: ty.clone(),
+        },
+        OpKind::StoreThroughPtr { ptr, value, raw } => OpKind::StoreThroughPtr {
+            ptr: remap_value(ptr, aliases),
+            value: remap_value(value, aliases),
+            raw: raw.clone(),
+        },
+        OpKind::LoadThroughPtr { ptr, raw } => OpKind::LoadThroughPtr {
+            ptr: remap_value(ptr, aliases),
+            raw: raw.clone(),
         },
         OpKind::Call {
             target,
@@ -22316,7 +22363,7 @@ mod tests {
                     base: base.clone(),
                     index: index.clone(),
                     field: FieldDescriptor::new("f_valid", Some("odictentry".into())),
-                    value: value.clone(),
+                    value: LinkArg::Value(value.clone()),
                     item_ty: ValueType::Int,
                     array_type_id: Some("GcArray<odictentry>".into()),
                     array: Some(concrete.clone()),
@@ -22614,7 +22661,7 @@ mod tests {
     /// GC struct whose first field is another GC struct
     /// (`GcStruct._first_struct`). Downcast (`cast_pointer`) is Identity;
     /// a subsequent field read is `getfield_gc_*` on the same object.
-    /// `jtransform.py rewrite_op_getsubstruct` refuses a GC getsubstruct.
+    /// `jtransform.py rewrite_op_getsubstruct` refuses a GC interior.
     #[test]
     fn gc_first_struct_downcast_field_read_is_same_object() {
         use crate::call::{CallControl, StructFieldLayout, StructLayout};
@@ -22752,7 +22799,7 @@ mod tests {
                 &op.kind,
                 OpKind::BinOp { op, .. } if op == "add"
             )),
-            "downcast + field read must not emit a getsubstruct int_add; ops={ops:?}"
+            "downcast + field read must not emit an interior int_add; ops={ops:?}"
         );
         let w_cls = ops.iter().find(|op| {
             matches!(

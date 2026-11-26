@@ -5481,6 +5481,12 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_interpreter::PyError::from_exc_object",
         crate::error::from_exc_object_method_jit_abi,
     );
+    cpa1!(
+        &mut entries,
+        "pyre_interpreter::error::PyError::key_error_with_key",
+        "pyre_interpreter::PyError::key_error_with_key",
+        crate::error::key_error_with_key_jit_abi,
+    );
     // The same materialisation with the `type_error` constructor folded in, so
     // the raise site carries neither body. The typed local spells the
     // trampoline's signature at the call site; `cpa1` checks the same thing
@@ -10194,6 +10200,16 @@ mod tests {
         assert_eq!(
             bindings["pyre_interpreter::PyError::from_exc_object"],
             from_exc_method
+        );
+        let key_error: extern "C" fn(i64) -> i64 = crate::error::key_error_with_key_jit_abi;
+        let key_error = key_error as *const () as usize as i64;
+        assert_eq!(
+            bindings["pyre_interpreter::error::PyError::key_error_with_key"],
+            key_error
+        );
+        assert_eq!(
+            bindings["pyre_interpreter::PyError::key_error_with_key"],
+            key_error
         );
 
         let fused: extern "C" fn(i64) -> i64 =

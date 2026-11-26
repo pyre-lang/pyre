@@ -13798,6 +13798,160 @@ mod tests {
         assert_eq!(key_field.index_in_parent(), 0);
     }
 
+    /// `BhDescr::from_field_descr` stores `FieldDescr.field_key()` as
+    /// `BhDescr::Field.name` with an empty owner. Ordinary ARRAY.OF
+    /// interiors use a bare key (`f_hash`); a `repr(transparent)`
+    /// one-field leaf uses the dotted leaf the codewriter published
+    /// (`descr.py get_interiorfield_descr` `(ARRAY, name, arrayfieldname)`).
+    /// The restore cache key must equal that member name, including when
+    /// the leaf itself contains a dot.
+    #[test]
+    fn dotted_interior_field_name_round_trips_the_codewriter_member() {
+        use majit_ir::descr::{LLType, gc_cache};
+        use majit_ir::effectinfo::DescrSetMember;
+        use majit_jitcode::jitcode::{BhDescr, BhFieldSpec, BhInteriorFieldSpec, BhSizeSpec};
+
+        let restore_array_id = majit_ir::descr::path_hash(
+            "pyre_jit_trace::descr::tests::dotted_interior::restore::GcArray",
+        );
+        let listed_array_id = majit_ir::descr::path_hash(
+            "pyre_jit_trace::descr::tests::dotted_interior::listed::GcArray",
+        );
+        let owner_id =
+            majit_ir::descr::path_hash("pyre_jit_trace::descr::tests::dotted_interior::Entry");
+        assert_ne!(restore_array_id, 0);
+        assert_ne!(listed_array_id, 0);
+        assert_ne!(owner_id, 0);
+
+        let array = |array_id, interior_fields| BhDescr::Array {
+            base_size: 8,
+            itemsize: 32,
+            len_offset: Some(0),
+            type_id: array_id,
+            gc_type_id: 0,
+            item_type: Type::Ref,
+            is_array_of_pointers: false,
+            is_array_of_structs: true,
+            is_item_signed: false,
+            is_gc_managed: true,
+            ei_index: u32::MAX,
+            array_type_id: None,
+            interior_fields,
+            load_is_acquire: false,
+        };
+        let field = |name: &str, owner: &str| BhDescr::Field {
+            offset: 0,
+            field_size: 8,
+            field_type: Type::Ref,
+            field_flag: majit_ir::descr::ArrayFlag::Pointer,
+            is_field_signed: false,
+            is_immutable: false,
+            is_quasi_immutable: false,
+            index_in_parent: Some(0),
+            parent: None,
+            name: name.into(),
+            owner: owner.into(),
+            load_is_acquire: false,
+            store_is_release: false,
+        };
+
+        // Production restore: empty `interior_fields` (the array descr
+        // did not carry `all_interiorfielddescrs`) and `from_field_descr`
+        // spelling of the inner field.
+        let _restore = make_descr_from_bh(&BhDescr::InteriorField {
+            array: Box::new(array(restore_array_id, Vec::new())),
+            field: Box::new(field("key.__pos_0", "")),
+        });
+
+        let dotted = BhFieldSpec {
+            index: 0,
+            field_key: "key.__pos_0".into(),
+            name: "Entry.key.__pos_0".into(),
+            offset: 0,
+            field_size: 8,
+            field_type: Type::Ref,
+            field_flag: majit_ir::descr::ArrayFlag::Pointer,
+            is_field_signed: false,
+            is_immutable: false,
+            is_quasi_immutable: false,
+            index_in_parent: 0,
+            is_class_word: None,
+            load_is_acquire: false,
+            store_is_release: false,
+        };
+        let hash = BhFieldSpec {
+            index: 1,
+            field_key: "f_hash".into(),
+            name: "Entry.f_hash".into(),
+            offset: 8,
+            field_size: 8,
+            field_type: Type::Int,
+            field_flag: majit_ir::descr::ArrayFlag::Unsigned,
+            is_field_signed: false,
+            is_immutable: false,
+            is_quasi_immutable: false,
+            index_in_parent: 1,
+            is_class_word: None,
+            load_is_acquire: false,
+            store_is_release: false,
+        };
+        let owner = BhSizeSpec {
+            owner: "Entry".into(),
+            size: 32,
+            type_id: owner_id,
+            vtable: 0,
+            is_gc_managed: true,
+            is_immutable: false,
+            headerless: false,
+            all_fielddescrs: vec![dotted.clone(), hash.clone()],
+        };
+        let listed = |field: BhFieldSpec| BhInteriorFieldSpec {
+            index: field.index,
+            field,
+            owner: owner.clone(),
+        };
+        // Found-in-owner-list path: display name still has `STRUCT.` and
+        // the leaf itself is dotted. Ordinary `f_hash` stays a bare key.
+        let _listed = make_descr_from_bh(&BhDescr::InteriorField {
+            array: Box::new(array(listed_array_id, vec![listed(dotted), listed(hash)])),
+            field: Box::new(field("Entry.f_hash", "Entry")),
+        });
+
+        let stamp = |array_id, name: &str, ei_index: u32| {
+            super::stamp_effect_info_descr(
+                &DescrSetMember::InteriorField {
+                    array_id,
+                    name: name.to_string(),
+                },
+                ei_index,
+            );
+        };
+        stamp(restore_array_id, "key.__pos_0", 31);
+        stamp(listed_array_id, "key.__pos_0", 32);
+        stamp(listed_array_id, "f_hash", 33);
+
+        let gc = gc_cache().lock();
+        let stored = |array_id, name: &str| {
+            gc._cache_interiorfield
+                .get(&(LLType::Array(array_id), name.to_string(), String::new()))
+                .unwrap_or_else(|| panic!("{name} interior slot missing"))
+                .clone()
+        };
+        assert_eq!(stored(restore_array_id, "key.__pos_0").get_ei_index(), 31);
+        assert_eq!(stored(listed_array_id, "key.__pos_0").get_ei_index(), 32);
+        assert_eq!(stored(listed_array_id, "f_hash").get_ei_index(), 33);
+        assert!(
+            gc._cache_interiorfield
+                .get(&(
+                    LLType::Array(restore_array_id),
+                    "__pos_0".to_string(),
+                    String::new()
+                ))
+                .is_none(),
+            "dot-split must not cache the dotted leaf under its last segment"
+        );
+    }
+
     #[test]
     fn make_descr_from_bh_items_block_capacity_with_parent_is_canonical() {
         use majit_ir::descr::ArrayFlag;
@@ -17825,14 +17979,17 @@ pub fn make_struct_array_descr_full_keyed(
                     })
                     .unwrap_or(field.index_in_parent);
                 if let Some(field_descr) = owner_group.field_descrs.get(field_pos) {
-                    // Bare interior field name (`spec.name`) is the cache
-                    // key per `descr.py cache[STRUCT][fieldname]` shape.
-                    let bare_name = field
-                        .name
-                        .rsplit_once('.')
-                        .map(|(_, name)| name.to_string())
-                        .unwrap_or_else(|| field.name.clone());
-                    (field_descr.clone(), bare_name)
+                    // `descr.py get_interiorfield_descr` keys
+                    // `(ARRAY, name, arrayfieldname)` on the field name
+                    // `get_field_descr` used as `cache[STRUCT][fieldname]`.
+                    // That is `BhFieldSpec::field_key`; strip a `STRUCT.`
+                    // owner prefix when the spec still carries one
+                    // (`bh_field_cache_key`). A `repr(transparent)` leaf
+                    // keeps its dotted `field.leaf` key, same as a bare
+                    // `f_hash`.
+                    let cache_name =
+                        bh_field_cache_key(&interior.owner.owner, field.field_key()).to_string();
+                    (field_descr.clone(), cache_name)
                 } else {
                     (
                         field_descr_from_unlisted_interior_spec(field),
@@ -19085,7 +19242,7 @@ pub fn make_descr_from_bh(bh: &majit_jitcode::jitcode::BhDescr) -> DescrRef {
             if ei_index != u32::MAX {
                 array_descr.set_ei_index(ei_index);
             }
-            let (offset, field_size, field_type, field_flag, index_in_parent, name) =
+            let (offset, field_size, field_type, field_flag, index_in_parent, name, owner) =
                 match field.as_ref() {
                     BhDescr::Field {
                         offset,
@@ -19094,6 +19251,7 @@ pub fn make_descr_from_bh(bh: &majit_jitcode::jitcode::BhDescr) -> DescrRef {
                         field_flag,
                         index_in_parent,
                         name,
+                        owner,
                         ..
                     } => (
                         *offset,
@@ -19102,18 +19260,21 @@ pub fn make_descr_from_bh(bh: &majit_jitcode::jitcode::BhDescr) -> DescrRef {
                         *field_flag,
                         *index_in_parent,
                         name.clone(),
+                        owner.clone(),
                     ),
                     other => panic!(
                         "BhDescr::InteriorField field slot must be BhDescr::Field, got {other:?}"
                     ),
                 };
-            // Bare interior field name (`descr.py cache[STRUCT][fieldname]`
-            // shape) — the `get_interiorfield_descr` cache key the
-            // `make_struct_array_descr_full_keyed` interior loop used.
-            let bare_name = name
-                .rsplit_once('.')
-                .map(|(_, n)| n.to_string())
-                .unwrap_or_else(|| name.clone());
+            // `descr.py get_interiorfield_descr` keys `(ARRAY, name,
+            // arrayfieldname)` on the requested field name.
+            // `BhDescr::from_field_descr` stores `FieldDescr.field_key()`
+            // as `BhDescr::Field.name` with an empty owner; assembler
+            // Field rows may still carry `owner` plus a `STRUCT.field`
+            // display name. Strip exactly that owner prefix
+            // (`bh_field_cache_key`) so a dotted leaf `key.__pos_0` and
+            // a bare `f_hash` both match the codewriter member.
+            let cache_name = bh_field_cache_key(&owner, &name).to_string();
             // `descr.py` `InteriorFieldDescr.get_index()` delegates to
             // `fielddescr.get_index()` (= `index_in_parent`), read back by
             // `info.py` getinteriorfield/setinteriorfield_virtual.
@@ -19144,7 +19305,7 @@ pub fn make_descr_from_bh(bh: &majit_jitcode::jitcode::BhDescr) -> DescrRef {
             if type_id != 0 {
                 majit_ir::descr::gc_cache().lock().get_interiorfield_descr(
                     majit_ir::descr::LLType::Array(type_id),
-                    bare_name,
+                    cache_name,
                     String::new(),
                     array_descr,
                     field_descr,

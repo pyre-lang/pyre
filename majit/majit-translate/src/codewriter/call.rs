@@ -7822,7 +7822,40 @@ impl CallControl {
         Some((descr as majit_ir::descr::DescrRef, member))
     }
 
-    /// Offset of `field` in the registered layout of `owner`, when one is.
+    /// `field.<leaf>` when `field` of `owner` is a `#[repr(transparent)]`
+    /// one-field struct whose unique leaf is a non-`Void` scalar or pointer.
+    /// That wrapper's layout is its field's (`TypeDecl::is_repr_transparent`).
+    /// `None` when the nested struct has no layout, is not
+    /// `repr(transparent)`, or has any other shape. `heaptracker.py
+    /// all_interiorfielddescrs` raises `UnsupportedFieldExc` for every
+    /// `array(struct(struct))`; this dotted path is a Rust layout
+    /// adaptation for the transparent wrapper, not that walk.
+    fn single_leaf_path(&self, owner: &str, field: &str) -> Option<String> {
+        let row = self
+            .struct_field_entries(owner)?
+            .iter()
+            .find(|row| row.name == field)?;
+        if !self.is_known_struct(&row.ty) {
+            return None;
+        }
+        if !self
+            .struct_layout_for(&row.ty)
+            .is_some_and(|layout| layout.repr_transparent)
+        {
+            return None;
+        }
+        let entries = self.struct_field_entries(&row.ty)?;
+        if entries.len() != 1 {
+            return None;
+        }
+        let leaf = &entries[0];
+        let (_, ir_type, _) = get_type_flag(&leaf.ty, &self.raw_alloc_flavor_structs);
+        if ir_type == majit_ir::value::Type::Void || self.is_known_struct(&leaf.ty) {
+            return None;
+        }
+        Some(format!("{field}.{}", leaf.name))
+    }
+
     fn layout_field_offset(
         &self,
         sid: Option<majit_ir::descr::StructId>,
@@ -8002,19 +8035,28 @@ impl CallControl {
         // An interned pointer-item ARRAY sharing a dump STRUCT spelling
         // must not reuse that intern id (`descr.py` `isinstance(ARRAY.OF,
         // lltype.Struct)`).
+        let cache_field = interned_of_struct
+            .as_deref()
+            .and_then(|owner| {
+                let owner = self
+                    .array_of_field_owner(owner)
+                    .unwrap_or_else(|| owner.to_string());
+                self.single_leaf_path(&owner, field_name)
+            })
+            .unwrap_or_else(|| field_name.to_string());
         if interned_of_struct.is_some()
             && let Some(id) = intern_id
             && let Some(cached) = self
                 .interiorfield_descrs
                 .borrow()
-                .get(&(id, field_name.to_string()))
+                .get(&(id, cache_field.clone()))
                 .cloned()
         {
             cached.set_index(idx);
             let atid = array_type_id_of_lltype(&self.interned_array(id));
             let member = majit_ir::effectinfo::DescrSetMember::InteriorField {
                 array_id: majit_ir::descr::path_hash(&atid),
-                name: field_name.to_string(),
+                name: cache_field,
             };
             return Some((cached, member));
         }
@@ -8045,6 +8087,15 @@ impl CallControl {
             return None;
         }
         let elem_name = self.array_of_field_owner(&elem_name).unwrap_or(elem_name);
+        // A `#[repr(transparent)]` one-field struct stored by value in
+        // ARRAY.OF has that field's layout, so its interior descr is the
+        // dotted leaf `single_leaf_path` names. This is a Rust layout
+        // adaptation. `heaptracker.py all_interiorfielddescrs` raises
+        // `UnsupportedFieldExc("unexpected array(struct(struct))")` for
+        // every nested struct, including a one-field wrapper that is not
+        // `repr(transparent)`.
+        let single_leaf = self.single_leaf_path(&elem_name, field_name);
+        let field_name: &str = single_leaf.as_deref().unwrap_or(field_name);
         // PyPy `descr.py fielddescr = get_field_descr(gc_ll_descr,
         // REALARRAY.OF, name)` — the inner FieldDescr.index is the
         // stable per-parent slot from `heaptracker.get_fielddescr_index_in()`
@@ -8076,31 +8127,50 @@ impl CallControl {
             if fname == "typeptr" {
                 continue;
             }
-            // heaptracker.py:108-110: step past a by-value nested struct
-            // field's bytes; `get_fielddescr_index_in` recurses into it for
-            // the position.  Mirrors the `fielddescrof_concrete` walk; the
-            // corpus's array-element structs carry no by-value nested struct
-            // field, so this never fires there.
-            if self.is_known_struct(fty) {
-                offset = offset.saturating_add(compute_struct_size(self, fty));
-                continue;
-            }
-            if fname == field_name {
+            // Only a `#[repr(transparent)]` one-field leaf named by
+            // `single_leaf_path` resolves through a nested struct; any
+            // other nested struct field is skipped
+            // (`heaptracker.py all_interiorfielddescrs`
+            // `UnsupportedFieldExc`).
+            let nested_leaf = if self.is_known_struct(fty) {
+                let leaf = if single_leaf.is_some() {
+                    field_name
+                        .strip_prefix(fname.as_str())
+                        .and_then(|rest| rest.strip_prefix('.'))
+                        .and_then(|tail| self.nested_struct_leaf(fty, tail))
+                } else {
+                    None
+                };
+                if leaf.is_none() {
+                    offset = offset.saturating_add(compute_struct_size(self, fty));
+                    continue;
+                }
+                leaf
+            } else {
+                None
+            };
+            if nested_leaf.is_some() || fname == field_name {
                 // `all_interiorfielddescrs` takes the offset from the
                 // registered layout (`symbolic.get_field_token`). The running
                 // total above does not insert `repr(C)` padding, so a `bool`
                 // before a pointer is one byte early. Prefer the layout field
                 // when it is present.
-                let (offset, field_size, flag, ir_type) = self
-                    .struct_layout_for(&elem_name)
-                    .and_then(|layout| {
+                let layout_field = |name: &str| {
+                    self.struct_layout_for(&elem_name).and_then(|layout| {
                         layout
                             .fields
                             .iter()
-                            .find(|f| f.name == field_name)
+                            .find(|f| f.name == name)
                             .map(|fl| (fl.offset, fl.size, fl.flag, fl.field_type))
                     })
-                    .unwrap_or((offset, field_size, flag, ir_type));
+                };
+                let (offset, field_size, flag, ir_type) = match nested_leaf {
+                    Some((flag, ir_type, field_size, inner)) => {
+                        let at = layout_field(fname).map_or(offset, |(at, ..)| at);
+                        (at.saturating_add(inner), field_size, flag, ir_type)
+                    }
+                    None => layout_field(field_name).unwrap_or((offset, field_size, flag, ir_type)),
+                };
                 // Use-import resolver: hash the canonical
                 // `defining_module::Bare` form so analyzer hits the
                 // same `_cache_size` slot the runtime's qualified
@@ -11586,6 +11656,20 @@ impl CallControl {
         declared_result_type("<indirect>", "<family>", graphs.to_vec(), |path| {
             self.function_graphs.get(path)
         })
+    }
+}
+
+impl crate::model::ModelGraphLookup for CallControl {
+    fn direct_graph(
+        &self,
+        target: &CallTarget,
+    ) -> Option<std::rc::Rc<crate::model::FunctionGraph>> {
+        self.target_to_path_and_graph(target)
+            .map(|(_path, graph)| graph)
+    }
+
+    fn indirect_graph(&self, path: &CallPath) -> Option<std::rc::Rc<crate::model::FunctionGraph>> {
+        self.function_graphs.get(path)
     }
 }
 
@@ -17613,7 +17697,11 @@ fn op_can_raise(op: &OpKind, cc: &CallControl) -> RaiseClass {
     //   anything else truthy -> Yes
     match op {
         // RPython LL: getfield_gc, setfield_gc → cannot raise
-        OpKind::FieldRead { .. } | OpKind::FieldWrite { .. } => RaiseClass::No,
+        OpKind::FieldRead { .. }
+        | OpKind::FieldWrite { .. }
+        | OpKind::InteriorPtrExpose { .. }
+        | OpKind::StoreThroughPtr { .. }
+        | OpKind::LoadThroughPtr { .. } => RaiseClass::No,
         // `malloc` / `malloc_varsize` can only raise MemoryError; with
         // `ignore_memoryerror` it is treated as non-raising
         // (canraise = (MemoryError,)).  `new_array_clear` is the cleared
@@ -19366,7 +19454,7 @@ fn effect_transduce_op(
             let index = effect_materialize(out, block, &op.args[1]);
             let field_name = effect_field_name(&op.args[2]);
             let owner_root = effect_interior_owner(&base);
-            let value = effect_materialize(out, block, &op.args[3]);
+            let value = effect_linkarg(&op.args[3]);
             let item_ty = effect_interior_field_lltype(&base, &field_name)
                 .and_then(|lltype| effect_value_type_from_lltype(&lltype))
                 .unwrap_or_else(|| match &op.args[3] {
@@ -21066,6 +21154,113 @@ mod tests {
             .interiorfielddescrof_with_array(1, &spelling, &Some(float), "v")
             .expect("float interiorfield");
         assert!(!std::sync::Arc::ptr_eq(&d_signed, &d_float));
+    }
+
+    #[test]
+    fn interiorfielddescr_collapses_only_one_field_newtype() {
+        let ident_sid = majit_ir::descr::StructId::from_canonical("IdentityKey");
+        let opaque_sid = majit_ir::descr::StructId::from_canonical("OpaqueKey");
+        let _registry = crate::test_support::register_struct_ids_serialized(HashMap::from([
+            ("IdentityKey".to_string(), Some(ident_sid)),
+            ("OpaqueKey".to_string(), Some(opaque_sid)),
+        ]));
+        let mut cc = CallControl::new();
+        cc.set_known_struct_names(
+            [
+                "EntryTwo",
+                "EntryOne",
+                "EntryOpaque",
+                "TwoRowKey",
+                "IdentityKey",
+                "OpaqueKey",
+            ]
+            .into_iter()
+            .map(String::from)
+            .collect(),
+        );
+        let mut registry = crate::front::StructFieldRegistry::default();
+        registry.fields.insert(
+            "EntryTwo".to_string(),
+            vec![("key".to_string(), "TwoRowKey".to_string())],
+        );
+        registry.fields.insert(
+            "EntryOne".to_string(),
+            vec![("key".to_string(), "IdentityKey".to_string())],
+        );
+        registry.fields.insert(
+            "EntryOpaque".to_string(),
+            vec![("key".to_string(), "OpaqueKey".to_string())],
+        );
+        registry.fields.insert(
+            "TwoRowKey".to_string(),
+            vec![
+                ("a".to_string(), "i64".to_string()),
+                ("b".to_string(), "i64".to_string()),
+            ],
+        );
+        registry.fields.insert(
+            "IdentityKey".to_string(),
+            vec![("inner".to_string(), "*mut PyObject".to_string())],
+        );
+        registry.fields.insert(
+            "OpaqueKey".to_string(),
+            vec![("inner".to_string(), "*mut PyObject".to_string())],
+        );
+        cc.set_struct_fields(registry);
+        let empty_known = HashSet::new();
+        let empty_sizes = HashMap::new();
+        let empty_aligns = HashMap::new();
+        let empty_ranks = HashMap::new();
+        let empty_raw = HashSet::new();
+        let mut ident_layout = StructLayout::from_type_strings(
+            &[("inner".into(), "*mut PyObject".into())],
+            &empty_known,
+            &empty_sizes,
+            &empty_aligns,
+            &empty_ranks,
+            &empty_raw,
+        );
+        ident_layout.repr_transparent = true;
+        cc.set_struct_layout(ident_sid, ident_layout);
+        cc.set_struct_layout(
+            opaque_sid,
+            StructLayout::from_type_strings(
+                &[("inner".into(), "*mut PyObject".into())],
+                &empty_known,
+                &empty_sizes,
+                &empty_aligns,
+                &empty_ranks,
+                &empty_raw,
+            ),
+        );
+        assert_eq!(cc.single_leaf_path("EntryTwo", "key"), None);
+        assert_eq!(
+            cc.single_leaf_path("EntryOne", "key"),
+            Some("key.inner".to_string())
+        );
+        assert_eq!(cc.single_leaf_path("EntryOpaque", "key"), None);
+        let opaque_arr = {
+            use crate::translator::rtyper::lltypesystem::lltype::{Array, LowLevelType, Struct};
+            Array::gc(LowLevelType::Struct(Box::new(Struct::new(
+                "EntryOpaque",
+                vec![(
+                    "key".into(),
+                    LowLevelType::Struct(Box::new(Struct::new(
+                        "OpaqueKey",
+                        vec![("inner".into(), LowLevelType::Address)],
+                    ))),
+                )],
+            ))))
+        };
+        assert!(
+            cc.interiorfielddescrof_keyed(
+                1,
+                &Some("GcArray<EntryOpaque>".into()),
+                &Some(opaque_arr),
+                "key"
+            )
+            .is_none()
+        );
     }
 
     /// Harvest stores `[module::Item; N]`. ARRAY.OF is that TypeDecl path,
@@ -35337,8 +35532,8 @@ mod tests {
     }
 
     /// `writeanalyze.py WriteAnalyzer.analyze_simple_operation`:
-    /// `setinteriorfield` is an interior write; Constant values are
-    /// materialised into a Variable.
+    /// `setinteriorfield` is an interior write; Constant values stay
+    /// `LinkArg::Const` like `setfield`.
     #[test]
     fn effect_graph_setinteriorfield_is_interior_field_write() {
         use crate::translator::rtyper::lltypesystem::lltype::{Array, LowLevelType, Ptr, Struct};
@@ -36675,7 +36870,7 @@ mod tests {
                 base,
                 index,
                 field: crate::model::FieldDescriptor::new("v", Some("x".into())),
-                value,
+                value: LinkArg::Value(value),
                 item_ty: ValueType::Int,
                 array_type_id: Some(array_type_id_of_lltype(&array)),
                 array: Some(array),
