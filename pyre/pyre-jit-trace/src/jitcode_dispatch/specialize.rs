@@ -19319,18 +19319,6 @@ pub(crate) fn try_walker_lower_exc_info_residual<Sym: WalkSym>(
         &[ec, store_op],
         crate::descr::ec_sys_exc_value_descr(),
     );
-    // The `None` check's guard numbers its resume data, and recording can grow
-    // the trace pool; both allocate and can collect.  `exc_concrete` is a copy
-    // taken before them, so read the stored value off the operand register
-    // again, as `pyjitpl.py` reads a box's `getref_base` at its use.
-    let store_concrete = if store_concrete.is_null() {
-        store_concrete
-    } else {
-        match read_ref_var_list_concrete(code, op, 1, ctx).first() {
-            Some(ConcreteValue::Ref(p)) => *p,
-            other => unreachable!("exc_info operand register changed kind: {other:?}"),
-        }
-    };
     // The walk is authoritative: apply the concrete store the residual
     // executor would have performed, so the live EC tracks the symbolic
     // SETFIELD in lock-step (a following `get_current_exception` /
