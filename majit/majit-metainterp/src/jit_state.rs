@@ -2,6 +2,7 @@
 //! (RPython uses concrete MetaInterp class in pyjitpl.py).
 
 use majit_ir::{GcRef, OpRef, Type, Value};
+use std::rc::Rc;
 
 use crate::blackhole::ExceptionState;
 use crate::jitdriver::JitDriverStaticData;
@@ -110,12 +111,12 @@ impl DeoptMaterializationCache {
 pub struct ResumeDataResult {
     /// resume.py:1057: per-frame decoded values from rd_numb.
     /// Each RebuiltValue::Box(i, kind) → `liveboxes[i]` in RPython.
-    pub frames: Vec<majit_ir::resumedata::RebuiltFrame>,
+    pub frames: Rc<[majit_ir::resumedata::RebuiltFrame]>,
     /// `rebuild_from_resumedata` virtualizable boxes (decoded from the vable
     /// section). Each `RebuiltValue` is a box (`Box` / `Const` / `Virtual`).
-    pub virtualizable_boxes: Vec<majit_ir::resumedata::RebuiltValue>,
+    pub virtualizable_boxes: Rc<[majit_ir::resumedata::RebuiltValue]>,
     /// resume.py:1045: virtualref box pairs (decoded from vref section).
-    pub virtualref_values: Vec<majit_ir::resumedata::RebuiltValue>,
+    pub virtualref_values: Rc<[majit_ir::resumedata::RebuiltValue]>,
     /// compile.py `ResumeGuardDescr` storage handle — the shared
     /// `Arc<ResumeStorage>` owned by the guard whose rd_numb we just
     /// decoded. Virtual materialization (resume.py:1251
@@ -140,7 +141,7 @@ pub struct ResumeDataResult {
     /// `materialize_bridge_virtual::decode_fieldnum` indexes into this
     /// vector so the recovered TAGBOX OpRef matches the typed variant
     /// the optimizer / heap-cache later see.
-    pub fail_arg_types: Vec<Type>,
+    pub fail_arg_types: Rc<[Type]>,
 }
 
 /// resume.py `decode_box(num, kind)` parity for a generic

@@ -20,6 +20,10 @@ use crate::{TraceAction, TraceCtx};
 /// Residual-call argument lists. Eight slots cover the common helper arity
 /// (`MAX_HOST_CALL_ARITY` is 16); longer calls spill once.
 const CALL_INLINE: usize = 8;
+#[cfg(test)]
+const OPTRACE_PROBE_JITCODE: &str = "optrace_probe_jump_int_add";
+#[cfg(test)]
+static OPTRACE_SLOW_STEPS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 type CallOpRefs = SmallVec<[OpRef; CALL_INLINE]>;
 type CallI64s = SmallVec<[i64; CALL_INLINE]>;
 type CallTypes = SmallVec<[Type; CALL_INLINE]>;
@@ -2959,6 +2963,7 @@ where
         _sub_jitcodes: &[Arc<JitCode>],
         _fn_ptrs: &[JitCallTarget],
     ) -> Self {
+        crate::init_optrace_from_env();
         Self {
             frames,
             last_exception_box: None,
@@ -3394,11 +3399,10 @@ where
     ///  - same-box (pyjitpl.py `if <not float> and b1 is b2`): `x <cmp> x`
     ///    is statically determined (FASTPATHS_SAME_BOXES), so neither the
     ///    compare nor a guard is recorded; gated off for float opcodes.
-    ///  - both-constant: `self.execute(<CMP>, b1, b2)` folds to a `Const` via
-    ///    `execute_and_record` when `_all_constants(b1, b2)` (pyjitpl.py)
-    ///    so nothing is recorded, and `opimpl_goto_if_not` then sees a `Const`
-    ///    condbox so `generate_guard` records no guard either (pyjitpl.py,
-    ///    2583).
+    ///  - both-constant: `taken` is already `eval_binop_i` of the concrete
+    ///    bits. Same skip as the same-box arm — `execute` would return a
+    ///    Const and `generate_guard` records nothing
+    ///    (`pyjitpl.py` `opimpl_goto_if_not_<cmp>` / `MetaInterp.generate_guard`).
     ///
     /// Only a non-constant, non-same-box operand pair materialises the
     /// compare + guard. The branch is followed identically in all cases
@@ -3444,7 +3448,9 @@ where
                 | OpCode::FloatGe
         );
         let same_box = !is_float && lhs.same_box(rhs);
-        if !same_box {
+        // Both-constant is the same skip as same-box: `taken` already holds
+        // the compare, and `generate_guard` would record nothing on a Const.
+        if !same_box && !(lhs.is_constant() && rhs.is_constant()) {
             let cond = ctx.execute_and_record(
                 Some(self.cpu.as_ref()),
                 opcode,
@@ -4279,8 +4285,9 @@ where
                         }
                         majit_jitcode::jitcode::read_label_at(code, pc + 1)
                     };
+                    // `pyjitpl.py` `MIFrame.run_one_step` `op_goto`: set pc
+                    // and continue. No debug tracer. LIVE already skips.
                     frame.code_cursor = target;
-                    self.optrace_step();
                     continue;
                 }
                 _ => {}
@@ -4297,22 +4304,37 @@ where
     }
 
     /// Print the current opcode when `optrace_enabled`. Never aborts the walk.
+    #[inline(always)]
     fn optrace_step(&mut self) {
         if crate::optrace_enabled() {
-            let fr = self.frames.current_mut();
-            let cur = fr.code_cursor;
-            let anchor_pc = fr.pc;
-            let opcode = fr.jitcode.code.get(cur).copied().unwrap_or(0xff);
-            let name = fr.jitcode.name.clone();
-            eprintln!(
-                "[optrace] depth={} cursor={} pc={} opcode={} jitcode={}",
-                self.frames.len(),
-                cur,
-                anchor_pc,
-                opcode,
-                name
-            );
+            self.optrace_step_slow();
         }
+    }
+
+    #[inline(never)]
+    fn optrace_step_slow(&mut self) {
+        #[cfg(test)]
+        if self
+            .frames
+            .frames
+            .last()
+            .is_some_and(|fr| fr.jitcode.name() == OPTRACE_PROBE_JITCODE)
+        {
+            OPTRACE_SLOW_STEPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        let fr = self.frames.current_mut();
+        let cur = fr.code_cursor;
+        let anchor_pc = fr.pc;
+        let opcode = fr.jitcode.code.get(cur).copied().unwrap_or(0xff);
+        let name = fr.jitcode.name.clone();
+        eprintln!(
+            "[optrace] depth={} cursor={} pc={} opcode={} jitcode={}",
+            self.frames.len(),
+            cur,
+            anchor_pc,
+            opcode,
+            name
+        );
     }
 
     /// One instruction of [`Self::run_one_step`]'s loop: pop a finished frame,
@@ -7396,6 +7418,72 @@ mod tests {
         stack: &mut MIFrameStack,
     ) -> JitCodeMachine<'_, DummySym, ClosureRuntime<fn(usize) -> usize>> {
         JitCodeMachine::with_framestack(stack, &[], &[])
+    }
+
+    fn walk_jump_then_int_add() {
+        let mut builder = JitCodeBuilder::new();
+        builder.set_name(super::OPTRACE_PROBE_JITCODE);
+        let add = builder.new_label();
+        builder.jump(add);
+        builder.mark_label(add);
+        builder.record_binop_i(2, OpCode::IntAdd, 0, 1);
+        builder.void_return();
+        let jitcode = Arc::new(builder.finish());
+
+        let mut ctx = TraceCtx::for_test_types(&[Type::Int, Type::Int, Type::Int]);
+        let mut standalone = StandaloneFrameStack::new();
+        let mut frame = standalone
+            .frames
+            .take_frame(jitcode, 0, None, Some(&mut ctx));
+        frame.setup_call(&[
+            (JitArgKind::Int, OpRef::input_arg_int(0), 1),
+            (JitArgKind::Int, OpRef::input_arg_int(1), 2),
+        ]);
+        ctx.stamp_argboxes(&[
+            (JitArgKind::Int, OpRef::input_arg_int(0), 1),
+            (JitArgKind::Int, OpRef::input_arg_int(1), 2),
+        ]);
+        standalone.frames.push(frame);
+
+        let runtime = ClosureRuntime::new(|_pc: usize| 0usize);
+        let mut sym = DummySym;
+        let mut machine = JitCodeMachine::with_framestack(&mut standalone.frames, &[], &[]);
+        let _ = machine.run_to_end(&mut ctx, &mut sym, &runtime);
+    }
+
+    /// `MIFrame.run_one_step` `op_goto` continues with no debug tracer.
+    /// LIVE already skips; the disabled path is a Relaxed load and JUMP
+    /// does not enter `optrace_step_slow`.
+    #[test]
+    fn optrace_disabled_skips_jump_and_the_slow_path() {
+        super::OPTRACE_SLOW_STEPS.store(0, std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            !crate::optrace_enabled(),
+            "MAJIT_OPTRACE is unset in this process"
+        );
+        walk_jump_then_int_add();
+        assert_eq!(
+            super::OPTRACE_SLOW_STEPS.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "disabled walk must not enter optrace_step_slow"
+        );
+
+        let prev = crate::optrace_enabled();
+        struct Restore(bool);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                crate::set_optrace_enabled_for_test(self.0);
+            }
+        }
+        let _restore = Restore(prev);
+        crate::set_optrace_enabled_for_test(true);
+        super::OPTRACE_SLOW_STEPS.store(0, std::sync::atomic::Ordering::Relaxed);
+        walk_jump_then_int_add();
+        assert_eq!(
+            super::OPTRACE_SLOW_STEPS.load(std::sync::atomic::Ordering::Relaxed),
+            2,
+            "enabled walk prints INT_ADD and VOID_RETURN; JUMP is skipped"
+        );
     }
 
     /// Abort / too-long / Continue before the first merge point still have
@@ -10568,6 +10656,81 @@ mod tests {
                 .iter()
                 .any(|op| op.opcode == OpCode::GuardFalse),
             "non-constant false branch must guard on the comparison",
+        );
+    }
+
+    /// Both registers `OpRef::ConstInt`: the fused compare records nothing
+    /// (`num_ops` / `RECORDED_OPS` stay put) and the cursor follows `taken`.
+    /// One non-const operand still records `IntLt` + `GuardTrue`/`GuardFalse`.
+    #[test]
+    fn fused_goto_if_not_int_lt_both_constint_records_nothing_and_follows_taken() {
+        let trace_both_const = |lhs: i64, rhs: i64| {
+            let mut builder = JitCodeBuilder::new();
+            let target = builder.new_label();
+            builder.load_const_i_value(0, lhs);
+            builder.load_const_i_value(1, rhs);
+            builder.goto_if_not_int_lt(0, 1, target);
+            builder.int_return(0);
+            builder.mark_label(target);
+            builder.int_return(1);
+            let jitcode = builder.finish();
+
+            let mut ctx = TraceCtx::for_test(0);
+            let before_ops = ctx.num_ops();
+            let before_recorded = ctx.profiler().get_counter(crate::counters::RECORDED_OPS);
+            let mut sym = DummySym;
+            let action = trace_jitcode(&mut ctx, &mut sym, &jitcode, 0, |_pc| 0);
+            assert_eq!(ctx.num_ops(), before_ops);
+            assert_eq!(
+                ctx.profiler().get_counter(crate::counters::RECORDED_OPS),
+                before_recorded,
+            );
+            match action {
+                TraceAction::Finish { finish_args, .. } => finish_args,
+                other => panic!("expected Finish after fused ConstInt compare, got {other:?}"),
+            }
+        };
+
+        // 5 < 3 is false → `!taken` jumps to the target return of rhs.
+        assert_eq!(trace_both_const(5, 3), vec![OpRef::ConstInt(3)]);
+        // 1 < 3 is true → fall through to the return of lhs.
+        assert_eq!(trace_both_const(1, 3), vec![OpRef::ConstInt(1)]);
+
+        let trace_one_nonconst = |lhs: i64| {
+            let mut asm = majit_jitcode::codewriter::assembler::Assembler::new();
+            let mut builder = JitCodeBuilder::new();
+            let target = builder.new_label();
+            builder.load_const_i_value(1, 3);
+            builder.live(&mut asm, &[0], &[], &[]);
+            builder.goto_if_not_int_lt(0, 1, target);
+            builder.mark_label(target);
+            let jitcode = builder.finish();
+
+            let mut ctx = context_with_liveness(&[Type::Int], &asm);
+            let mut sym = DummySym;
+            let action = trace_jitcode_with_args(
+                &mut ctx,
+                &mut sym,
+                &jitcode,
+                0,
+                |_pc| 0,
+                &[(JitArgKind::Int, OpRef::input_arg_int(0), lhs)],
+            );
+            assert!(matches!(action, TraceAction::Continue));
+            ctx.into_recorder()
+                .ops()
+                .iter()
+                .map(|op| op.opcode)
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            trace_one_nonconst(5),
+            vec![OpCode::IntLt, OpCode::GuardFalse],
+        );
+        assert_eq!(
+            trace_one_nonconst(1),
+            vec![OpCode::IntLt, OpCode::GuardTrue],
         );
     }
 

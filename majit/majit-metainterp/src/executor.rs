@@ -317,18 +317,18 @@ pub(crate) fn do_call_positional(
             majit_backend::call_stub::bh_call_i_by_classes(
                 func,
                 &arg_classes,
-                leftover_bh_args(&args_i),
-                leftover_bh_args(&args_r),
-                leftover_bh_args(&args_f),
+                &args_i,
+                &args_r,
+                &args_f,
             )
         },
         majit_ir::Type::Ref => unsafe {
             majit_backend::call_stub::bh_call_ref_by_classes(
                 func,
                 &arg_classes,
-                leftover_bh_args(&args_i),
-                leftover_bh_args(&args_r),
-                leftover_bh_args(&args_f),
+                &args_i,
+                &args_r,
+                &args_f,
             )
         },
         majit_ir::Type::Void => {
@@ -336,9 +336,9 @@ pub(crate) fn do_call_positional(
                 majit_backend::call_stub::bh_call_v_by_classes(
                     func,
                     &arg_classes,
-                    leftover_bh_args(&args_i),
-                    leftover_bh_args(&args_r),
-                    leftover_bh_args(&args_f),
+                    &args_i,
+                    &args_r,
+                    &args_f,
                 );
             }
             0
@@ -347,17 +347,13 @@ pub(crate) fn do_call_positional(
             majit_backend::call_stub::bh_call_f_by_classes(
                 func,
                 &arg_classes,
-                leftover_bh_args(&args_i),
-                leftover_bh_args(&args_r),
-                leftover_bh_args(&args_f),
+                &args_i,
+                &args_r,
+                &args_f,
             )
             .to_bits() as i64
         },
     }
-}
-
-fn leftover_bh_args(v: &[i64]) -> Option<&[i64]> {
-    if v.is_empty() { None } else { Some(v) }
 }
 
 /// executor.py `do_cond_call(cpu, metainterp, argboxes, descr)`:
@@ -413,13 +409,7 @@ fn do_call_n(
         }
     }
     let calldescr = majit_jitcode::jitcode::BhCallDescr::from_call_descr(descr);
-    cpu.bh_call_v(
-        func_ptr,
-        leftover_bh_args(&args_i),
-        leftover_bh_args(&args_r),
-        leftover_bh_args(&args_f),
-        &calldescr,
-    );
+    cpu.bh_call_v(func_ptr, &args_i, &args_r, &args_f, &calldescr);
 }
 
 /// `executor.py _do_call`: split argboxes[1..] into I/R/F and call
@@ -455,40 +445,13 @@ fn do_call<M: Clone>(
         majit_jitcode::jitcode::BhCallDescr::from_call_descr(descr)
     };
     match result_type {
-        majit_ir::Type::Int => cpu.bh_call_i(
-            func,
-            leftover_bh_args(&args_i),
-            leftover_bh_args(&args_r),
-            leftover_bh_args(&args_f),
-            &calldescr,
-        ),
-        majit_ir::Type::Ref => {
-            cpu.bh_call_r(
-                func,
-                leftover_bh_args(&args_i),
-                leftover_bh_args(&args_r),
-                leftover_bh_args(&args_f),
-                &calldescr,
-            )
-            .0 as i64
-        }
+        majit_ir::Type::Int => cpu.bh_call_i(func, &args_i, &args_r, &args_f, &calldescr),
+        majit_ir::Type::Ref => cpu.bh_call_r(func, &args_i, &args_r, &args_f, &calldescr).0 as i64,
         majit_ir::Type::Void => {
-            cpu.bh_call_v(
-                func,
-                leftover_bh_args(&args_i),
-                leftover_bh_args(&args_r),
-                leftover_bh_args(&args_f),
-                &calldescr,
-            );
+            cpu.bh_call_v(func, &args_i, &args_r, &args_f, &calldescr);
             0
         }
-        majit_ir::Type::Float => cpu.bh_call_i(
-            func,
-            leftover_bh_args(&args_i),
-            leftover_bh_args(&args_r),
-            leftover_bh_args(&args_f),
-            &calldescr,
-        ),
+        majit_ir::Type::Float => cpu.bh_call_i(func, &args_i, &args_r, &args_f, &calldescr),
     }
 }
 

@@ -5373,6 +5373,13 @@ impl RdLocs {
         }
     }
 
+    /// One `Arc<[u16]>` allocation when `iter` is `TrustedLen` (`Arc::from_iter`).
+    pub fn from_exact_iter(iter: impl ExactSizeIterator<Item = u16>) -> Self {
+        Self {
+            inner: std::sync::Arc::from_iter(iter),
+        }
+    }
+
     pub fn as_slice(&self) -> &[u16] {
         &self.inner
     }
@@ -5405,6 +5412,26 @@ impl From<Vec<u16>> for RdLocs {
 impl FromIterator<u16> for RdLocs {
     fn from_iter<I: IntoIterator<Item = u16>>(iter: I) -> Self {
         Self::from_vec(iter.into_iter().collect())
+    }
+}
+
+#[cfg(test)]
+mod rd_locs_tests {
+    use super::RdLocs;
+
+    #[test]
+    fn from_exact_iter_matches_from_vec() {
+        let empty_v = RdLocs::from_vec(Vec::new());
+        let empty_i = RdLocs::from_exact_iter(std::iter::empty());
+        assert_eq!(empty_v.as_slice(), empty_i.as_slice());
+        assert!(empty_v.is_empty());
+
+        let values: Vec<u16> = (0..40).map(|i| if i == 2 { 0xFFFF } else { i }).collect();
+        let from_vec = RdLocs::from_vec(values.clone());
+        let from_iter = RdLocs::from_exact_iter(values.iter().copied());
+        assert_eq!(from_vec.as_slice(), from_iter.as_slice());
+        assert_eq!(from_iter[2], 0xFFFF);
+        assert!(RdLocs::ptr_eq(&from_iter, &from_iter.clone()));
     }
 }
 
@@ -5450,7 +5477,7 @@ pub trait FailDescr: Descr {
     /// untyped, so we cache `Vec<Type>` on the descr and refresh it
     /// here. Concrete `ResumeGuardDescr` /
     /// `ResumeAtPositionDescr` / `CompileLoopVersionDescr` use
-    /// `UnsafeCell<Vec<Type>>` so the existing `Arc<dyn FailDescr>`
+    /// `UnsafeCell<SmallVec<[Type; 16]>>` so the existing `Arc<dyn FailDescr>`
     /// identity (fail_index, vector_info, subtype) is preserved across
     /// the optimizer pass — matching the load-bearing contract that
     /// subtype markers (`is_resume_at_position()`, `loop_version()`)
@@ -6446,8 +6473,7 @@ pub trait FieldDescr: Descr {
         if name == "typeptr" || name.ends_with(".typeptr") {
             return true;
         }
-        let leaf = name.rsplit('.').next().unwrap_or(name);
-        leaf == "ob_type" && self.offset() == 0
+        self.offset() == 0 && (name == "ob_type" || name.ends_with(".ob_type"))
     }
 
     /// Whether this descr names the class word: the header slot carrying

@@ -10,7 +10,7 @@
 
 use crate::aarch64::registers;
 use crate::regalloc::{
-    FrameManager, RegAlloc, RegAllocAssembler, SAVE_ALL_REGS, SAVE_DEFAULT_REGS, SAVE_GCREF_REGS,
+    RegAlloc, RegAllocAssembler, SAVE_ALL_REGS, SAVE_DEFAULT_REGS, SAVE_GCREF_REGS,
     compute_vars_longevity, is_math_sqrt_call,
 };
 use crate::regloc::{Loc, RegLoc};
@@ -299,10 +299,6 @@ impl<'a> RegAlloc<'a> {
     /// x86/regalloc.py _prepare
     pub fn _prepare(&mut self) {
         self.longevity = compute_vars_longevity(self.inputargs, self.operations);
-        let base_ofs = crate::jitframe::FIRST_ITEM_OFFSET as i32;
-        self.fm = FrameManager::new(base_ofs);
-        self.rm = Self::make_gpr_manager();
-        self.xrm = Self::make_xmm_manager();
         self.jump_target_descr = None;
         self.final_jump_args = None;
         self.final_jump_op_position = -1;

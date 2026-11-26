@@ -5810,9 +5810,9 @@ where
                     majit_backend::call_stub::bh_call_v_by_classes(
                         concrete_ptr as usize,
                         &calldescr.arg_classes,
-                        Some(&raw_i),
-                        Some(&raw_r),
-                        Some(&raw_f),
+                        &raw_i,
+                        &raw_r,
+                        &raw_f,
                     );
                 }
             }
@@ -5921,9 +5921,9 @@ where
                 majit_backend::call_stub::bh_call_v_by_classes(
                     concrete_ptr as usize,
                     &calldescr.arg_classes,
-                    Some(&raw_i),
-                    Some(&raw_r),
-                    Some(&raw_f),
+                    &raw_i,
+                    &raw_r,
+                    &raw_f,
                 );
             }
             if let Some(action) =
@@ -6160,9 +6160,9 @@ where
                     majit_backend::call_stub::bh_call_v_by_classes(
                         concrete_ptr as usize,
                         &calldescr.arg_classes,
-                        Some(&raw_i),
-                        Some(&raw_r),
-                        Some(&raw_f),
+                        &raw_i,
+                        &raw_r,
+                        &raw_f,
                     );
                 }
             }
@@ -6253,9 +6253,9 @@ where
                 majit_backend::call_stub::bh_call_i_by_classes(
                     concrete_ptr as usize,
                     &calldescr.arg_classes,
-                    Some(&raw_i),
-                    Some(&raw_r),
-                    Some(&raw_f),
+                    &raw_i,
+                    &raw_r,
+                    &raw_f,
                 )
             };
             if let Some(action) =
@@ -6501,9 +6501,9 @@ where
                     majit_backend::call_stub::bh_call_v_by_classes(
                         concrete_ptr as usize,
                         &calldescr.arg_classes,
-                        Some(&raw_i),
-                        Some(&raw_r),
-                        Some(&raw_f),
+                        &raw_i,
+                        &raw_r,
+                        &raw_f,
                     );
                 }
             }
@@ -6596,9 +6596,9 @@ where
                 majit_backend::call_stub::bh_call_i_by_classes(
                     concrete_ptr as usize,
                     &calldescr.arg_classes,
-                    Some(&raw_i),
-                    Some(&raw_r),
-                    Some(&raw_f),
+                    &raw_i,
+                    &raw_r,
+                    &raw_f,
                 )
             };
             // `history.py` `ConstPtr` keeps this word alive across
@@ -6803,9 +6803,9 @@ where
                     majit_backend::call_stub::bh_call_v_by_classes(
                         concrete_ptr as usize,
                         &calldescr.arg_classes,
-                        Some(&raw_i),
-                        Some(&raw_r),
-                        Some(&raw_f),
+                        &raw_i,
+                        &raw_r,
+                        &raw_f,
                     );
                 }
             }
@@ -6881,9 +6881,9 @@ where
                 majit_backend::call_stub::bh_call_f_by_classes(
                     concrete_ptr as usize,
                     &calldescr.arg_classes,
-                    Some(&raw_i),
-                    Some(&raw_r),
-                    Some(&raw_f),
+                    &raw_i,
+                    &raw_r,
+                    &raw_f,
                 )
             };
             // pyjitpl.py — vrefs_after_residual_call
@@ -7092,9 +7092,9 @@ where
             majit_backend::call_stub::bh_call_v_by_classes(
                 concrete_ptr as usize,
                 &arg_classes,
-                Some(&raw_i),
-                Some(&raw_r),
-                Some(&raw_f),
+                &raw_i,
+                &raw_r,
+                &raw_f,
             );
         }
         if let Some(action) = host_requested_walk_abort(ctx, concrete_ptr as usize, &arg_classes) {
@@ -7264,9 +7264,9 @@ where
                                 majit_backend::call_stub::bh_call_v_by_classes(
                                     concrete_ptr as usize,
                                     &calldescr.arg_classes,
-                                    Some(&raw_i),
-                                    Some(&raw_r),
-                                    Some(&raw_f),
+                                    &raw_i,
+                                    &raw_r,
+                                    &raw_f,
                                 );
                             }
                         }
@@ -7324,9 +7324,9 @@ where
                                 majit_backend::call_stub::bh_call_i_by_classes(
                                     concrete_ptr as usize,
                                     &calldescr.arg_classes,
-                                    Some(&raw_i),
-                                    Some(&raw_r),
-                                    Some(&raw_f),
+                                    &raw_i,
+                                    &raw_r,
+                                    &raw_f,
                                 )
                             }
                         };
@@ -7442,9 +7442,9 @@ where
                                 majit_backend::call_stub::bh_call_i_by_classes(
                                     concrete_ptr as usize,
                                     &calldescr.arg_classes,
-                                    Some(&raw_i),
-                                    Some(&raw_r),
-                                    Some(&raw_f),
+                                    &raw_i,
+                                    &raw_r,
+                                    &raw_f,
                                 )
                             }
                         };
@@ -7689,9 +7689,9 @@ where
                                 majit_backend::call_stub::bh_call_v_by_classes(
                                     concrete_ptr as usize,
                                     &arg_classes,
-                                    Some(&raw_i),
-                                    Some(&raw_r),
-                                    Some(&raw_f),
+                                    &raw_i,
+                                    &raw_r,
+                                    &raw_f,
                                 );
                             }
                         }
@@ -7742,9 +7742,9 @@ where
                                 majit_backend::call_stub::bh_call_i_by_classes(
                                     concrete_ptr as usize,
                                     &arg_classes,
-                                    Some(&raw_i),
-                                    Some(&raw_r),
-                                    Some(&raw_f),
+                                    &raw_i,
+                                    &raw_r,
+                                    &raw_f,
                                 )
                             }
                         };
@@ -7852,9 +7852,9 @@ where
                                 majit_backend::call_stub::bh_call_i_by_classes(
                                     concrete_ptr as usize,
                                     &arg_classes,
-                                    Some(&raw_i),
-                                    Some(&raw_r),
-                                    Some(&raw_f),
+                                    &raw_i,
+                                    &raw_r,
+                                    &raw_f,
                                 )
                             }
                         };
@@ -8145,9 +8145,9 @@ where
             majit_backend::call_stub::bh_call_i_by_classes(
                 concrete_ptr as usize,
                 &arg_classes,
-                Some(&raw_i),
-                Some(&raw_r),
-                Some(&raw_f),
+                &raw_i,
+                &raw_r,
+                &raw_f,
             )
         };
         if let Some(action) = host_requested_walk_abort(ctx, concrete_ptr as usize, &arg_classes) {
@@ -8290,9 +8290,9 @@ where
             majit_backend::call_stub::bh_call_i_by_classes(
                 concrete_ptr as usize,
                 &arg_classes,
-                Some(&raw_i),
-                Some(&raw_r),
-                Some(&raw_f),
+                &raw_i,
+                &raw_r,
+                &raw_f,
             )
         };
         if let Some(action) = host_requested_walk_abort(ctx, concrete_ptr as usize, &arg_classes) {
@@ -8435,9 +8435,9 @@ where
             majit_backend::call_stub::bh_call_i_by_classes(
                 concrete_ptr as usize,
                 &arg_classes,
-                Some(&raw_i),
-                Some(&raw_r),
-                Some(&raw_f),
+                &raw_i,
+                &raw_r,
+                &raw_f,
             )
         };
         if let Some(action) = host_requested_walk_abort(ctx, concrete_ptr as usize, &arg_classes) {

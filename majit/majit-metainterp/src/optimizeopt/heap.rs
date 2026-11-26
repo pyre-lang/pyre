@@ -318,14 +318,10 @@ impl CachedField {
         // info.py get_known_class. PyPy: opinfo1.get_known_class(cpu)
         // / opinfo2.get_known_class(cpu); CANNOT_ALIAS iff both are
         // known and not the same constant.
-        ctx.with_resolved_operand(box1, |b1| {
-            ctx.with_resolved_operand(box2, |b2| {
-                let class1 = ctx
-                    .getptrinfo_handle(b1)
-                    .and_then(|h| h.borrow().get_known_class(ctx.cpu.as_ref()));
-                let class2 = ctx
-                    .getptrinfo_handle(b2)
-                    .and_then(|h| h.borrow().get_known_class(ctx.cpu.as_ref()));
+        ctx.with_ptrinfo(box1, |info1| {
+            ctx.with_ptrinfo(box2, |info2| {
+                let class1 = info1.and_then(|i| i.get_known_class(ctx.cpu.as_ref()));
+                let class2 = info2.and_then(|i| i.get_known_class(ctx.cpu.as_ref()));
                 matches!((class1, class2), (Some(c1), Some(c2)) if c1 != c2)
             })
         })
@@ -770,20 +766,7 @@ impl ArrayCacheSubMap {
     }
 }
 
-/// Heap optimization pass.
-///
-/// Caches field and array item values to eliminate redundant loads, and delays
-/// store emission (lazy sets) to enable write-after-write elimination.
-///
-/// Green field optimization: immutable field caches survive cache invalidation
-/// by calls and side-effecting operations. When an immutable field is read from
-/// a constant object, the result is also a constant (green field folding).
-///
-/// Aliasing analysis: objects allocated during the trace (NEW, NEW_WITH_VTABLE,
-/// NEW_ARRAY, etc.) cannot alias each other or pre-existing objects. Their field
-/// caches survive writes to other objects. Objects that haven't escaped (not
-/// passed to calls or stored into the heap) keep their caches across calls.
-pub struct OptHeapState {
+pub struct OptHeapData {
     /// heap.py `self.optimizer.metainterp_sd.virtualref_info`, published by
     /// Optimizer together with the other metainterp-static pass inputs.
     vrefinfo: crate::virtualref::VirtualRefInfo,
@@ -844,6 +827,23 @@ pub struct OptHeapState {
     /// by QUASIIMMUT_FIELD, consumed by subsequent GETFIELD_GC_*. Survives
     /// calls (guarded by GUARD_NOT_INVALIDATED).
     quasi_immut_cache: crate::FxIndexMap<(DictArgKey, usize), Operand>,
+}
+
+/// Heap optimization pass.
+///
+/// Caches field and array item values to eliminate redundant loads, and delays
+/// store emission (lazy sets) to enable write-after-write elimination.
+///
+/// Green field optimization: immutable field caches survive cache invalidation
+/// by calls and side-effecting operations. When an immutable field is read from
+/// a constant object, the result is also a constant (green field folding).
+///
+/// Aliasing analysis: objects allocated during the trace (NEW, NEW_WITH_VTABLE,
+/// NEW_ARRAY, etc.) cannot alias each other or pre-existing objects. Their field
+/// caches survive writes to other objects. Objects that haven't escaped (not
+/// passed to calls or stored into the heap) keep their caches across calls.
+pub struct OptHeapState {
+    data: Box<OptHeapData>,
     /// Weak handle to `OptHeap.state`, set at construction (`Rc::new_cyclic`).
     /// `vstring.py` `optstring.emit_extra` re-enters `OptHeap.propagate_forward`
     /// during `Optimizer.emit` `force_box`; `emit_extra` upgrades this to park
@@ -856,6 +856,19 @@ pub struct OptHeapState {
     /// Nothing writes to it: the nested `OptHeap::propagate_forward` runs on
     /// the parked state.
     spare: Option<Box<OptHeapState>>,
+}
+
+impl std::ops::Deref for OptHeapState {
+    type Target = OptHeapData;
+    fn deref(&self) -> &OptHeapData {
+        &self.data
+    }
+}
+
+impl std::ops::DerefMut for OptHeapState {
+    fn deref_mut(&mut self) -> &mut OptHeapData {
+        &mut self.data
+    }
 }
 
 pub struct OptHeap {
@@ -904,18 +917,20 @@ impl OptHeap {
 impl OptHeapState {
     pub fn new(home: Weak<RefCell<Option<Box<OptHeapState>>>>) -> Self {
         OptHeapState {
-            vrefinfo: crate::virtualref::VirtualRefInfo::new(),
-            cached_fields: Vec::new(),
-            cached_arrayitems: Vec::new(),
-            seen_guard_not_invalidated: false,
-            postponed_op: None,
-            seen_allocation: BitSet::new(),
-            unescaped: crate::FxIndexSet::default(),
-            heapc_deps: crate::FxIndexMap::default(),
-            last_emitted_removed: false,
-            cached_dict_reads: crate::FxIndexMap::default(),
-            corresponding_array_descrs: crate::FxIndexMap::default(),
-            quasi_immut_cache: crate::FxIndexMap::default(),
+            data: Box::new(OptHeapData {
+                vrefinfo: crate::virtualref::VirtualRefInfo::new(),
+                cached_fields: Vec::new(),
+                cached_arrayitems: Vec::new(),
+                seen_guard_not_invalidated: false,
+                postponed_op: None,
+                seen_allocation: BitSet::new(),
+                unescaped: crate::FxIndexSet::default(),
+                heapc_deps: crate::FxIndexMap::default(),
+                last_emitted_removed: false,
+                cached_dict_reads: crate::FxIndexMap::default(),
+                corresponding_array_descrs: crate::FxIndexMap::default(),
+                quasi_immut_cache: crate::FxIndexMap::default(),
+            }),
             home,
             taken: false,
             spare: None,
@@ -1355,18 +1370,19 @@ impl OptHeapState {
     ) {
         if self.taken {
             let cell = self.home.upgrade().expect("OptHeap state home");
-            let mut live = self.spare.take().unwrap_or_else(|| self.placeholder());
-            std::mem::swap(self, live.as_mut());
-            // Park the live state. This is the only placeholder construction:
+            let mut parked = self.spare.take().unwrap_or_else(|| self.placeholder());
+            std::mem::swap(&mut self.data, &mut parked.data);
+            parked.taken = true;
+            // Park the live payload. This is the only placeholder construction:
             // `vstring.py` `optstring.emit_extra` re-enters
             // `OptHeap.propagate_forward`.
-            cell.borrow_mut().replace(live);
+            cell.borrow_mut().replace(parked);
             Self::send_extra_after_heap(opt, op, ctx);
-            let mut live = cell.borrow_mut().take().expect("OptHeap state taken");
-            std::mem::swap(self, live.as_mut());
-            // `live` now holds the untouched placeholder again.
-            debug_assert!(live.spare.is_none() && !live.taken);
-            self.spare = Some(live);
+            let mut parked = cell.borrow_mut().take().expect("OptHeap state taken");
+            debug_assert!(parked.taken && parked.spare.is_none());
+            std::mem::swap(&mut self.data, &mut parked.data);
+            parked.taken = false;
+            self.spare = Some(parked);
         } else {
             Self::send_extra_after_heap(opt, op, ctx);
         }

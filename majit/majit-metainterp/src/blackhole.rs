@@ -803,23 +803,23 @@ impl BlackholeInterpreter {
     }
 
     fn init_register_files_from_runtime_jitcode(&mut self, jitcode: &JitCode) {
-        // `blackhole.py` `BlackholeInterpreter.setposition` reads
-        // `jitcode.num_regs_*` / `jitcode.constants_*` as fields
-        // (`JitCode.setup`). `Arc<JitCode>` on `self.jitcode` pins them.
+        // SAFETY: `setposition_ref` receives a registry-resolved Arc;
+        // resolution cannot return an unset shell (`JitCode.setup`).
+        let body = unsafe { jitcode.body_assume_published() };
         Self::init_register_file_from_i64s(
             &mut self.registers_i,
-            jitcode.num_regs_i(),
-            &jitcode.constants_i,
+            body.c_num_regs_i as usize,
+            &body.constants_i,
         );
         Self::init_register_file_from_const_slots_r(
             &mut self.registers_r,
-            jitcode.num_regs_r(),
-            &jitcode.constants_r,
+            body.c_num_regs_r as usize,
+            &body.constants_r,
         );
         Self::init_register_file_from_i64s(
             &mut self.registers_f,
-            jitcode.num_regs_f(),
-            &jitcode.constants_f,
+            body.c_num_regs_f as usize,
+            &body.constants_f,
         );
     }
 
@@ -828,14 +828,12 @@ impl BlackholeInterpreter {
     ///
     /// `blackhole.py BlackholeInterpreter.cleanup_registers` NULLs only the
     /// first `num_regs_r()` REF registers and `exception_last_value`. It
-    /// never touches int/float registers and never clears constants. The
-    /// earlier whole-bank `fill(0)` wiped the constant area and forced
-    /// [`Self::setposition_ref`] to recopy it on every seating of the same
-    /// helper. Working int/float leftovers are overwritten by the next
-    /// `setposition` + argument copy the same way a pooled interp is.
+    /// never touches int/float registers and never clears constants. Working
+    /// int/float leftovers are overwritten by the next `setposition` +
+    /// argument copy the same way a pooled interp is.
     pub(crate) fn reset_for_inline_reuse(&mut self) {
         let n_r = self.jitcode.num_regs_r().min(self.registers_r.len());
-        self.registers_r[..n_r].fill(0);
+        Self::null_live_ref_prefix(&mut self.registers_r[..n_r]);
         self.tmpreg_i = 0;
         self.tmpreg_r = 0;
         self.tmpreg_f = 0;
@@ -1024,7 +1022,7 @@ impl BlackholeInterpreter {
             jdindex, greens_i, greens_r, greens_f, reds_i, reds_r, reds_f,
         );
         self.cpu()
-            .bh_call_r(fnptr, Some(&all_i), Some(&all_r), Some(&all_f), &calldescr)
+            .bh_call_r(fnptr, &all_i, &all_r, &all_f, &calldescr)
     }
 
     /// Set an integer register value.
@@ -1155,6 +1153,20 @@ impl BlackholeInterpreter {
         self.rooted
     }
 
+    /// Counted NULL stores over a live-ref prefix (`blackhole.py
+    /// BlackholeInterpreter.cleanup_registers` / generated
+    /// `pypy_g_BlackholeInterpreter_cleanup_registers`). Volatile stores
+    /// keep the loop as individual `RPyItem = NULL` writes.
+    #[inline(always)]
+    fn null_live_ref_prefix(registers_r: &mut [i64]) {
+        for i in 0..registers_r.len() {
+            // SAFETY: i < registers_r.len()
+            unsafe {
+                std::ptr::write_volatile(registers_r.get_unchecked_mut(i), 0);
+            }
+        }
+    }
+
     /// blackhole.py `BlackholeInterpreter.cleanup_registers`
     ///
     /// NULL `registers_r[0..num_regs_r())` and `exception_last_value`.
@@ -1165,8 +1177,12 @@ impl BlackholeInterpreter {
         // blackhole.py: `for i in range(self.jitcode.num_regs_r()):
         // self.registers_r[i] = NULL`. The `min` keeps the old per-index
         // guard's no-panic behaviour for a bank shorter than the count.
-        let n_r = self.jitcode.num_regs_r().min(self.registers_r.len());
-        self.registers_r[..n_r].fill(0);
+        // SAFETY: `self.jitcode` is always published: `Default` seats
+        // `JitCode::default` (empty published body) and `release_interp`
+        // never clears it; a seated interp keeps the last
+        // `setposition_ref` jitcode (`BlackholeInterpBuilder.release_interp`).
+        let n_r = unsafe { self.jitcode.num_regs_r_assume_published() }.min(self.registers_r.len());
+        Self::null_live_ref_prefix(&mut self.registers_r[..n_r]);
         self.exception_last_value = 0;
         self.pending_exc = 0;
     }
@@ -1180,7 +1196,13 @@ impl BlackholeInterpreter {
     /// There is no side table to disagree with the code stream, so the marker
     /// hook's register clear and a resume's register seeding read one source.
     pub fn get_current_position_info(&self) -> usize {
-        self.jitcode.get_live_vars_info(self.position, self.op_live)
+        // SAFETY: `blackhole_from_resumedata` called `setposition_ref`
+        // first; `setposition_ref` runs `init_register_files_from_runtime_jitcode`
+        // on a published body (`JitCode.setup`).
+        unsafe {
+            self.jitcode
+                .get_live_vars_info_assume_published(self.position, self.op_live)
+        }
     }
 
     /// Jitcode pc of the last `-live-` marker, if this frame has executed one
@@ -1202,7 +1224,9 @@ impl BlackholeInterpreter {
     /// (`jtransform.py handle_regular_call` / `handle_residual_call`),
     /// and `inline_call_typed` closes on the destination byte.
     fn call_result_reg(&self, _kind: BhReturnType) -> usize {
-        self.jitcode.code[self.position - 1] as usize
+        // SAFETY: the resumed call bytecode ends in the destination
+        // operand (`blackhole.py _setup_return_value_*`).
+        unsafe { self.jitcode.result_reg_assume_published(self.position) }
     }
 
     /// blackhole.py _setup_return_value_i
@@ -1211,23 +1235,36 @@ impl BlackholeInterpreter {
     /// 'xxx_call_yyy' instructions from the caller frame.
     /// blackhole.py _setup_return_value_i
     pub fn setup_return_value_i(&mut self, result: i64) {
-        // blackhole.py:1655-1656
-        let reg_idx = self.call_result_reg(BhReturnType::Int);
-        self.registers_i[reg_idx] = result;
+        let reg = self.call_result_reg(BhReturnType::Int);
+        debug_assert!(reg < self.registers_i.len());
+        // SAFETY: `setposition_ref` sized the bank to num_regs + constants;
+        // the destination byte is a register index in that bank
+        // (`blackhole.py _setup_return_value_i`).
+        unsafe {
+            *self.registers_i.get_unchecked_mut(reg) = result;
+        }
     }
 
     /// blackhole.py _setup_return_value_r
     pub fn setup_return_value_r(&mut self, result: i64) {
-        // blackhole.py:1658-1659
-        let reg_idx = self.call_result_reg(BhReturnType::Ref);
-        self.registers_r[reg_idx] = result;
+        let reg = self.call_result_reg(BhReturnType::Ref);
+        debug_assert!(reg < self.registers_r.len());
+        // SAFETY: `setposition_ref` sized the bank to num_regs + constants
+        // (`blackhole.py _setup_return_value_r`).
+        unsafe {
+            *self.registers_r.get_unchecked_mut(reg) = result;
+        }
     }
 
     /// blackhole.py _setup_return_value_f
     pub fn setup_return_value_f(&mut self, result: i64) {
-        // blackhole.py:1661-1662
-        let reg_idx = self.call_result_reg(BhReturnType::Float);
-        self.registers_f[reg_idx] = result;
+        let reg = self.call_result_reg(BhReturnType::Float);
+        debug_assert!(reg < self.registers_f.len());
+        // SAFETY: `setposition_ref` sized the bank to num_regs + constants
+        // (`blackhole.py _setup_return_value_f`).
+        unsafe {
+            *self.registers_f.get_unchecked_mut(reg) = result;
+        }
     }
 
     /// blackhole.py _done_with_this_frame
@@ -1459,8 +1496,20 @@ impl BlackholeInterpreter {
         self._get_list_of_values_f_into(&mut args.red_float);
 
         if self.nextblackholeinterp.is_none() {
-            // blackhole.py:1068-1069: bottommost level.
+            // `bhimpl_jit_merge_point`, bottommost level:
             //   raise ContinueRunningNormally(*args)
+            // `_get_list_of_values` built six fresh lists, which
+            // `make_sure_not_resized` turns into fixed arrays (header word,
+            // length word, one word per item), and `jitexc.py
+            // ContinueRunningNormally` is a six-field instance. The buffers
+            // here are reused, so their translated size is charged instead.
+            let items = args.green_int.len()
+                + args.green_ref.len()
+                + args.green_float.len()
+                + args.red_int.len()
+                + args.red_ref.len()
+                + args.red_float.len();
+            majit_gc::charge_translated_nursery(6 * 16 + items * 8 + (8 + 6 * 8));
             return Err(DispatchError::ContinueRunningNormally(args));
         }
         // blackhole.py:1074-1093: recursive portal level.
@@ -1824,6 +1873,16 @@ impl BlackholeInterpreter {
         if !self.chain_needs_run_rooting() {
             return self.run_after_rooting();
         }
+        self.run_with_explicit_roots()
+    }
+
+    /// Root the pending caller chain, then dispatch.
+    ///
+    /// `BlackholeInterpreter.run` takes this arm when a frame is not already
+    /// registered or a heap virtualizable is attached.
+    #[cold]
+    #[inline(never)]
+    fn run_with_explicit_roots(&mut self) -> BhRunOutcome {
         // Root this frame's register bank AND every pending caller frame
         // reachable through `nextblackholeinterp`.  RPython keeps the whole
         // blackhole interpreter chain transitively GC-traced from the head for
@@ -2454,8 +2513,7 @@ impl BlackholeInterpreter {
         args_r: &[i64],
         calldescr: &majit_jitcode::jitcode::BhCallDescr,
     ) -> i64 {
-        self.cpu()
-            .bh_call_i(func, None, Some(args_r), None, calldescr)
+        self.cpu().bh_call_i(func, &[], args_r, &[], calldescr)
     }
 
     /// blackhole.py:1227-1229
@@ -2465,8 +2523,7 @@ impl BlackholeInterpreter {
         args_r: &[i64],
         calldescr: &majit_jitcode::jitcode::BhCallDescr,
     ) -> majit_ir::GcRef {
-        self.cpu()
-            .bh_call_r(func, None, Some(args_r), None, calldescr)
+        self.cpu().bh_call_r(func, &[], args_r, &[], calldescr)
     }
 
     /// blackhole.py:1230-1232
@@ -2476,8 +2533,7 @@ impl BlackholeInterpreter {
         args_r: &[i64],
         calldescr: &majit_jitcode::jitcode::BhCallDescr,
     ) {
-        self.cpu()
-            .bh_call_v(func, None, Some(args_r), None, calldescr);
+        self.cpu().bh_call_v(func, &[], args_r, &[], calldescr);
     }
 
     /// blackhole.py:1234-1236
@@ -2488,8 +2544,7 @@ impl BlackholeInterpreter {
         args_r: &[i64],
         calldescr: &majit_jitcode::jitcode::BhCallDescr,
     ) -> i64 {
-        self.cpu()
-            .bh_call_i(func, Some(args_i), Some(args_r), None, calldescr)
+        self.cpu().bh_call_i(func, args_i, args_r, &[], calldescr)
     }
 
     /// blackhole.py:1237-1239
@@ -2500,8 +2555,7 @@ impl BlackholeInterpreter {
         args_r: &[i64],
         calldescr: &majit_jitcode::jitcode::BhCallDescr,
     ) -> majit_ir::GcRef {
-        self.cpu()
-            .bh_call_r(func, Some(args_i), Some(args_r), None, calldescr)
+        self.cpu().bh_call_r(func, args_i, args_r, &[], calldescr)
     }
 
     /// blackhole.py:1240-1242
@@ -2512,8 +2566,7 @@ impl BlackholeInterpreter {
         args_r: &[i64],
         calldescr: &majit_jitcode::jitcode::BhCallDescr,
     ) {
-        self.cpu()
-            .bh_call_v(func, Some(args_i), Some(args_r), None, calldescr);
+        self.cpu().bh_call_v(func, args_i, args_r, &[], calldescr);
     }
 
     /// blackhole.py:1244-1246
@@ -2526,7 +2579,7 @@ impl BlackholeInterpreter {
         calldescr: &majit_jitcode::jitcode::BhCallDescr,
     ) -> i64 {
         self.cpu()
-            .bh_call_i(func, Some(args_i), Some(args_r), Some(args_f), calldescr)
+            .bh_call_i(func, args_i, args_r, args_f, calldescr)
     }
 
     /// blackhole.py:1247-1249
@@ -2539,7 +2592,7 @@ impl BlackholeInterpreter {
         calldescr: &majit_jitcode::jitcode::BhCallDescr,
     ) -> majit_ir::GcRef {
         self.cpu()
-            .bh_call_r(func, Some(args_i), Some(args_r), Some(args_f), calldescr)
+            .bh_call_r(func, args_i, args_r, args_f, calldescr)
     }
 
     /// blackhole.py:1250-1252
@@ -2552,7 +2605,7 @@ impl BlackholeInterpreter {
         calldescr: &majit_jitcode::jitcode::BhCallDescr,
     ) -> f64 {
         self.cpu()
-            .bh_call_f(func, Some(args_i), Some(args_r), Some(args_f), calldescr)
+            .bh_call_f(func, args_i, args_r, args_f, calldescr)
     }
 
     /// blackhole.py:1253-1255
@@ -2565,7 +2618,7 @@ impl BlackholeInterpreter {
         calldescr: &majit_jitcode::jitcode::BhCallDescr,
     ) {
         self.cpu()
-            .bh_call_v(func, Some(args_i), Some(args_r), Some(args_f), calldescr);
+            .bh_call_v(func, args_i, args_r, args_f, calldescr);
     }
 
     // ── bhimpl_inline_call_* (`blackhole.py` `bhimpl_inline_call_*`) ──
@@ -2586,8 +2639,7 @@ impl BlackholeInterpreter {
         args_r: &[i64],
         calldescr: &majit_jitcode::jitcode::BhCallDescr,
     ) -> i64 {
-        self.cpu()
-            .bh_call_i(fnaddr, None, Some(args_r), None, calldescr)
+        self.cpu().bh_call_i(fnaddr, &[], args_r, &[], calldescr)
     }
     /// blackhole.py `bhimpl_inline_call_r_r`
     pub fn bhimpl_inline_call_r_r(
@@ -2596,8 +2648,7 @@ impl BlackholeInterpreter {
         args_r: &[i64],
         calldescr: &majit_jitcode::jitcode::BhCallDescr,
     ) -> majit_ir::GcRef {
-        self.cpu()
-            .bh_call_r(fnaddr, None, Some(args_r), None, calldescr)
+        self.cpu().bh_call_r(fnaddr, &[], args_r, &[], calldescr)
     }
     /// blackhole.py `bhimpl_inline_call_r_v`
     pub fn bhimpl_inline_call_r_v(
@@ -2606,8 +2657,7 @@ impl BlackholeInterpreter {
         args_r: &[i64],
         calldescr: &majit_jitcode::jitcode::BhCallDescr,
     ) {
-        self.cpu()
-            .bh_call_v(fnaddr, None, Some(args_r), None, calldescr);
+        self.cpu().bh_call_v(fnaddr, &[], args_r, &[], calldescr);
     }
     /// blackhole.py `bhimpl_inline_call_ir_i`
     pub fn bhimpl_inline_call_ir_i(
@@ -2617,8 +2667,7 @@ impl BlackholeInterpreter {
         args_r: &[i64],
         calldescr: &majit_jitcode::jitcode::BhCallDescr,
     ) -> i64 {
-        self.cpu()
-            .bh_call_i(fnaddr, Some(args_i), Some(args_r), None, calldescr)
+        self.cpu().bh_call_i(fnaddr, args_i, args_r, &[], calldescr)
     }
     /// blackhole.py `bhimpl_inline_call_ir_r`
     pub fn bhimpl_inline_call_ir_r(
@@ -2628,8 +2677,7 @@ impl BlackholeInterpreter {
         args_r: &[i64],
         calldescr: &majit_jitcode::jitcode::BhCallDescr,
     ) -> majit_ir::GcRef {
-        self.cpu()
-            .bh_call_r(fnaddr, Some(args_i), Some(args_r), None, calldescr)
+        self.cpu().bh_call_r(fnaddr, args_i, args_r, &[], calldescr)
     }
     /// blackhole.py `bhimpl_inline_call_ir_v`
     pub fn bhimpl_inline_call_ir_v(
@@ -2639,8 +2687,7 @@ impl BlackholeInterpreter {
         args_r: &[i64],
         calldescr: &majit_jitcode::jitcode::BhCallDescr,
     ) {
-        self.cpu()
-            .bh_call_v(fnaddr, Some(args_i), Some(args_r), None, calldescr);
+        self.cpu().bh_call_v(fnaddr, args_i, args_r, &[], calldescr);
     }
     /// blackhole.py `bhimpl_inline_call_irf_i`
     pub fn bhimpl_inline_call_irf_i(
@@ -2652,7 +2699,7 @@ impl BlackholeInterpreter {
         calldescr: &majit_jitcode::jitcode::BhCallDescr,
     ) -> i64 {
         self.cpu()
-            .bh_call_i(fnaddr, Some(args_i), Some(args_r), Some(args_f), calldescr)
+            .bh_call_i(fnaddr, args_i, args_r, args_f, calldescr)
     }
     /// blackhole.py `bhimpl_inline_call_irf_r`
     pub fn bhimpl_inline_call_irf_r(
@@ -2664,7 +2711,7 @@ impl BlackholeInterpreter {
         calldescr: &majit_jitcode::jitcode::BhCallDescr,
     ) -> majit_ir::GcRef {
         self.cpu()
-            .bh_call_r(fnaddr, Some(args_i), Some(args_r), Some(args_f), calldescr)
+            .bh_call_r(fnaddr, args_i, args_r, args_f, calldescr)
     }
     /// blackhole.py `bhimpl_inline_call_irf_f`
     pub fn bhimpl_inline_call_irf_f(
@@ -2676,7 +2723,7 @@ impl BlackholeInterpreter {
         calldescr: &majit_jitcode::jitcode::BhCallDescr,
     ) -> f64 {
         self.cpu()
-            .bh_call_f(fnaddr, Some(args_i), Some(args_r), Some(args_f), calldescr)
+            .bh_call_f(fnaddr, args_i, args_r, args_f, calldescr)
     }
     /// blackhole.py `bhimpl_inline_call_irf_v`
     pub fn bhimpl_inline_call_irf_v(
@@ -2688,7 +2735,7 @@ impl BlackholeInterpreter {
         calldescr: &majit_jitcode::jitcode::BhCallDescr,
     ) {
         self.cpu()
-            .bh_call_v(fnaddr, Some(args_i), Some(args_r), Some(args_f), calldescr);
+            .bh_call_v(fnaddr, args_i, args_r, args_f, calldescr);
     }
 
     // ── bhimpl_recursive_call_{i,f,v} (blackhole.py bhimpl_recursive_call_i) ──
@@ -2716,7 +2763,7 @@ impl BlackholeInterpreter {
             jdindex, greens_i, greens_r, greens_f, reds_i, reds_r, reds_f,
         );
         self.cpu()
-            .bh_call_i(fnptr, Some(&all_i), Some(&all_r), Some(&all_f), &calldescr)
+            .bh_call_i(fnptr, &all_i, &all_r, &all_f, &calldescr)
     }
 
     /// blackhole.py:1117-1124
@@ -2738,7 +2785,7 @@ impl BlackholeInterpreter {
             jdindex, greens_i, greens_r, greens_f, reds_i, reds_r, reds_f,
         );
         self.cpu()
-            .bh_call_f(fnptr, Some(&all_i), Some(&all_r), Some(&all_f), &calldescr)
+            .bh_call_f(fnptr, &all_i, &all_r, &all_f, &calldescr)
     }
 
     /// blackhole.py:1125-1132
@@ -2760,7 +2807,7 @@ impl BlackholeInterpreter {
             jdindex, greens_i, greens_r, greens_f, reds_i, reds_r, reds_f,
         );
         self.cpu()
-            .bh_call_v(fnptr, Some(&all_i), Some(&all_r), Some(&all_f), &calldescr);
+            .bh_call_v(fnptr, &all_i, &all_r, &all_f, &calldescr);
     }
 }
 
@@ -3667,6 +3714,33 @@ fn handle_jitexception<P: BlackholeInterpPool>(
             BlackholeTerminalImage::store_into(terminal_out, &mut bh);
         }
         builder.release_chain(Some(bh));
+        return Err(exc);
+    }
+    // Nothing between here and the return allocates, so the payload needs no
+    // root; the caller roots it before restoring state.
+    if on_leave_level.is_none() && bh.nextblackholeinterp.is_none() {
+        if bh.jitcode.jitdriver_sd().is_none() {
+            builder.release_interp(bh);
+            if let Some(terminal_out) = terminal_out {
+                *terminal_out = None;
+            }
+            return Err(exc);
+        }
+        if let Some(terminal_out) = terminal_out {
+            let skip_image = match &exc {
+                JitException::ContinueRunningNormally(args) => {
+                    bh.state_field_layout.has_no_scalar_identity()
+                        || bh.state_field_layout.crn_reds_are_identity(args)
+                }
+                _ => false,
+            };
+            if skip_image {
+                *terminal_out = None;
+            } else {
+                BlackholeTerminalImage::store_into(terminal_out, &mut bh);
+            }
+        }
+        builder.release_interp(bh);
         return Err(exc);
     }
     // The leave callback runs return_trace/leave, which can collect; the pending
@@ -5538,23 +5612,48 @@ mod tests {
         /// result register `inline_call_typed` now closes on.
         #[test]
         fn setup_return_value_i_reads_inline_calls_int_return_slot() {
+            let last_i = 7u16;
             let mut b = JitCodeBuilder::default();
-            b.inline_call_r_i(0, &[], Some(7));
+            b.ensure_i_regs(last_i + 1);
+            b.inline_call_r_i(0, &[], Some(last_i));
             let jitcode = b.finish();
             // The call is the whole body, so the position the caller resumes at
             // is the end of the code.
             let resume_pos = jitcode.code.len();
             assert_eq!(
                 jitcode.code[resume_pos - 1],
-                7,
+                last_i as u8,
                 "inline call must end on the int result register",
             );
+            assert_eq!(jitcode.num_regs_i(), last_i as usize + 1);
 
             let mut builder = build_test_bh_builder();
             let mut bh = builder.acquire_interp();
             bh.setposition(std::sync::Arc::new(jitcode), resume_pos);
+            let last_legal = bh.registers_i.len() - 1;
+            assert!(last_i as usize <= last_legal);
             bh.setup_return_value_i(42);
-            assert_eq!(bh.registers_i[7], 42);
+            assert_eq!(bh.registers_i[last_i as usize], 42);
+
+            let last_r = 7u16;
+            let mut b = JitCodeBuilder::default();
+            b.ensure_r_regs(last_r + 1);
+            b.inline_call_r_r(0, &[], Some(last_r));
+            let jitcode = b.finish();
+            let resume_pos = jitcode.code.len();
+            bh.setposition(std::sync::Arc::new(jitcode), resume_pos);
+            bh.setup_return_value_r(99);
+            assert_eq!(bh.registers_r[last_r as usize], 99);
+
+            let last_f = 7u16;
+            let mut b = JitCodeBuilder::default();
+            b.ensure_f_regs(last_f + 1);
+            b.inline_call_irf_f(0, &[], &[], &[], Some(last_f));
+            let jitcode = b.finish();
+            let resume_pos = jitcode.code.len();
+            bh.setposition(std::sync::Arc::new(jitcode), resume_pos);
+            bh.setup_return_value_f(123);
+            assert_eq!(bh.registers_f[last_f as usize], 123);
         }
 
         /// `BlackholeInterpreter.setposition` + `run` on a helper (non-portal)
@@ -7213,6 +7312,54 @@ mod tests {
             builder.release_interp(a);
             let reused = builder.acquire_interp();
             assert!(reused.nextblackholeinterp.is_none());
+        }
+
+        /// `cleanup_registers` NULLs only `registers_r[0..num_regs_r())`
+        /// (`blackhole.py BlackholeInterpreter.cleanup_registers`). Constants
+        /// and the int/float banks stay; `release_interp` then drops the
+        /// caller `Box` link and the idle virtualizable.
+        #[test]
+        fn cleanup_registers_nulls_the_live_ref_prefix_and_keeps_constants() {
+            let mut b = JitCodeBuilder::default();
+            b.ensure_r_regs(2);
+            b.ensure_i_regs(1);
+            b.ensure_f_regs(1);
+            b.add_const_r(0xC);
+            b.void_return();
+            let jitcode = std::sync::Arc::new(b.finish());
+            assert!(
+                jitcode.num_regs_r() == 2 && jitcode.num_regs_and_consts_r() >= 3,
+                "fixture: two live refs plus a constants_r slot"
+            );
+
+            let mut builder = build_test_bh_builder();
+            let mut bh = builder.acquire_interp();
+            bh.setposition_ref(&jitcode, 0);
+            assert!(bh.registers_r.len() >= 3);
+            assert!(!bh.registers_i.is_empty());
+            assert!(!bh.registers_f.is_empty());
+            bh.registers_r[0] = 0xA;
+            bh.registers_r[1] = 0xB;
+            bh.registers_r[2] = 0xC;
+            bh.registers_i[0] = 0xD;
+            bh.registers_f[0] = 0xE;
+            bh.virtualizable_ptr = 0x7f00_0000_1234;
+            bh.nextblackholeinterp = Some(builder.acquire_interp());
+
+            bh.cleanup_registers();
+            builder.release_interp(bh);
+
+            let pooled = builder
+                .blackholeinterps
+                .as_ref()
+                .expect("release_interp pools the interp");
+            assert_eq!(pooled.registers_r[0], 0);
+            assert_eq!(pooled.registers_r[1], 0);
+            assert_eq!(pooled.registers_r[2], 0xC);
+            assert_eq!(pooled.registers_i[0], 0xD);
+            assert_eq!(pooled.registers_f[0], 0xE);
+            assert_eq!(pooled.virtualizable_ptr, 0);
+            assert!(pooled.nextblackholeinterp.is_none());
         }
 
         /// Tier 2.1: ref-typed return propagation through
@@ -14338,8 +14485,7 @@ fn handler_conditional_call_ir_v(
         }
         bh.last_exc().set(0);
         let (ai, ar) = lists.banks();
-        bh.cpu()
-            .bh_call_v(func, Some(ai), Some(ar), None, calldescr);
+        bh.cpu().bh_call_v(func, ai, ar, &[], calldescr);
         check_residual_call_exception_after(bh, p)?;
     }
     Ok(p)
@@ -14360,9 +14506,7 @@ fn handler_conditional_call_value_ir_i(
         }
         bh.last_exc().set(0);
         let (ai, ar) = lists.banks();
-        value = bh
-            .cpu()
-            .bh_call_i(func, Some(ai), Some(ar), None, calldescr);
+        value = bh.cpu().bh_call_i(func, ai, ar, &[], calldescr);
         check_residual_call_exception_after(bh, p + 1)?;
     }
     bh.registers_i[code[p] as usize] = value;
@@ -14389,10 +14533,7 @@ fn handler_conditional_call_value_ir_r(
         }
         bh.last_exc().set(0);
         let (ai, ar) = lists.banks();
-        value = bh
-            .cpu()
-            .bh_call_r(func, Some(ai), Some(ar), None, calldescr)
-            .0 as i64;
+        value = bh.cpu().bh_call_r(func, ai, ar, &[], calldescr).0 as i64;
         check_residual_call_exception_after(bh, p + 1)?;
     }
     bh.registers_r[code[p] as usize] = value;

@@ -713,9 +713,7 @@ impl Trace {
         match tagged {
             SnapshotTagged::Const(v, Type::Int) => OcBox::ConstInt(v),
             SnapshotTagged::Const(v, Type::Float) => OcBox::ConstFloat(v as u64),
-            SnapshotTagged::Const(v, Type::Ref) => {
-                OcBox::ConstPtr(majit_ir::const_ptr_table::resolve(v as u32).0 as u64)
-            }
+            SnapshotTagged::Const(v, Type::Ref) => OcBox::ConstPtrIndexed(v as u32),
             SnapshotTagged::Const(_, Type::Void) => {
                 panic!("encode snapshot: Const Void is not a tagged value")
             }
@@ -766,9 +764,9 @@ impl Trace {
     ///
     /// Hold `ConstPtr` indexes with `hold_tagged_const_indexes` across
     /// `new_array` / `_encode`. Resolve each box after the previous encode
-    /// via `snapshot_tagged_to_box` (`Const(v, Ref)` through
-    /// `const_ptr_table::resolve`, `Box(r, _)` through `arg_to_box`),
-    /// matching `record_bytes`.
+    /// via `snapshot_tagged_to_box` (`Const(v, Ref)` as
+    /// `ConstPtrIndexed`, `Box(r, _)` through `arg_to_box`), matching
+    /// `record_bytes`.
     fn write_tagged_array(&mut self, boxes: &[SnapshotTagged]) -> i64 {
         let held = self.hold_tagged_const_indexes(boxes);
         let res = self
@@ -1065,7 +1063,10 @@ impl Trace {
             return match value {
                 Value::Int(v) => OcBox::ConstInt(v),
                 Value::Float(f) => OcBox::ConstFloat(f.to_bits()),
-                Value::Ref(g) => OcBox::ConstPtr(g.as_usize() as u64),
+                Value::Ref(g) => match r.const_ptr_index() {
+                    Some(index) => OcBox::ConstPtrIndexed(index),
+                    None => OcBox::ConstPtr(g.as_usize() as u64),
+                },
                 Value::Void => panic!("arg_to_box: constant {r:?} has Void type"),
             };
         }

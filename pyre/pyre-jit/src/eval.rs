@@ -17229,9 +17229,9 @@ fn materialize_virtual_from_rd(
             // resume.py:1456: self.cpu.bh_call_i(func, [size], None, None, calldescr)
             let buffer = driver.meta_interp().backend().bh_call_i(
                 *func,
-                Some(&[*size as i64]),
-                None,
-                None,
+                &[*size as i64],
+                &[],
+                &[],
                 &bh_calldescr,
             );
             // resume.py:704: cache BEFORE filling fields.
@@ -17425,13 +17425,8 @@ fn materialize_virtual_from_rd(
             };
             let right_val = right_ref.0 as i64;
             let backend = driver.meta_interp().backend();
-            let result = backend.bh_call_r(
-                func as i64,
-                None,
-                Some(&[left_val, right_val]),
-                None,
-                &bh_calldescr,
-            );
+            let result =
+                backend.bh_call_r(func as i64, &[], &[left_val, right_val], &[], &bh_calldescr);
             let value = Value::Ref(majit_ir::GcRef(result.0));
             virtuals_cache.insert(vidx, value);
             return virtuals_cache.live_ref_value(vidx);
@@ -17507,9 +17502,9 @@ fn materialize_virtual_from_rd(
             let backend = driver.meta_interp().backend();
             let result = backend.bh_call_r(
                 func as i64,
-                Some(&[start_val, stop_val]),
-                Some(&[str_val]),
-                None,
+                &[start_val, stop_val],
+                &[str_val],
+                &[],
                 &bh_calldescr,
             );
             let value = Value::Ref(majit_ir::GcRef(result.0));
@@ -19415,13 +19410,10 @@ impl majit_metainterp::resume::BlackholeAllocator for PyreBlackholeAllocator {
             .as_call_descr()
             .expect("OS_RAW_MALLOC_VARSIZE_CHAR calldescr must downcast to CallDescr");
         let bh_calldescr = majit_jitcode::jitcode::BhCallDescr::from_call_descr(cd);
-        driver.meta_interp().backend().bh_call_i(
-            func,
-            Some(&[size as i64]),
-            None,
-            None,
-            &bh_calldescr,
-        )
+        driver
+            .meta_interp()
+            .backend()
+            .bh_call_i(func, &[size as i64], &[], &[], &bh_calldescr)
     }
 
     /// resume.py:1547 cpu.bh_raw_store_f(buffer, offset, value, descr).

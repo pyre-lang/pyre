@@ -638,6 +638,21 @@ impl JitFrameDeadFrame {
         }
     }
 
+    /// Take over an already-live translated local for the returned jitframe.
+    /// The caller must not retain another root owner for the same local.
+    pub fn from_shadow_root(
+        jf_root: ShadowRoot,
+        fail_descr: ExitDescr,
+        latest_descr: Option<DescrRef>,
+    ) -> Self {
+        JitFrameDeadFrame {
+            jf_root: JitFrameRoot::Slot(jf_root),
+            fail_descr,
+            latest_descr,
+            _heap_owner: None,
+        }
+    }
+
     /// Present a frame allocated by the GC as a rooted deadframe.
     ///
     /// `llmodel.py force` casts the resolved frame to a GCREF and
@@ -834,6 +849,38 @@ mod tests {
 
         drop(deadframe);
         unsafe { free_off_gc_jitframe(frame) };
+    }
+
+    fn walked_root_count() -> usize {
+        let mut n = 0;
+        majit_gc::shadow_stack::walk_roots(|_| n += 1);
+        n
+    }
+
+    /// `from_shadow_root` keeps the caller's owner slot: `jf_gcref` re-reads
+    /// it after a forwarding store, and drop releases it.
+    #[test]
+    fn from_shadow_root_rereads_the_owner_slot_and_releases_it() {
+        let sentinel = GcRef(0x1111_2222);
+        let forwarded = GcRef(0x3333_4444);
+        let baseline = walked_root_count();
+
+        let deadframe = JitFrameDeadFrame::from_shadow_root(
+            ShadowRoot::new(sentinel),
+            ExitDescr::owned(a_descr()),
+            None,
+        );
+        assert_eq!(deadframe.jf_gcref(), sentinel);
+
+        majit_gc::shadow_stack::walk_roots(|root| {
+            if *root == sentinel {
+                *root = forwarded;
+            }
+        });
+        assert_eq!(deadframe.jf_gcref(), forwarded);
+
+        drop(deadframe);
+        assert_eq!(walked_root_count(), baseline);
     }
 }
 

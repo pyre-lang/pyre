@@ -173,9 +173,9 @@ impl crate::Backend for SyntheticCpu {
     fn bh_call_i(
         &self,
         _func: i64,
-        _args_i: Option<&[i64]>,
-        _args_r: Option<&[i64]>,
-        _args_f: Option<&[i64]>,
+        _args_i: &[i64],
+        _args_r: &[i64],
+        _args_f: &[i64],
         _calldescr: &majit_jitcode::jitcode::BhCallDescr,
     ) -> i64 {
         unimplemented!("synthetic bh_call_i dispatch awaits cross-crate wiring")
@@ -184,9 +184,9 @@ impl crate::Backend for SyntheticCpu {
     fn bh_call_r(
         &self,
         _func: i64,
-        _args_i: Option<&[i64]>,
-        _args_r: Option<&[i64]>,
-        _args_f: Option<&[i64]>,
+        _args_i: &[i64],
+        _args_r: &[i64],
+        _args_f: &[i64],
         _calldescr: &majit_jitcode::jitcode::BhCallDescr,
     ) -> majit_ir::GcRef {
         unimplemented!("synthetic bh_call_r dispatch awaits cross-crate wiring")
@@ -195,9 +195,9 @@ impl crate::Backend for SyntheticCpu {
     fn bh_call_f(
         &self,
         _func: i64,
-        _args_i: Option<&[i64]>,
-        _args_r: Option<&[i64]>,
-        _args_f: Option<&[i64]>,
+        _args_i: &[i64],
+        _args_r: &[i64],
+        _args_f: &[i64],
         _calldescr: &majit_jitcode::jitcode::BhCallDescr,
     ) -> f64 {
         unimplemented!("synthetic bh_call_f dispatch awaits cross-crate wiring")
@@ -206,9 +206,9 @@ impl crate::Backend for SyntheticCpu {
     fn bh_call_v(
         &self,
         _func: i64,
-        _args_i: Option<&[i64]>,
-        _args_r: Option<&[i64]>,
-        _args_f: Option<&[i64]>,
+        _args_i: &[i64],
+        _args_r: &[i64],
+        _args_f: &[i64],
         _calldescr: &majit_jitcode::jitcode::BhCallDescr,
     ) {
         unimplemented!("synthetic bh_call_v dispatch awaits cross-crate wiring")

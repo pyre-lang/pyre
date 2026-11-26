@@ -295,6 +295,21 @@ fn have_debug_prints_init() -> bool {
     with_debug_state(|state, _| (state.ready & 1) != 0)
 }
 
+/// False only when debug printing is switched off for the whole process;
+/// then `have_debug_prints` is false at every call.
+pub fn debug_prints_configured() -> bool {
+    #[cfg(test)]
+    {
+        if CONFIG_OVERRIDE.with(|slot| slot.borrow().is_some()) {
+            return true;
+        }
+    }
+    if HAVE_DEBUG_PRINTS_FLAG.load(Ordering::Relaxed) == 0 {
+        let _ = have_debug_prints_init();
+    }
+    HAVE_DEBUG_PRINTS_FLAG.load(Ordering::Relaxed) != 1
+}
+
 /// `rlib/debug.py have_debug_prints_for(prefix)` — true when the
 /// configured prefix list overlaps `prefix`.
 ///
@@ -452,8 +467,8 @@ fn set_log_spec_for_test(value: Option<&str>) -> TestLogGuard {
 #[cfg(test)]
 mod tests {
     use super::{
-        debug_start, debug_stop, have_debug_prints, have_debug_prints_for, parse_majit_log,
-        set_log_spec_for_test,
+        debug_prints_configured, debug_start, debug_stop, have_debug_prints, have_debug_prints_for,
+        parse_majit_log, set_log_spec_for_test,
     };
 
     #[test]
@@ -591,5 +606,15 @@ mod tests {
         assert!(!have_debug_prints());
         debug_stop("jit-tracing");
         assert!(have_debug_prints());
+    }
+
+    #[test]
+    fn debug_prints_configured_is_true_under_enabled_override() {
+        let _guard = set_log_spec_for_test(Some("1"));
+        assert!(debug_prints_configured());
+        drop(_guard);
+        let _guard = set_log_spec_for_test(Some("jit-summary"));
+        assert!(!have_debug_prints());
+        assert!(debug_prints_configured());
     }
 }

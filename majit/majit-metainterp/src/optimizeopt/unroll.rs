@@ -419,7 +419,7 @@ pub struct UnrollOptimizer {
     pub persistent_snapshot_root_slots: Vec<usize>,
     /// `compile.py` `enable_opts` handed to `build_opt_chain` for each phase
     /// optimizer. Defaults to `ENABLE_ALL_OPTS`.
-    pub enable_opts: Vec<String>,
+    pub enable_opts: std::rc::Rc<[String]>,
 }
 
 /// Withdraws the address `publish_short_preamble_producer` installed in
@@ -604,11 +604,13 @@ impl UnrollOptimizer {
             compile_resume_memos_slot: None,
             compile_short_preamble_producer_slot: None,
             persistent_snapshot_root_slots: Vec::new(),
-            enable_opts: crate::optimizeopt::optimizer::ENABLE_ALL_OPTS
-                .split(':')
-                .filter(|name| !name.is_empty())
-                .map(String::from)
-                .collect(),
+            enable_opts: std::rc::Rc::from(
+                crate::optimizeopt::optimizer::ENABLE_ALL_OPTS
+                    .split(':')
+                    .filter(|name| !name.is_empty())
+                    .map(String::from)
+                    .collect::<Vec<_>>(),
+            ),
         }
     }
 

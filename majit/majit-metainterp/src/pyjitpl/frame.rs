@@ -26,7 +26,10 @@ fn register_to_box(opref: OpRef) -> OpBox {
     match opref.inline_const_to_value() {
         Some(majit_ir::Value::Int(v)) => OpBox::ConstInt(v),
         Some(majit_ir::Value::Float(f)) => OpBox::ConstFloat(f.to_bits()),
-        Some(majit_ir::Value::Ref(g)) => OpBox::ConstPtr(g.as_usize() as u64),
+        Some(majit_ir::Value::Ref(g)) => match opref.const_ptr_index() {
+            Some(index) => OpBox::ConstPtrIndexed(index),
+            None => OpBox::ConstPtr(g.as_usize() as u64),
+        },
         Some(majit_ir::Value::Void) => {
             panic!("register_to_box: constant {opref:?} has Void type")
         }

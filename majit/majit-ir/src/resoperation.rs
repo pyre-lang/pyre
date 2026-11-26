@@ -2161,16 +2161,36 @@ impl ArgSlot {
     /// `N_aryOp.initarglist`: `numargs` is `len(self._args)`, returned with
     /// the slot so a nested constructor cannot clobber the outer length.
     pub fn new(v: OpArgVec) -> (Self, u8) {
-        let len = store_arg_len(v.len());
-        (ArgSlot(std::cell::UnsafeCell::new(Self::pack_data(v))), len)
+        Self::from_exact_iter(v)
     }
 
-    fn pack_data(v: OpArgVec) -> ArgData {
+    /// Pack args from a slice with the same length-class layout as [`Self::new`].
+    pub fn from_slice(args: &[Operand]) -> (Self, u8) {
+        Self::from_exact_iter(args.iter().cloned())
+    }
+
+    fn from_exact_iter<I>(v: I) -> (Self, u8)
+    where
+        I: IntoIterator<Item = Operand>,
+        I::IntoIter: ExactSizeIterator,
+    {
+        let iter = v.into_iter();
+        let len = store_arg_len(iter.len());
+        (
+            ArgSlot(std::cell::UnsafeCell::new(Self::pack_data(iter))),
+            len,
+        )
+    }
+
+    fn pack_data<I>(v: I) -> ArgData
+    where
+        I: ExactSizeIterator<Item = Operand>,
+    {
         let len_us = v.len();
         if len_us <= ARG_INLINE {
             let mut inline: [std::mem::MaybeUninit<Operand>; ARG_INLINE] =
                 unsafe { std::mem::MaybeUninit::uninit().assume_init() };
-            for (i, arg) in v.into_iter().enumerate() {
+            for (i, arg) in v.enumerate() {
                 inline[i].write(arg);
             }
             ArgData {
@@ -2180,7 +2200,7 @@ impl ArgSlot {
             // 3–4 args: 32 B payload from the reserved slot slab so
             // GC_STORE's extra pair does not mint the 32-byte class.
             let ptr = alloc_arg32();
-            for (i, arg) in v.into_iter().enumerate() {
+            for (i, arg) in v.enumerate() {
                 unsafe {
                     ptr.add(i).write(arg);
                 }
@@ -2192,7 +2212,8 @@ impl ArgSlot {
                 }),
             }
         } else if len_us <= ARG_LEN_STORED_MAX as usize {
-            let mut vec = v.into_vec();
+            let mut vec = Vec::with_capacity(len_us);
+            vec.extend(v);
             let heap = ArgHeap {
                 ptr: vec.as_mut_ptr(),
                 cap: vec.capacity(),
@@ -2216,7 +2237,7 @@ impl ArgSlot {
             unsafe {
                 base.cast::<usize>().write(len_us);
                 let ptr = base.add(header).cast::<Operand>();
-                for (i, arg) in v.into_iter().enumerate() {
+                for (i, arg) in v.enumerate() {
                     ptr.add(i).write(arg);
                 }
                 ArgData {
@@ -2264,7 +2285,7 @@ impl ArgSlot {
         unsafe {
             let data = &mut *self.0.get();
             drop_arg_data(data, old_len);
-            std::ptr::write(data, Self::pack_data(v));
+            std::ptr::write(data, Self::pack_data(v.into_iter()));
         }
         new_len
     }
@@ -2456,8 +2477,13 @@ static THIN_STAMPED: std::sync::LazyLock<parking_lot::Mutex<ThinStampedTable>> =
         })
     });
 
-static THIN_STAMPED_SLOTS: [std::sync::OnceLock<ThinStamped>; THIN_STAMPED_SLOT_COUNT] =
-    [const { std::sync::OnceLock::new() }; THIN_STAMPED_SLOT_COUNT];
+/// Published `(vtable, stamp)` pairs. Slot `i` is stored with `Release`
+/// before `intern_thin_stamped` returns the id a thin word can carry.
+/// `thin_stamped_at` loads the slot with `Acquire`, pairing with that
+/// `Release` (`descr_vtable_at` / `DESCR_VTABLE_SLOTS`). Unset is 0; a set
+/// slot carries bit 63.
+static THIN_STAMPED_SLOTS: [std::sync::atomic::AtomicU64; THIN_STAMPED_SLOT_COUNT] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; THIN_STAMPED_SLOT_COUNT];
 
 /// Published vtable pointers. Slot `i` is stored with `Release` before
 /// `DESCR_VTABLE_LEN` advances to `i + 1`, and before `intern_descr_vtable`
@@ -2498,6 +2524,22 @@ fn descr_vtable_at(id: u8) -> usize {
     DESCR_VTABLE_SLOTS[id as usize].load(std::sync::atomic::Ordering::Acquire)
 }
 
+fn pack_thin_stamped(e: ThinStamped) -> u64 {
+    (u64::from(e.vtable) << 32) | u64::from(e.stamp) | (1 << 63)
+}
+
+fn unpack_thin_stamped(w: u64) -> Option<ThinStamped> {
+    if w == 0 {
+        None
+    } else {
+        let w = w & !(1 << 63);
+        Some(ThinStamped {
+            vtable: (w >> 32) as u8,
+            stamp: w as u32,
+        })
+    }
+}
+
 fn is_thin_descr(w: u64) -> bool {
     w & SLOT_BOX_BIT == 0 && w & THIN_DESCR_BIT != 0 && w & 7 == 0 && !is_stamp_inline(w)
 }
@@ -2521,7 +2563,7 @@ fn thin_stamped_at(w: u64) -> Option<ThinStamped> {
         return None;
     }
     let id = ((w >> THIN_STAMPED_ID_SHIFT) & THIN_STAMPED_ID_MASK) as usize;
-    THIN_STAMPED_SLOTS[id].get().copied()
+    unpack_thin_stamped(THIN_STAMPED_SLOTS[id].load(std::sync::atomic::Ordering::Acquire))
 }
 
 fn thin_stamp(w: u64) -> u32 {
@@ -2600,7 +2642,8 @@ fn intern_thin_stamped(vtable: u8, stamp: u32) -> Option<u64> {
         vtable,
         stamp,
         |i, key| {
-            let _ = THIN_STAMPED_SLOTS[i].set(key);
+            THIN_STAMPED_SLOTS[i]
+                .store(pack_thin_stamped(key), std::sync::atomic::Ordering::Release);
         },
     )
 }
@@ -2710,6 +2753,7 @@ unsafe fn drop_descr_extra(lo: usize, hi: usize) {
     }
 }
 
+#[inline]
 fn slot_bits(w: u64) -> (usize, usize) {
     if w == 0 || is_stamp_inline(w) {
         (0, 0)
@@ -3395,8 +3439,7 @@ impl Op {
     }
 
     pub fn new(opcode: OpCode, args: &[Operand]) -> Self {
-        let collected: OpArgVec = args.iter().cloned().collect();
-        let (args, arg_len) = ArgSlot::new(collected);
+        let (args, arg_len) = ArgSlot::from_slice(args);
         Op {
             opcode,
             type_: opcode.result_type(),
@@ -3409,8 +3452,7 @@ impl Op {
     }
 
     pub fn with_descr(opcode: OpCode, args: &[Operand], descr: DescrRef) -> Self {
-        let collected: OpArgVec = args.iter().cloned().collect();
-        let (args, arg_len) = ArgSlot::new(collected);
+        let (args, arg_len) = ArgSlot::from_slice(args);
         Op {
             opcode,
             type_: opcode.result_type(),
@@ -7926,6 +7968,8 @@ mod tests {
 
     #[test]
     fn intern_thin_stamped_reuses_id_and_roundtrips_fields() {
+        assert!(super::unpack_thin_stamped(0).is_none());
+
         let id_a = intern_thin_stamped(3, 0xABCDEF01).expect("intern first key");
         let id_a_again = intern_thin_stamped(3, 0xABCDEF01).expect("intern same key");
         assert_eq!(id_a, id_a_again);
@@ -7937,6 +7981,22 @@ mod tests {
         let e = thin_stamped_at(word).expect("reader path");
         assert_eq!(e.vtable, 3);
         assert_eq!(e.stamp, 0xABCDEF01);
+        let packed = super::pack_thin_stamped(e);
+        assert_ne!(packed, 0);
+        assert_eq!(
+            super::unpack_thin_stamped(packed).map(|x| (x.vtable, x.stamp)),
+            Some((3, 0xABCDEF01))
+        );
+
+        let packed_zero = super::pack_thin_stamped(super::ThinStamped {
+            vtable: 0,
+            stamp: 0,
+        });
+        assert_ne!(packed_zero, 0);
+        assert_eq!(
+            super::unpack_thin_stamped(packed_zero).map(|x| (x.vtable, x.stamp)),
+            Some((0, 0))
+        );
     }
 
     #[test]

@@ -2391,21 +2391,7 @@ fn materialize_str_call_for_cranelift(
         .as_call_descr()
         .expect("materialize_str_call: calldescr must downcast to CallDescr");
     let bh_calldescr = majit_jitcode::jitcode::BhCallDescr::from_call_descr(cd);
-    let result = backend.bh_call_r(
-        func,
-        if args_i.is_empty() {
-            None
-        } else {
-            Some(args_i)
-        },
-        if args_r.is_empty() {
-            None
-        } else {
-            Some(args_r)
-        },
-        None,
-        &bh_calldescr,
-    );
+    let result = backend.bh_call_r(func, args_i, args_r, &[], &bh_calldescr);
     result.0 as i64
 }
 
@@ -5714,12 +5700,12 @@ fn start_novable_bridge_session(
             storage.rd_virtuals().map_or(0, <[_]>::len),
         );
     let resume_result = majit_metainterp::ResumeDataResult {
-        frames,
-        virtualizable_boxes: Vec::new(),
-        virtualref_values: vref_values,
+        frames: ::std::rc::Rc::from(frames),
+        virtualizable_boxes: Vec::new().into(),
+        virtualref_values: ::std::rc::Rc::from(vref_values),
         storage: Some(storage.clone()),
         num_failargs,
-        fail_arg_types: retrace.fail_types.clone(),
+        fail_arg_types: ::std::rc::Rc::from(retrace.fail_types.as_slice()),
     };
 
     let Some(mainjitcode) = ({

@@ -4077,7 +4077,7 @@ fn rewrite_body(
                                     // An abort blackhole already built those
                                     // banks; a single-pass close carries them
                                     // as `TraceCtx::portal_resume_args`.
-                                    let __crn_resume = match __mp_crn {
+                                    let mut __crn_resume = match __mp_crn {
                                         Some(__resume) => __resume,
                                         None => {
                                             majit_metainterp::PortalResume::ContinueRunningNormally(
@@ -4089,7 +4089,7 @@ fn rewrite_body(
                                     if let Some(__crn_args) = __crn_resume.args() {
                                         #green_assigns
                                     }
-                                    #driver.recycle_portal_resume(__crn_resume);
+                                    #driver.recycle_portal_resume(&mut __crn_resume);
                                     // A terminal dispatch return (Finish) means
                                     // the interpreted function has returned:
                                     // exit the native dispatch loop and run its
@@ -4412,8 +4412,8 @@ fn rewrite_body(
                                             #green_assigns
                                         }
                                     }
-                                    if let Some(__crn_resume) = __back_edge_resume {
-                                        #driver_expr.recycle_portal_resume(__crn_resume);
+                                    if let Some(mut __crn_resume) = __back_edge_resume {
+                                        #driver_expr.recycle_portal_resume(&mut __crn_resume);
                                     }
                                     #finish_drain
                                     if __had_resume {

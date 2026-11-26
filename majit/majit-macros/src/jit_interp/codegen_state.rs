@@ -2237,12 +2237,12 @@ fn generate_state_fields_jit_state(
                     return None;
                 }
                 Some(majit_metainterp::ResumeDataResult {
-                    frames,
-                    virtualizable_boxes: vable_values,
-                    virtualref_values: vref_values,
+                    frames: ::std::rc::Rc::from(frames),
+                    virtualizable_boxes: ::std::rc::Rc::from(vable_values),
+                    virtualref_values: ::std::rc::Rc::from(vref_values),
                     storage: Some(storage.clone()),
                     num_failargs,
-                    fail_arg_types: fail_arg_types.to_vec(),
+                    fail_arg_types: ::std::rc::Rc::from(fail_arg_types),
                 })
             }
 

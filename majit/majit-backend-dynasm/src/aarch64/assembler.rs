@@ -23,9 +23,10 @@ use dynasmrt::{AssemblyOffset, DynamicLabel, DynasmApi, DynasmLabelApi, dynasm};
 
 use majit_backend::{
     AsmMemoryBlock, AsmMemoryManager, BackendError, JitCellToken, MachineDataBlockWrapper,
+    ResumeGuardDescr,
 };
 use majit_ir::{
-    FailDescr, FailDescrStore, InputArgRc, Op, OpCode, OpRc, OpRef, OpTypeIndex, TargetArgLoc, Type,
+    FailDescr, FailDescrStore, InputArgRc, Op, OpCode, OpRc, OpRef, TargetArgLoc, Type,
 };
 
 use crate::arch::*;
@@ -871,14 +872,6 @@ pub struct AssemblerARM64<'a> {
     /// Trace operations — borrowed for `opref_type` lookups (reads
     /// `op.type_` directly, RPython `box.type` parity).
     operations: &'a [OpRc],
-    /// `arg.index` raw -> idx in inputargs, sentinel
-    /// [`OpTypeIndex::NO_POS`] for unset slots. Mirrors
-    /// `OpTypeIndex::inputarg_pos`.
-    inputarg_pos: majit_ir::PosIndex,
-    /// `op_pos[op.pos.raw()] = idx in operations`, sentinel
-    /// [`OpTypeIndex::NO_POS`] for unset slots and Void/None ops.
-    /// Mirrors `OpTypeIndex::op_pos`.
-    op_pos: majit_ir::PosIndex,
     /// Next available frame slot index.
     next_slot: usize,
     /// Condition code from the most recent CMP/TEST instruction,
@@ -1108,17 +1101,8 @@ impl CompiledCode {
 /// else in this `impl` that stops being reached.
 impl<'a> AssemblerARM64<'a> {
     #[inline]
-    fn opref_type_at(&self, opref: OpRef, at_op_index: Option<usize>) -> Option<Type> {
-        let type_index = OpTypeIndex::from_parts(
-            self.inputargs,
-            self.operations,
-            &self.inputarg_pos,
-            &self.op_pos,
-        );
-        match at_op_index {
-            Some(at) => type_index.opref_type_at(opref, at),
-            None => type_index.opref_type(opref),
-        }
+    fn opref_type_at(&self, opref: OpRef, _at_op_index: Option<usize>) -> Option<Type> {
+        opref.ty().filter(|tp| *tp != Type::Void)
     }
 
     /// Load `pypy_threadlocal_s` from `saved_threadlocal_addr` into x16.
@@ -1146,8 +1130,6 @@ impl<'a> AssemblerARM64<'a> {
         inputargs: &'a [InputArgRc],
         operations: &'a [OpRc],
     ) -> Self {
-        let inputarg_pos = OpTypeIndex::<OpRc, InputArgRc>::build_inputarg_pos(inputargs);
-        let op_pos = OpTypeIndex::<OpRc, InputArgRc>::build_op_pos(operations);
         let datablockwrapper = MachineDataBlockWrapper::new(Arc::clone(&asm_memory_manager));
         AssemblerARM64 {
             mc: Assembler::new(0),
@@ -1167,8 +1149,6 @@ impl<'a> AssemblerARM64<'a> {
             opref_to_slot: indexmap::IndexMap::with_hasher(rustc_hash::FxBuildHasher),
             inputargs,
             operations,
-            inputarg_pos,
-            op_pos,
             next_slot: 0,
             guard_success_cc: None,
             pending_cmp_cc: None,
@@ -2531,6 +2511,9 @@ impl<'a> AssemblerARM64<'a> {
         // `self` for the walk instead of being reachable two ways.
         self.fail_descrs = FailDescrStore::with_capacity(fail_cell_capacity(ops));
         self.fail_index = 0;
+        // assembler.py pending_guard_tokens — one token per guard.
+        self.pending_guard_tokens
+            .reserve(ops.iter().filter(|op| op.opcode.is_guard()).count());
         let mut datablockwrapper = std::mem::replace(
             &mut self.datablockwrapper,
             MachineDataBlockWrapper::new(Arc::clone(&self.asm_memory_manager)),
@@ -5286,7 +5269,7 @@ impl<'a> AssemblerARM64<'a> {
                 self.pending_guard_tokens.len()
             );
         }
-        let mut stub_offsets = Vec::new();
+        let mut stub_offsets = Vec::with_capacity(self.pending_guard_tokens.len());
         for guard_token in std::mem::take(&mut self.pending_guard_tokens) {
             let fail_label = guard_token.fail_label;
             let entry = self.generate_quick_failure(guard_token, save_regs_label);
@@ -5761,7 +5744,14 @@ impl<'a> AssemblerARM64<'a> {
         }
         let inferred = self.infer_fail_arg_types(op, op_index);
         if fd.fail_arg_types() != inferred.as_slice() {
-            fd.set_fail_arg_types(inferred.into_vec());
+            if let Some(rg) = fd
+                .as_any()
+                .and_then(|a| a.downcast_ref::<ResumeGuardDescr>())
+            {
+                rg.set_fail_arg_types_from_slice(&inferred);
+            } else {
+                fd.set_fail_arg_types(inferred.into_vec());
+            }
         }
     }
 

@@ -644,9 +644,31 @@ pub fn pcseq_enabled() -> bool {
 /// Per-op trace of `run_to_end`'s dispatch loop (frame depth, pc, raw opcode).
 /// Diagnostic for pinpointing the op that faults a hardware-signal crash
 /// (SIGBUS/SIGSEGV) which `catch_unwind` cannot capture.
+///
+/// Process-global `AtomicBool`, read with Relaxed. `MIFrame.run_one_step`
+/// has no debug tracer; the flag is the print switch for the opcode path.
+static OPTRACE_FLAG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Load `MAJIT_OPTRACE` once, at `MetaInterpStaticData` / machine
+/// construction. The hot path is then a Relaxed load.
+pub(crate) fn init_optrace_from_env() {
+    static INIT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    INIT.get_or_init(|| {
+        OPTRACE_FLAG.store(
+            std::env::var_os("MAJIT_OPTRACE").is_some(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    });
+}
+
+#[inline(always)]
 pub fn optrace_enabled() -> bool {
-    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var_os("MAJIT_OPTRACE").is_some())
+    OPTRACE_FLAG.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(test)]
+pub(crate) fn set_optrace_enabled_for_test(on: bool) {
+    OPTRACE_FLAG.store(on, std::sync::atomic::Ordering::Relaxed);
 }
 
 pub fn diag_enabled() -> bool {

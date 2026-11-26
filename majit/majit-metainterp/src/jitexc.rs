@@ -236,14 +236,12 @@ impl PortalResume {
         }
     }
 
-    /// Take the banks so the driver can return them to
-    /// `recycle_merge_point_args` capacity (`portal_resume_scratch`).
-    pub fn into_args(self) -> Option<ContinueRunningNormallyArgs> {
+    pub fn args_mut(&mut self) -> Option<&mut ContinueRunningNormallyArgs> {
         match self {
             Self::ContinueRunningNormally(args) => Some(args),
             Self::DoneWithThisFrame(args)
             | Self::BailToInterpreter(args)
-            | Self::ExitFrameWithException { args, .. } => args,
+            | Self::ExitFrameWithException { args, .. } => args.as_mut(),
             Self::ResumeAt(_) => None,
         }
     }

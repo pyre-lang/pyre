@@ -22769,21 +22769,15 @@ impl majit_backend::Backend for CraneliftBackend {
     fn bh_call_i(
         &self,
         func: i64,
-        args_i: Option<&[i64]>,
-        args_r: Option<&[i64]>,
-        args_f: Option<&[i64]>,
+        args_i: &[i64],
+        args_r: &[i64],
+        args_f: &[i64],
         calldescr: &majit_jitcode::jitcode::BhCallDescr,
     ) -> i64 {
         assert_ne!(func, 0, "bh_call_i: null function pointer");
         majit_backend::call_stub::verify_result_type(calldescr.result_type, "iS");
         unsafe {
-            majit_backend::call_stub::bh_call_i_with_descr(
-                func as usize,
-                args_i,
-                args_r,
-                args_f,
-                calldescr,
-            )
+            majit_backend::call_stub::call_stub_i(func as usize, args_i, args_r, args_f, calldescr)
         }
     }
 
@@ -22794,21 +22788,15 @@ impl majit_backend::Backend for CraneliftBackend {
     fn bh_call_r(
         &self,
         func: i64,
-        args_i: Option<&[i64]>,
-        args_r: Option<&[i64]>,
-        args_f: Option<&[i64]>,
+        args_i: &[i64],
+        args_r: &[i64],
+        args_f: &[i64],
         calldescr: &majit_jitcode::jitcode::BhCallDescr,
     ) -> majit_ir::GcRef {
         assert_ne!(func, 0, "bh_call_r: null function pointer");
         majit_backend::call_stub::verify_result_type(calldescr.result_type, "r");
         let raw = unsafe {
-            majit_backend::call_stub::bh_call_i_with_descr(
-                func as usize,
-                args_i,
-                args_r,
-                args_f,
-                calldescr,
-            )
+            majit_backend::call_stub::call_stub_i(func as usize, args_i, args_r, args_f, calldescr)
         };
         majit_ir::GcRef(raw as usize)
     }
@@ -22820,21 +22808,15 @@ impl majit_backend::Backend for CraneliftBackend {
     fn bh_call_f(
         &self,
         func: i64,
-        args_i: Option<&[i64]>,
-        args_r: Option<&[i64]>,
-        args_f: Option<&[i64]>,
+        args_i: &[i64],
+        args_r: &[i64],
+        args_f: &[i64],
         calldescr: &majit_jitcode::jitcode::BhCallDescr,
     ) -> f64 {
         assert_ne!(func, 0, "bh_call_f: null function pointer");
         majit_backend::call_stub::verify_result_type(calldescr.result_type, "fL");
         unsafe {
-            majit_backend::call_stub::bh_call_f_with_descr(
-                func as usize,
-                args_i,
-                args_r,
-                args_f,
-                calldescr,
-            )
+            majit_backend::call_stub::call_stub_f(func as usize, args_i, args_r, args_f, calldescr)
         }
     }
 
@@ -22844,9 +22826,9 @@ impl majit_backend::Backend for CraneliftBackend {
     fn bh_call_v(
         &self,
         func: i64,
-        args_i: Option<&[i64]>,
-        args_r: Option<&[i64]>,
-        args_f: Option<&[i64]>,
+        args_i: &[i64],
+        args_r: &[i64],
+        args_f: &[i64],
         calldescr: &majit_jitcode::jitcode::BhCallDescr,
     ) {
         // llmodel.py bh_call_v / descr.py create_call_stub
@@ -22857,13 +22839,7 @@ impl majit_backend::Backend for CraneliftBackend {
         assert_ne!(func, 0, "bh_call_v: null function pointer");
         majit_backend::call_stub::verify_result_type(calldescr.result_type, "v");
         unsafe {
-            majit_backend::call_stub::bh_call_v_with_descr(
-                func as usize,
-                args_i,
-                args_r,
-                args_f,
-                calldescr,
-            );
+            majit_backend::call_stub::call_stub_v(func as usize, args_i, args_r, args_f, calldescr);
         }
     }
 

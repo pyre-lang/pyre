@@ -3413,18 +3413,24 @@ impl<S: JitState> JitDriver<S> {
     /// The `#[jit_interp]` expansion calls this after assigning greens so
     /// the next compiled entry reuses the Vec capacities. `ResumeAt` has
     /// no banks (`jtransform.py` `promote_greens` already passed).
-    pub fn recycle_portal_resume(&mut self, resume: PortalResume) {
-        if let Some(args) = resume.into_args() {
-            self.meta.recycle_portal_resume_args(args);
+    pub fn recycle_portal_resume(&mut self, resume: &mut PortalResume) {
+        if let Some(args) = resume.args_mut() {
+            args.green_int.clear();
+            args.green_ref.clear();
+            args.green_float.clear();
+            args.red_int.clear();
+            args.red_ref.clear();
+            args.red_float.clear();
+            std::mem::swap(args, &mut self.meta.portal_resume_scratch);
         }
     }
 
     /// Function-entry maps `PortalResume` to a pc and would otherwise drop
     /// the Vec capacities. Recycle first (`blackhole.py`
     /// `recycle_merge_point_args`).
-    fn resume_pc_recycling(&mut self, resume: PortalResume) -> Option<usize> {
+    fn resume_pc_recycling(&mut self, mut resume: PortalResume) -> Option<usize> {
         let pc = resume.resume_pc();
-        self.recycle_portal_resume(resume);
+        self.recycle_portal_resume(&mut resume);
         pc
     }
 
@@ -6061,7 +6067,17 @@ impl<S: JitState> JitDriver<S> {
                 DoorLookup::Occupied => (target_pc as u64, None),
             };
         self.back_edge_internal(
-            key, None, false, carried, target_pc, state, env, None, pre_run, None,
+            key,
+            None,
+            false,
+            carried.is_some(),
+            carried,
+            target_pc,
+            state,
+            env,
+            None,
+            pre_run,
+            None,
         )
     }
 
@@ -6080,7 +6096,17 @@ impl<S: JitState> JitDriver<S> {
                 DoorLookup::Occupied => (green_key, None),
             };
         self.back_edge_internal(
-            key, None, false, carried, target_pc, state, env, None, pre_run, None,
+            key,
+            None,
+            false,
+            carried.is_some(),
+            carried,
+            target_pc,
+            state,
+            env,
+            None,
+            pre_run,
+            None,
         )
     }
 
@@ -6181,7 +6207,17 @@ impl<S: JitState> JitDriver<S> {
             }
         };
         self.back_edge_internal(
-            key, greenargs, false, carried, target_pc, state, env, None, pre_run, pin_live,
+            key,
+            greenargs,
+            false,
+            carried.is_some(),
+            carried,
+            target_pc,
+            state,
+            env,
+            None,
+            pre_run,
+            pin_live,
         )
     }
 
@@ -6228,6 +6264,7 @@ impl<S: JitState> JitDriver<S> {
             cell_key,
             greenargs,
             false,
+            false,
             Some(procedure_token),
             target_pc,
             state,
@@ -6253,6 +6290,7 @@ impl<S: JitState> JitDriver<S> {
             cell_key,
             None,
             true,
+            false,
             Some(procedure_token),
             target_pc,
             state,
@@ -6611,7 +6649,7 @@ impl<S: JitState> JitDriver<S> {
             // `rebuild_from_resumedata` just appends them as it reads.
             let mut sections: Vec<(std::sync::Arc<crate::jitcode::JitCode>, usize)> =
                 Vec::with_capacity(resume.frames.len());
-            for frame in &resume.frames {
+            for frame in resume.frames.iter() {
                 let Some(index) = usize::try_from(frame.jitcode_index).ok() else {
                     if crate::bridge_debug_enabled() {
                         eprintln!(
@@ -7158,6 +7196,7 @@ impl<S: JitState> JitDriver<S> {
         green_key_hash: u64,
         greenargs: Option<(&[i64], &[GreenType])>,
         confirmed: bool,
+        door_checked: bool,
         carried_procedure_token: Option<std::sync::Arc<majit_backend::JitCellToken>>,
         target_pc: usize,
         state: &mut S,
@@ -7213,9 +7252,11 @@ impl<S: JitState> JitDriver<S> {
         // on another key still enters. `opimpl_jit_merge_point` records the
         // loop being traced; those back edges never reach
         // `maybe_compile_and_run`. A sibling still ticks on the occupied door
-        // below.
+        // below. `door_checked` is the `DoorLookup::Enter` proof from
+        // `try_empty_chain_tick`: that arm already tested `JC_TRACING |
+        // JC_TEMPORARY` on this cell before reading the token.
 
-        if self.cell_is_tracing(green_key) {
+        if !door_checked && self.cell_is_tracing(green_key) {
             return None;
         }
         // `EnterJitAssembler.procedure_token` is a live reference for the
@@ -7279,6 +7320,7 @@ impl<S: JitState> JitDriver<S> {
         #[cfg(feature = "__back-edge-stage-probe")]
         let stage_repeats = back_edge_stage_repeats();
         if let Some(procedure_token) = entry_procedure_token {
+            let mut pre_run = Some(pre_run);
             // warmstate.py maybe_compile_and_run: confirm_enter_jit(*args)
             // with the portal greens then reds first, then unspecialize
             // reds for EnterJitAssembler. Confirm before extracting
@@ -7320,6 +7362,61 @@ impl<S: JitState> JitDriver<S> {
                 {
                     return None;
                 }
+            }
+            // `warmstate.py maybe_compile_and_run` unspecializes the reds to
+            // words and `execute_assembler` hands them to the backend. Same
+            // contract as `enter_compiled_function_entry`; a state that
+            // declines, an unpatched token, LABEL-ordered values, a
+            // virtualizable driver or a live recording context take the
+            // typed path below.
+            if direct_live_values.is_none()
+                && self.meta.tracing.is_none()
+                && self.meta.virtualizable_info().is_none()
+            {
+                let mut scratch = self.take_entry_scratch_raw();
+                if state.fill_entry_raw_reds(&mut scratch.raw)
+                    && procedure_token.inputarg_types().len() <= scratch.raw.len()
+                {
+                    if self.meta.hooks.on_compiled_entry.is_some() {
+                        self.enter_compiled_entry_hook(green_key, target_pc);
+                    }
+                    if let Some(f) = pre_run.take() {
+                        f();
+                    }
+                    let polled = if self.meta.result_type == Type::Ref {
+                        self.meta
+                            .poll_raw_ref_finish_raw(&procedure_token, green_key, &scratch.raw)
+                            .map(|addr| addr as i64)
+                    } else {
+                        self.meta
+                            .poll_raw_int_finish_raw(&procedure_token, green_key, &scratch.raw)
+                    };
+                    self.entry_scratch_out(scratch);
+                    return match polled {
+                        Ok(value) => {
+                            self.meta.back_edge_finish = None;
+                            self.meta.back_edge_finish_word = Some(value);
+                            self.meta.single_pass_finish = true;
+                            Some(PortalResume::DoneWithThisFrame(None))
+                        }
+                        Err(frame) => {
+                            let live_meta = state.build_meta(target_pc, env);
+                            self.dispatch_handle_fail(
+                                green_key,
+                                target_pc,
+                                state,
+                                env,
+                                frame,
+                                &live_meta,
+                                None,
+                                0,
+                                portal_rca_enabled(),
+                                None,
+                            )
+                        }
+                    };
+                }
+                self.entry_scratch_out(scratch);
             }
             let mut scratch = self.take_entry_scratch();
             let values_are_label_ordered = direct_live_values.is_some();
@@ -7501,7 +7598,9 @@ impl<S: JitState> JitDriver<S> {
                 );
             }
 
-            pre_run();
+            if let Some(f) = pre_run.take() {
+                f();
+            }
 
             // Host entry is dispatch key 0 (`warmstate.py execute_assembler`).
             let selected_dispatch_key = 0u32;
@@ -8287,6 +8386,14 @@ impl<S: JitState> JitDriver<S> {
             // `BlackholeInterpBuilder.acquire_interp`).
             if self.state_field_layout.total_live_values() == 0 {
                 self.state_field_layout = state.state_field_layout();
+                // `blackhole.py BlackholeInterpBuilder.__init__` fixes the
+                // builder's metadata once; the layout of a state type never
+                // changes, so it is handed over where it is first computed.
+                self.meta
+                    .staticdata
+                    .blackholeinterpbuilder
+                    .borrow_mut()
+                    .state_field_layout = self.state_field_layout.clone();
             }
             let cpu = self.meta.blackhole_cpu();
             let jitdrivers_sd = bh_jitdrivers_sd(&self.meta.staticdata);
@@ -8302,9 +8409,6 @@ impl<S: JitState> JitDriver<S> {
                 // is the one `finish_setup` installed.
                 if !std::sync::Arc::ptr_eq(&bh_builder.jitdrivers_sd, jitdrivers_sd) {
                     bh_builder.setup_jitdrivers_sd(std::sync::Arc::clone(jitdrivers_sd));
-                }
-                if bh_builder.state_field_layout != self.state_field_layout {
-                    bh_builder.state_field_layout = self.state_field_layout.clone();
                 }
                 crate::resume::blackhole_from_resumedata(
                     &mut bh_builder,
@@ -8417,10 +8521,8 @@ impl<S: JitState> JitDriver<S> {
                         // across the restore below, which can collect.
                         let args_root_depth = majit_gc::shadow_stack::resume_ref_roots_depth();
                         unsafe {
-                            majit_gc::shadow_stack::push_resume_ref_roots(
+                            majit_gc::shadow_stack::push_resume_ref_roots_pair(
                                 args.green_ref.as_mut_slice(),
-                            );
-                            majit_gc::shadow_stack::push_resume_ref_roots(
                                 args.red_ref.as_mut_slice(),
                             );
                         }
@@ -9416,19 +9518,31 @@ impl<S: JitState> JitDriver<S> {
     /// the per-entry paths only read through it.
     /// Address of the cached driver descriptor. The `Arc` in
     /// [`Self::descriptor_cache`] keeps it alive for the driver's life.
+    #[inline(always)]
     fn driver_descriptor_ptr(
         &mut self,
         state: &S,
         meta: &S::Meta,
     ) -> Option<*const JitDriverStaticData> {
-        if self.descriptor_cache.is_none() {
-            let resolved = self
-                .descriptor
-                .clone()
-                .or_else(|| state.driver_descriptor(meta))
-                .map(std::sync::Arc::new);
-            self.descriptor_cache = Some(resolved);
+        if let Some(cached) = self.descriptor_cache.as_ref() {
+            return cached.as_ref().map(std::sync::Arc::as_ptr);
         }
+        self.init_driver_descriptor_ptr(state, meta)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn init_driver_descriptor_ptr(
+        &mut self,
+        state: &S,
+        meta: &S::Meta,
+    ) -> Option<*const JitDriverStaticData> {
+        let resolved = self
+            .descriptor
+            .clone()
+            .or_else(|| state.driver_descriptor(meta))
+            .map(std::sync::Arc::new);
+        self.descriptor_cache = Some(resolved);
         self.descriptor_cache
             .as_ref()
             .and_then(|cached| cached.as_ref().map(std::sync::Arc::as_ptr))
@@ -9605,23 +9719,24 @@ impl<S: JitState> JitDriver<S> {
         meta: &S::Meta,
         virtualizable: Option<&JitDriverVar>,
     ) -> bool {
+        let info_ptr = self.meta.virtualizable_info().map(std::sync::Arc::as_ptr);
+        // SAFETY: MetaInterp owns this Arc for its lifetime and this function
+        // never replaces it.
+        let info = info_ptr.map(|ptr| unsafe { &*ptr });
+
         // Descriptor-gated token-reset path — RPython
         // compile.py::sync_before_jit calls `vinfo.reset_vable_token(virt)`
         // when the JitDriver has a virtualizable declared.  Pyre routes
         // this through the interpreter's `sync_named_virtualizable_before_jit`.
         if let Some(virtualizable) = virtualizable {
-            let ok = state.sync_named_virtualizable_before_jit(
-                meta,
-                &virtualizable.name,
-                self.meta.virtualizable_info().map(|a| a.as_ref()),
-            );
+            let ok = state.sync_named_virtualizable_before_jit(meta, &virtualizable.name, info);
             if !ok {
                 return false;
             }
         }
         // `execute_assembler` clears the vable token only `if vinfo is not None`.
         // A driver with no virtualizable info has nothing to reset.
-        if virtualizable.is_none() && self.meta.virtualizable_info().is_none() {
+        if virtualizable.is_none() && info.is_none() {
             return true;
         }
 
@@ -9633,8 +9748,7 @@ impl<S: JitState> JitDriver<S> {
         // interpreter hooks without going through the descriptor.
         self.meta.set_vable_ptr(std::ptr::null());
         self.meta.set_vable_array_lengths(Vec::new());
-        let info_clone = self.meta.virtualizable_info().cloned();
-        if let Some(ref info) = info_clone {
+        if let Some(info) = info {
             if let Some(ptr) = state.virtualizable_heap_ptr(meta, &info.name, info) {
                 self.meta.set_vable_ptr(ptr.cast_const());
                 // The entry names the frame this run executes.  The exits
@@ -12845,6 +12959,9 @@ mod tests {
         live_values: Vec<i64>,
         restored_values: Vec<Value>,
         restore_called: bool,
+        build_meta_calls: std::cell::Cell<u32>,
+        fill_entry_reds_without_meta_calls: std::cell::Cell<u32>,
+        extract_live_values_into_calls: std::cell::Cell<u32>,
     }
 
     #[derive(Default)]
@@ -12871,13 +12988,30 @@ mod tests {
         type Sym = ();
         type Env = ();
 
-        fn build_meta(&self, _header_pc: usize, _env: &Self::Env) -> Self::Meta {}
+        fn build_meta(&self, _header_pc: usize, _env: &Self::Env) -> Self::Meta {
+            self.build_meta_calls.set(self.build_meta_calls.get() + 1);
+        }
 
         fn extract_live(&mut self, _meta: &Self::Meta) -> Vec<i64> {
             self.live_values.clone()
         }
 
+        fn extract_live_values_into(
+            &mut self,
+            meta: &Self::Meta,
+            out: &mut Vec<Value>,
+            raw: &mut Vec<i64>,
+            types: &mut Vec<Type>,
+        ) {
+            self.extract_live_values_into_calls
+                .set(self.extract_live_values_into_calls.get() + 1);
+            let _ = (raw, types);
+            out.extend(self.extract_live_values(meta));
+        }
+
         fn fill_entry_reds_without_meta(&mut self, out: &mut Vec<Value>) -> bool {
+            self.fill_entry_reds_without_meta_calls
+                .set(self.fill_entry_reds_without_meta_calls.get() + 1);
             out.extend(self.live_values.iter().copied().map(Value::Int));
             true
         }
@@ -14084,6 +14218,7 @@ mod tests {
         let label_outcome = driver.back_edge_internal(
             hash,
             None,
+            false,
             false,
             Some(token),
             19,
@@ -15841,6 +15976,38 @@ mod tests {
             compiled_entries.load(std::sync::atomic::Ordering::Relaxed),
             1,
             "fill_entry_raw_reds true enters without a compiled_loops row"
+        );
+    }
+
+    #[test]
+    fn fill_entry_raw_reds_enters_compiled_back_edge_without_typed_extract() {
+        // `warmstate.py maybe_compile_and_run` unspecializes reds to words
+        // and `execute_assembler` hands them to the backend.
+        let (mut driver, hash, _key) = confirm_enter_jit_hook_compiled_loop(10);
+        let token = driver
+            .runnable_procedure_token(hash)
+            .expect("the cell still holds a this-driver token");
+        let mut state = TypedRestoreState {
+            live_values: vec![4],
+            ..Default::default()
+        };
+        let outcome = driver.back_edge_resolved(hash, token, None, 19, &mut state, &(), || {});
+        assert_eq!(
+            outcome,
+            Some(PortalResume::DoneWithThisFrame(Some(
+                ContinueRunningNormallyArgs::default()
+            ))),
+            "the fixture token's GuardFalse fail is the compiled finish"
+        );
+        assert_eq!(
+            state.fill_entry_reds_without_meta_calls.get(),
+            0,
+            "raw red path must not call fill_entry_reds_without_meta"
+        );
+        assert_eq!(
+            state.extract_live_values_into_calls.get(),
+            0,
+            "raw red path must not call extract_live_values_into"
         );
     }
 
@@ -17897,12 +18064,12 @@ mod tests {
                 // trait stub, the fixture admits the symbolic setup path.
                 assert!(fail_arg_types.is_empty());
                 Some(crate::ResumeDataResult {
-                    frames: vec![],
-                    virtualizable_boxes: vec![],
-                    virtualref_values: vec![],
+                    frames: vec![].into(),
+                    virtualizable_boxes: vec![].into(),
+                    virtualref_values: vec![].into(),
                     storage: storage.cloned(),
                     num_failargs: 0,
-                    fail_arg_types: vec![],
+                    fail_arg_types: vec![].into(),
                 })
             }
         }
@@ -17994,12 +18161,12 @@ mod tests {
             ) -> Option<crate::ResumeDataResult> {
                 assert!(fail_arg_types.is_empty());
                 Some(crate::ResumeDataResult {
-                    frames: vec![],
-                    virtualizable_boxes: vec![],
-                    virtualref_values: vec![],
+                    frames: vec![].into(),
+                    virtualizable_boxes: vec![].into(),
+                    virtualref_values: vec![].into(),
                     storage: storage.cloned(),
                     num_failargs: 0,
-                    fail_arg_types: vec![],
+                    fail_arg_types: vec![].into(),
                 })
             }
         }
@@ -18133,12 +18300,12 @@ mod tests {
             ) -> Option<crate::ResumeDataResult> {
                 assert!(fail_arg_types.is_empty());
                 Some(crate::ResumeDataResult {
-                    frames: vec![],
-                    virtualizable_boxes: vec![],
-                    virtualref_values: vec![],
+                    frames: vec![].into(),
+                    virtualizable_boxes: vec![].into(),
+                    virtualref_values: vec![].into(),
                     storage: storage.cloned(),
                     num_failargs: 0,
-                    fail_arg_types: vec![],
+                    fail_arg_types: vec![].into(),
                 })
             }
         }
@@ -18223,12 +18390,12 @@ mod tests {
             ) -> Option<crate::ResumeDataResult> {
                 assert!(fail_arg_types.is_empty());
                 Some(crate::ResumeDataResult {
-                    frames: vec![],
-                    virtualizable_boxes: vec![],
-                    virtualref_values: vec![],
+                    frames: vec![].into(),
+                    virtualizable_boxes: vec![].into(),
+                    virtualref_values: vec![].into(),
                     storage: storage.cloned(),
                     num_failargs: 0,
-                    fail_arg_types: vec![],
+                    fail_arg_types: vec![].into(),
                 })
             }
         }
@@ -18365,12 +18532,13 @@ mod tests {
                         jitcode_index: 0,
                         pc: 0,
                         values: vec![],
-                    }],
-                    virtualizable_boxes: vec![],
-                    virtualref_values: vec![],
+                    }]
+                    .into(),
+                    virtualizable_boxes: vec![].into(),
+                    virtualref_values: vec![].into(),
                     storage: storage.cloned(),
                     num_failargs: 0,
-                    fail_arg_types: vec![],
+                    fail_arg_types: vec![].into(),
                 })
             }
             fn prepare_bridge_resume(
@@ -18537,12 +18705,13 @@ mod tests {
                         jitcode_index: 0,
                         pc: 0,
                         values: vec![],
-                    }],
-                    virtualizable_boxes: vec![],
-                    virtualref_values: vec![],
+                    }]
+                    .into(),
+                    virtualizable_boxes: vec![].into(),
+                    virtualref_values: vec![].into(),
                     storage: storage.cloned(),
                     num_failargs: 0,
-                    fail_arg_types: vec![],
+                    fail_arg_types: vec![].into(),
                 })
             }
             fn consume_vref_and_vable_boxes(
@@ -19239,6 +19408,7 @@ mod tests {
             hash,
             Some((key.values.as_slice(), key.types.as_slice())),
             false,
+            false,
             None,
             19,
             &mut state,
@@ -19255,6 +19425,7 @@ mod tests {
         let carried = driver.back_edge_internal(
             hash,
             None,
+            false,
             false,
             Some(token),
             19,

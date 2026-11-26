@@ -1250,15 +1250,20 @@ impl OwnerRootGuard {
     pub fn get(&self) -> GcRef {
         // SAFETY: `roots` is this thread's own `OWNER_ROOTS` cell, alive for
         // as long as the guard (which cannot leave the thread), and the slot
-        // stays acquired until `Drop`.
-        unsafe { (*self.roots).borrow()[self.index].expect("inactive owner-root guard") }
+        // stays acquired until `Drop`. The slot is read through the cell's
+        // raw view, the way a translated function reads its root-stack slot
+        // by fixed offset (`shadowstack.py` `push_roots`): no reference into
+        // the vector is held across this statement, so a collector walk or
+        // an `acquire_owner_root` on this thread cannot observe one.
+        unsafe { (&*(*self.roots).as_ptr())[self.index].expect("inactive owner-root guard") }
     }
 
     #[inline]
     pub fn set(&self, root: GcRef) {
-        // SAFETY: same cell and slot lifetime as [`Self::get`].
+        // SAFETY: same cell and slot lifetime as [`Self::get`]. The slot is
+        // written through the same raw view.
         unsafe {
-            (*self.roots).borrow_mut()[self.index] = Some(root);
+            (&mut *(*self.roots).as_ptr())[self.index] = Some(root);
         }
     }
 }
@@ -2297,6 +2302,56 @@ pub unsafe fn push_resume_ref_roots(slice: &mut [i64]) {
     });
 }
 
+/// Register two ref slices in one TLS trip.
+///
+/// `warmspot.py handle_jitexception` keeps ContinueRunningNormally's green
+/// and red GCREF lists as two livevars; `ShadowStackFrameworkGCTransformer.push_roots`
+/// spills each around the restore. Same two `ResumeRefRoots` entries as two
+/// [`push_resume_ref_roots`] calls.
+///
+/// # Safety
+/// Both slices must remain alive and at a fixed address until the matching
+/// `pop_resume_ref_roots_to` runs.
+#[inline]
+#[track_caller]
+pub unsafe fn push_resume_ref_roots_pair(a: &mut [i64], b: &mut [i64]) {
+    if a.is_empty() && b.is_empty() {
+        return;
+    }
+    debug_assert!(
+        a.is_empty() || !crate::gc_is_nursery_object(a.as_ptr() as usize),
+        "GC BUG: resume root slice points inside the movable nursery: ptr={:#x} len={} caller={}",
+        a.as_ptr() as usize,
+        a.len(),
+        std::panic::Location::caller(),
+    );
+    debug_assert!(
+        b.is_empty() || !crate::gc_is_nursery_object(b.as_ptr() as usize),
+        "GC BUG: resume root slice points inside the movable nursery: ptr={:#x} len={} caller={}",
+        b.as_ptr() as usize,
+        b.len(),
+        std::panic::Location::caller(),
+    );
+    RESUME_REF_ROOTS_STACK.with(|ss| {
+        // SAFETY: the stack is only touched by its own thread; other threads read it only with that mutator stopped.
+        let entries = unsafe { &mut *ss.entries.get() };
+        if !a.is_empty() {
+            entries.push(ResumeRefRoots {
+                ptr: a.as_mut_ptr().cast(),
+                len: a.len(),
+                stride: std::mem::size_of::<i64>(),
+            });
+        }
+        if !b.is_empty() {
+            entries.push(ResumeRefRoots {
+                ptr: b.as_mut_ptr().cast(),
+                len: b.len(),
+                stride: std::mem::size_of::<i64>(),
+            });
+        }
+    });
+}
+
 /// Pop resume-construction ref-slice roots back to the given depth.
 pub fn pop_resume_ref_roots_to(depth: usize) {
     let _ = RESUME_REF_ROOTS_STACK.try_with(|ss| {
@@ -2847,6 +2902,32 @@ mod tests {
         pop_resume_ref_roots_to(depth);
         assert_eq!(fields.0, [0x1111, 0x2010, 0x3333]);
         assert_eq!(registers, [0x4010, 0x5010]);
+    }
+
+    /// Two CRN lists become two resume-ref entries in one TLS trip; a
+    /// walk forwards both; empty+empty leaves the depth unchanged.
+    #[test]
+    fn push_resume_ref_roots_pair_registers_green_and_red() {
+        let _lock = TEST_MUTEX.lock();
+        let mut green = [0x6000_i64, 0x7000];
+        let mut red = [0x8000_i64];
+        let depth = resume_ref_roots_depth();
+        unsafe {
+            push_resume_ref_roots_pair(&mut green, &mut red);
+        }
+        assert!(resume_ref_slice_registered(green.as_ptr()));
+        assert!(resume_ref_slice_registered(red.as_ptr()));
+        assert_eq!(resume_ref_roots_depth(), depth + 2);
+        walk_resume_ref_roots(|slot| slot.0 += 0x10);
+        assert_eq!(green, [0x6010, 0x7010]);
+        assert_eq!(red, [0x8010]);
+        pop_resume_ref_roots_to(depth);
+        assert_eq!(resume_ref_roots_depth(), depth);
+
+        unsafe {
+            push_resume_ref_roots_pair(&mut [], &mut []);
+        }
+        assert_eq!(resume_ref_roots_depth(), depth);
     }
 
     fn jf_root_stack_base_for_test() -> usize {

@@ -645,11 +645,13 @@ fn main() {
         // `MiniMarkGC.collection_counts` — real minor collections, not the
         // `HostNurseryClock` byte quantum. `PYPYLOG=gc-minor` is not wired
         // on this example; the count is the stats line beside the bridges.
+        // The host clock's own hook calls are the next line.
         let (minors, _) = majit_gc::gc_sync::gc_op(|gc| {
             use majit_gc::GcAllocator;
             gc.collection_counts()
         });
         eprintln!("minor collections {minors}");
+        eprintln!("host clock ticks {}", majit_gc::synthetic_ticks());
     }
 
     if bad != 0 {

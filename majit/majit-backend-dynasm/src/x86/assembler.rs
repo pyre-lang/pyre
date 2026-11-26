@@ -64,7 +64,7 @@ use majit_backend::{
     AsmMemoryBlock, AsmMemoryManager, BackendError, JitCellToken, MachineDataBlockWrapper,
 };
 use majit_ir::{
-    FailDescr, FailDescrStore, InputArgRc, Op, OpCode, OpRc, OpRef, OpTypeIndex, TargetArgLoc, Type,
+    FailDescr, FailDescrStore, InputArgRc, Op, OpCode, OpRc, OpRef, TargetArgLoc, Type,
 };
 
 use crate::arch::*;
@@ -2081,14 +2081,6 @@ pub struct Assembler386<'a> {
     /// Trace operations — borrowed for `opref_type` lookups (reads
     /// `op.type_` directly, RPython `box.type` parity).
     operations: &'a [OpRc],
-    /// `arg.index` raw -> idx in inputargs, sentinel
-    /// [`OpTypeIndex::NO_POS`] for unset slots. Mirrors
-    /// `OpTypeIndex::inputarg_pos`.
-    inputarg_pos: majit_ir::PosIndex,
-    /// `op_pos[op.pos.raw()] = idx in operations`, sentinel
-    /// [`OpTypeIndex::NO_POS`] for unset slots and Void/None ops.
-    /// Mirrors `OpTypeIndex::op_pos`.
-    op_pos: majit_ir::PosIndex,
     /// Next available frame slot index.
     next_slot: usize,
     /// Condition code from the most recent CMP/TEST instruction,
@@ -2350,17 +2342,8 @@ static FLOAT_CONST_ABS: AlignedPdConst = AlignedPdConst([
 /// stops being reached.
 impl<'a> Assembler386<'a> {
     #[inline]
-    fn opref_type_at(&self, opref: OpRef, at_op_index: Option<usize>) -> Option<Type> {
-        let type_index = OpTypeIndex::from_parts(
-            self.inputargs,
-            self.operations,
-            &self.inputarg_pos,
-            &self.op_pos,
-        );
-        match at_op_index {
-            Some(at) => type_index.opref_type_at(opref, at),
-            None => type_index.opref_type(opref),
-        }
+    fn opref_type_at(&self, opref: OpRef, _at_op_index: Option<usize>) -> Option<Type> {
+        opref.ty().filter(|tp| *tp != Type::Void)
     }
     /// assembler.py:54 __init__
     pub(crate) fn new(
@@ -2387,8 +2370,6 @@ impl<'a> Assembler386<'a> {
         inputargs: &'a [InputArgRc],
         operations: &'a [OpRc],
     ) -> Self {
-        let inputarg_pos = OpTypeIndex::<OpRc, InputArgRc>::build_inputarg_pos(inputargs);
-        let op_pos = OpTypeIndex::<OpRc, InputArgRc>::build_op_pos(operations);
         let datablockwrapper = MachineDataBlockWrapper::new(Arc::clone(&asm_memory_manager));
         Assembler386 {
             mc: LocationCodeBuilder::new(),
@@ -2407,8 +2388,6 @@ impl<'a> Assembler386<'a> {
             opref_to_slot: IndexMap::with_hasher(rustc_hash::FxBuildHasher),
             inputargs,
             operations,
-            inputarg_pos,
-            op_pos,
             next_slot: 0,
             guard_success_cc: None,
             target_tokens_currently_compiling: IndexMap::new(),
@@ -3560,6 +3539,9 @@ impl<'a> Assembler386<'a> {
         // (`_relative_unaryop`), not before every op.
         self.fail_descrs = FailDescrStore::with_capacity(fail_cell_capacity(ops));
         self.fail_index = 0;
+        // assembler.py pending_guard_tokens — one token per guard.
+        self.pending_guard_tokens
+            .reserve(ops.iter().filter(|op| op.opcode.is_guard()).count());
         let mut datablockwrapper = std::mem::replace(
             &mut self.datablockwrapper,
             MachineDataBlockWrapper::new(Arc::clone(&self.asm_memory_manager)),
@@ -6259,7 +6241,7 @@ impl<'a> Assembler386<'a> {
                 self.pending_guard_tokens.len()
             );
         }
-        let mut stub_offsets = Vec::new();
+        let mut stub_offsets = Vec::with_capacity(self.pending_guard_tokens.len());
         for guard_token in std::mem::take(&mut self.pending_guard_tokens) {
             stub_offsets.push(self.generate_quick_failure(guard_token));
         }

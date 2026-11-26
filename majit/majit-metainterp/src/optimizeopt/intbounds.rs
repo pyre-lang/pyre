@@ -116,9 +116,8 @@ impl OptIntBoundsState {
 
     /// Resolve an operand to its forwarded terminal, the `op =
     /// get_box_replacement(op)` step shared by every `optimize_INT_*` body
-    /// (intbounds.py / optimizer.py). The dispatch-entry rebind
-    /// registers a canonical host for every operand, so `get_box_replacement`
-    /// is total and resolves to a bound terminal. The returned box is the
+    /// (intbounds.py / optimizer.py). `get_box_replacement` walks
+    /// `_forwarded` to the bound terminal. The returned box is the
     /// operand the bound and the `arg0 is arg1` identity check both read.
     pub(super) fn resolve_box(&self, arg: &Operand, ctx: &mut OptContext) -> Operand {
         ctx.resolve_operand_operand(arg)
@@ -1067,10 +1066,9 @@ impl OptIntBoundsState {
         ctx: &mut OptContext,
     ) {
         let arg0 = op_rc.arg(0);
-        // optimizer.py `getintbound` lazy-installs unbounded; the
-        // dispatch-entry rebind registers the operand, so `resolve_operand_operand`
-        // resolves to the bound host the is_raw_ptr read and the downstream
-        // bound write both use.
+        // optimizer.py `getintbound` lazy-installs unbounded.
+        // `resolve_operand_operand` walks `_forwarded` to the bound host
+        // the is_raw_ptr read and the downstream bound write both use.
         let arg0_box = self.resolve_box(&arg0, ctx);
         if ctx.is_raw_ptr(&arg0_box) {
             return;
@@ -2646,9 +2644,7 @@ mod tests {
     #[test]
     fn test_int_and_x_x() {
         // `a` is an unproduced header input (oparser `[i0]`): model it as an
-        // InputArg so the production driver's dispatch-entry rebind resolves
-        // it through the OpRef store (no detached bound producer to strand the
-        // `_forwarded` chain). Both args share position 0 ⇒ `same_box` holds.
+        // InputArg. Both args share position 0 ⇒ `same_box` holds.
         let a = rooted_inputarg_operand(Type::Int, 0);
         let ops = vec![make_op(OpCode::IntAnd, &[a.clone(), a], 1)];
         let result = run_pass(&ops);

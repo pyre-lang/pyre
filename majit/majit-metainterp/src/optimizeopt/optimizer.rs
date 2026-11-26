@@ -2774,6 +2774,111 @@ impl Optimizer {
         self.compile_live_op_roots_slot = slot;
     }
 
+    /// Force, rewrite, and send a non-bridge terminal JUMP/FINISH.
+    ///
+    /// `Optimizer._propagate_all_forward` with `flush=True` sends `last_op`
+    /// after `flush`. `UnrollOptimizer.optimize_preamble` /
+    /// `UnrollOptimizer.optimize_peeled_loop` keep `skip_flush` so the
+    /// rewritten op is parked on `terminal_op` (`BasicLoopInfo.jump_op`)
+    /// instead of being sent. A bridge never calls this: its JUMP stays
+    /// untouched until `UnrollOptimizer.optimize_bridge`.
+    fn prepare_and_send_terminal_operation(
+        &mut self,
+        terminal_op: OpRc,
+        ctx: &mut OptContext,
+    ) -> Result<(), crate::optimize::InvalidLoop> {
+        // `UnrollOptimizer.optimize_peeled_loop`:
+        //   for a in end_jump.getarglist():
+        //       self.force_box_for_end_of_preamble(get_box_replacement(a))
+        //
+        // Call force_at_the_end_of_preamble on ALL args (not just
+        // Ref-mismatch ones). Optimizer.force_box_for_end_of_preamble
+        // handles both Ref virtuals (type 'r') and raw-ptr-int (type 'i'):
+        //   - Ref virtual: recursively process fields, keep virtual alive
+        //   - Raw ptr int: force via optearlyforce
+        //   - Non-virtual: return get_box_replacement(op) unchanged
+        //
+        // Additionally, in majit OpRef forwarding is typeless, so a Ref
+        // virtual can forward to a Float (SameAsF). When that happens,
+        // force_box materializes the virtual to preserve Ref type.
+        let inputargs = self.trace_inputargs.clone();
+        // Phase 1: resolve and call force_at_the_end_of_preamble on all args
+        for arg in terminal_op.args_slice().iter() {
+            self.force_box_for_end_of_preamble(&arg.get_box_replacement(false), ctx);
+        }
+        // Phase 2: re-resolve after forcing (force may have changed forwarding)
+        // and fix Ref→non-Ref type crossings by force_box
+        let mut force_needed: Vec<usize> = Vec::new();
+        // optimizer.py force_box loop parity:
+        //   for i in range(op.numargs()): op.setarg(i, force_box(...))
+        //
+        // `trace_inputargs` names the positions this JUMP writes into only
+        // on the unroll paths, where `OptUnroll.export_state` builds
+        // `end_args` from `original_label_args`: the preamble closes back
+        // to the loop start, and the peeled body closes back to the LABEL
+        // made from those same args. A bridge's JUMP targets a different
+        // trace's label while `trace_inputargs` holds the guard's failargs
+        // — two unrelated lists, so a positional Ref check reads arbitrary
+        // positions. There the type contract belongs to virtual-state
+        // matching (`VirtualState.generate_guards`), and what applies here
+        // is the plain force_box loop.
+        let inputargs_are_the_jump_target = !self.building_bridge;
+        for i in 0..terminal_op.num_args() {
+            let arg = terminal_op.arg(i);
+            let resolved_box = ctx.resolve_operand_operand(&arg);
+            let expected_ref = inputargs_are_the_jump_target
+                && i < inputargs.len()
+                && inputargs[i].type_() == majit_ir::Type::Ref;
+            // setup_optimizations seeds `trace_inputargs` into
+            // ctx.inputargs (`optimizer.py Optimizer.__init__`).
+            // The replacement box carries `Box.type` (`Operand::type_`);
+            // PtrInfo presence is an additional Ref-only side channel
+            // for inputargs not in `new_operations`.
+            let resolved_has_ptr_info = ctx.has_ptr_info(&resolved_box);
+            let resolved_is_ref =
+                resolved_box.type_() == majit_ir::Type::Ref || resolved_has_ptr_info;
+            if expected_ref && !resolved_is_ref && resolved_box.const_value().is_none() {
+                let arg_is_virtual = ctx.is_virtual(&resolved_box);
+                if arg_is_virtual {
+                    force_needed.push(i);
+                } else {
+                    // A ref-typed box never forwards to an int/float box.
+                    // majit's flat OpRef forwarding can collapse a boxed
+                    // W_Int/W_Float local to its raw payload, but
+                    // end-of-preamble JUMP args must preserve the ref box
+                    // identity at ref-typed positions.
+                    //
+                    // Keep the original ref-typed arg instead of substituting
+                    // the non-ref replacement. This matches the
+                    // Optimizer.force_box_for_end_of_preamble contract more
+                    // closely than allowing Ref -> Float/Int type
+                    // substitution at the JUMP.
+                    if crate::majit_log_enabled() {
+                        eprintln!(
+                            "[jump-type] arg {i}: label position is Ref, replacement is not; \
+                             keeping the original arg"
+                        );
+                    }
+                }
+            } else {
+                terminal_op.setarg(i, resolved_box);
+            }
+        }
+        for i in force_needed {
+            let original = terminal_op.arg(i);
+            let b_forced = self.force_box(&original, ctx);
+            terminal_op.setarg(i, b_forced);
+        }
+        if self.skip_flush {
+            // flush=False: store for caller to consume.
+            self.terminal_op = Some(terminal_op);
+        } else {
+            // flush=True: send through passes (`Optimizer._propagate_all_forward`).
+            self.send_extra_operation(&terminal_op, ctx)?;
+        }
+        Ok(())
+    }
+
     /// opencoder.py `_index` parity entry point.
     ///
     /// Optimizes a slice of ops whose `pos`/`args` reference OpRefs in a
@@ -3213,13 +3318,15 @@ impl Optimizer {
             self.propagate_one(op, &mut ctx)?;
         }
 
-        // RPython: flush() before JUMP processing (export_state calls flush
-        // before get_virtual_state). Phase 2 skips flush.
-        if !self.skip_flush {
+        // Optimizer._propagate_all_forward: flush() before JUMP is sent.
+        // `flush=False` (optimize_preamble / optimize_peeled_loop /
+        // UnrollOptimizer.optimize_bridge) neither flushes nor sends last_op.
+        let defer_bridge_terminal = self.building_bridge;
+        if !self.skip_flush && !defer_bridge_terminal {
             self.flush(&mut ctx)?;
         }
 
-        // RPython unroll.py:454-457:
+        // OptUnroll.export_state:
         //     end_args = [self.optimizer.force_box_for_end_of_preamble(a)
         //                 for a in original_label_args]
         //     self.optimizer.flush()
@@ -3237,116 +3344,41 @@ impl Optimizer {
         //
         // Capture is performed below, *after* the terminal_op force pass
         // and `flush()` have run inside the `exported_loop_state` map
-        // closure, mirroring RPython's order. Keep the raw jump args here:
-        // unroll.py:452-455 passes `original_label_args` directly to
-        // `force_box_for_end_of_preamble`, and optimizer.py returns
-        // the original box unchanged when no force is required.
-        let pre_jump_resolved_args = last_op
-            .as_ref()
-            .filter(|op| op.opcode == OpCode::Jump)
-            .map(|jump_op| jump_op.getarglist_copy());
+        // closure, mirroring OptUnroll.export_state order. Keep the raw
+        // jump args here: export_state passes `original_label_args` directly
+        // to `force_box_for_end_of_preamble`, and
+        // Optimizer.force_box_for_end_of_preamble returns the original box
+        // unchanged when no force is required. A bridge JUMP is parked
+        // untouched, so there is no rewritten arglist to capture.
+        let pre_jump_resolved_args = if defer_bridge_terminal {
+            None
+        } else {
+            last_op
+                .as_ref()
+                .filter(|op| op.opcode == OpCode::Jump)
+                .map(|jump_op| jump_op.getarglist_copy())
+        };
 
-        // RPython optimizer.py (_propagate_all_forward):
+        // Optimizer._propagate_all_forward:
         //     if flush:
         //         self.flush()
         //         if last_op:
         //             self.send_extra_operation(last_op)
         //
-        // flush=False is used ONLY by optimize_preamble (Phase 1) and
-        // optimize_peeled_loop (Phase 2) — terminal_op is returned in
-        // BasicLoopInfo.jump_op for unroll.rs to handle.
-        //
-        // flush=True (default) is used by optimize_loop (compile_loop) and
-        // finish_and_compile — terminal op is sent through passes and ends
-        // up in new_operations naturally.
+        // flush=False is used by UnrollOptimizer.optimize_preamble,
+        // UnrollOptimizer.optimize_peeled_loop, and
+        // UnrollOptimizer.optimize_bridge. A bridge parks the untouched
+        // JUMP on terminal_op; preamble/peeled-loop still force/rewrite
+        // then park (skip_flush) so OptUnroll.export_state sees the same
+        // JUMP it does today.
         if let Some(terminal_op) = last_op {
-            // RPython unroll.py:126-127 parity:
-            //   for a in end_jump.getarglist():
-            //       self.force_box_for_end_of_preamble(get_box_replacement(a))
-            //
-            // Call force_at_the_end_of_preamble on ALL args (not just
-            // Ref-mismatch ones). RPython's force_box_for_end_of_preamble
-            // handles both Ref virtuals (type 'r') and raw-ptr-int (type 'i'):
-            //   - Ref virtual: recursively process fields, keep virtual alive
-            //   - Raw ptr int: force via optearlyforce
-            //   - Non-virtual: return get_box_replacement(op) unchanged
-            //
-            // Additionally, in majit OpRef forwarding is typeless, so a Ref
-            // virtual can forward to a Float (SameAsF). When that happens,
-            // force_box materializes the virtual to preserve Ref type.
-            let inputargs = self.trace_inputargs.clone();
-            // Phase 1: resolve and call force_at_the_end_of_preamble on all args
-            for arg in terminal_op.args_slice().iter() {
-                self.force_box_for_end_of_preamble(&arg.get_box_replacement(false), &mut ctx);
-            }
-            // Phase 2: re-resolve after forcing (force may have changed forwarding)
-            // and fix Ref→non-Ref type crossings by force_box
-            let mut force_needed: Vec<usize> = Vec::new();
-            // optimizer.py force_box loop parity:
-            //   for i in range(op.numargs()): op.setarg(i, force_box(...))
-            //
-            // `trace_inputargs` names the positions this JUMP writes into only
-            // on the unroll paths, where unroll.py:454 builds `end_args` from
-            // `original_label_args`: the preamble closes back to the loop start,
-            // and the peeled body closes back to the LABEL made from those same
-            // args. A bridge's JUMP targets a different trace's label while
-            // `trace_inputargs` holds the guard's failargs — two unrelated
-            // lists, so a positional Ref check reads arbitrary positions. There
-            // the type contract belongs to virtual-state matching
-            // (virtualstate.py `generate_guards`), and what applies here
-            // is the plain force_box loop.
-            let inputargs_are_the_jump_target = !self.building_bridge;
-            for i in 0..terminal_op.num_args() {
-                let arg = terminal_op.arg(i);
-                let resolved_box = ctx.resolve_operand_operand(&arg);
-                let expected_ref = inputargs_are_the_jump_target
-                    && i < inputargs.len()
-                    && inputargs[i].type_() == majit_ir::Type::Ref;
-                // setup_optimizations seeds `trace_inputargs` into
-                // ctx.inputargs (`optimizer.py Optimizer.__init__`).
-                // The replacement box carries `Box.type` (`Operand::type_`);
-                // PtrInfo presence is an additional Ref-only side channel
-                // for inputargs not in `new_operations`.
-                let resolved_has_ptr_info = ctx.has_ptr_info(&resolved_box);
-                let resolved_is_ref =
-                    resolved_box.type_() == majit_ir::Type::Ref || resolved_has_ptr_info;
-                if expected_ref && !resolved_is_ref && resolved_box.const_value().is_none() {
-                    let arg_is_virtual = ctx.is_virtual(&resolved_box);
-                    if arg_is_virtual {
-                        force_needed.push(i);
-                    } else {
-                        // RPython Box parity: a ref-typed box never forwards to
-                        // an int/float box. majit's flat OpRef forwarding can
-                        // collapse a boxed W_Int/W_Float local to its raw payload,
-                        // but end-of-preamble JUMP args must preserve the ref box
-                        // identity at ref-typed positions.
-                        //
-                        // Keep the original ref-typed arg instead of substituting
-                        // the non-ref replacement. This matches the upstream
-                        // force_box_for_end_of_preamble contract more closely than
-                        // allowing Ref -> Float/Int type substitution at the JUMP.
-                        if crate::majit_log_enabled() {
-                            eprintln!(
-                                "[jump-type] arg {i}: label position is Ref, replacement is not; \
-                                 keeping the original arg"
-                            );
-                        }
-                    }
-                } else {
-                    terminal_op.setarg(i, resolved_box);
-                }
-            }
-            for i in force_needed {
-                let original = terminal_op.arg(i);
-                let b_forced = self.force_box(&original, &mut ctx);
-                terminal_op.setarg(i, b_forced);
-            }
-            if self.skip_flush {
-                // flush=False: store for caller to consume.
+            if defer_bridge_terminal {
+                // Optimizer._propagate_all_forward(..., flush=False): the
+                // caller owns the JUMP and no pass has observed or rewritten
+                // it yet.
                 self.terminal_op = Some(terminal_op);
             } else {
-                // flush=True: send through passes (optimizer.py).
-                self.send_extra_operation(&terminal_op, &mut ctx)?;
+                self.prepare_and_send_terminal_operation(terminal_op, &mut ctx)?;
             }
         }
 
@@ -3438,195 +3470,191 @@ impl Optimizer {
         // `match` (not `jump.map(|jump| ...)`) so the `return Err(InvalidLoop)`
         // for the preview virtual-state mismatch below propagates out of
         // `optimize_with_constants_and_inputs_at`, not just the closure.
-        let building_bridge = self.building_bridge;
         // `Optimizer.optimize_loop` (optimizer.py) is the whole of
         // `SimpleCompileData.optimize`; there is no `optimize_preamble` behind
         // it to export for. See [`Self::simple_compile`].
-        self.exported_loop_state = match jump.filter(|_| !self.simple_compile) {
-            Some(jump) => 'export: {
-                // unroll.py OptUnroll.export_state order:
-                //   end_args = [force_box_for_end_of_preamble(a) for a ...]
-                //   self.optimizer.flush()
-                //   virtual_state = self.get_virtual_state(end_args)
-                // — VS captured AFTER force + flush.
-                let original_jump_args: Vec<Operand> = pre_jump_resolved_args
-                    .clone()
-                    .map(|v| v.into_iter().collect())
-                    .unwrap_or_else(|| {
-                        jump.args_slice()
+        // UnrollOptimizer.optimize_bridge never export_state except in
+        // its retrace arm (`optimize_bridge` after flush + force).
+        self.exported_loop_state = if self.building_bridge {
+            None
+        } else {
+            match jump.filter(|_| !self.simple_compile) {
+                Some(jump) => 'export: {
+                    // unroll.py OptUnroll.export_state order:
+                    //   end_args = [force_box_for_end_of_preamble(a) for a ...]
+                    //   self.optimizer.flush()
+                    //   virtual_state = self.get_virtual_state(end_args)
+                    // — VS captured AFTER force + flush.
+                    let original_jump_args: Vec<Operand> = pre_jump_resolved_args
+                        .clone()
+                        .map(|v| v.into_iter().collect())
+                        .unwrap_or_else(|| {
+                            jump.args_slice()
+                                .iter()
+                                .map(|a| a.get_box_replacement(false))
+                                .collect()
+                        });
+                    let mut resolved_args = original_jump_args.clone();
+                    // Dedup: two cases require SameAs allocation at end of preamble.
+                    //
+                    // Case A — duplicate args: when two JUMP slots reference the same
+                    // box (e.g. b and t in fib_loop after b = t aliasing), create a
+                    // fresh SameAs for the second occurrence so each slot has a
+                    // distinct identity.
+                    //
+                    // Case B — preamble inputarg position used by a non-self slot:
+                    // when JUMP slot j carries a box whose class-C `Op.pos` raw is
+                    // k < num_inputs, k != j, the export hands Phase 2 a
+                    // `next_iteration_args[j]` that collides with body inputarg
+                    // slot k's own source position. import_state forwards both
+                    // slot j and slot k, and get_box_replacement walks the chain
+                    // through k, making body inputarg j resolve to nia[k]
+                    // instead of the original box at k. RPython avoids this with
+                    // fresh-Box identity per phase (`History.record_same_as`);
+                    // the alias is a SAME_AS ResOp so nia[j] is a distinct box.
+                    //
+                    {
+                        let mut seen: crate::FxIndexSet<Operand> = crate::FxIndexSet::default();
+                        // Positions already holding an emitted op are phase 1
+                        // results, not body inputarg sources. Only the UNUSED
+                        // positions in 0..num_inputs correspond to trace
+                        // inputargs (`InputArgRef` / `InputArgInt` /
+                        // `InputArgFloat`). `emitted_positions` is class-C
+                        // (`Op.pos` of emitted ops) used only to decide Case B.
+                        let emitted_positions: crate::FxIndexSet<OpRef> = ctx
+                            .new_operations
                             .iter()
-                            .map(|a| a.get_box_replacement(false))
-                            .collect()
-                    });
-                let mut resolved_args = original_jump_args.clone();
-                // Dedup: two cases require SameAs allocation at end of preamble.
-                //
-                // Case A — duplicate args: when two JUMP slots reference the same
-                // box (e.g. b and t in fib_loop after b = t aliasing), create a
-                // fresh SameAs for the second occurrence so each slot has a
-                // distinct identity.
-                //
-                // Case B — preamble inputarg position used by a non-self slot:
-                // when JUMP slot j carries a box whose class-C `Op.pos` raw is
-                // k < num_inputs, k != j, the export hands Phase 2 a
-                // `next_iteration_args[j]` that collides with body inputarg
-                // slot k's own source position. import_state forwards both
-                // slot j and slot k, and get_box_replacement walks the chain
-                // through k, making body inputarg j resolve to nia[k]
-                // instead of the original box at k. RPython avoids this with
-                // fresh-Box identity per phase (`History.record_same_as`);
-                // the alias is a SAME_AS ResOp so nia[j] is a distinct box.
-                //
-                // A bridge needs the aliases too: its retrace arm exports from
-                // `ctx.preamble_end_args`, which is built from these args.
-                {
-                    let mut seen: crate::FxIndexSet<Operand> = crate::FxIndexSet::default();
-                    // Positions already holding an emitted op are phase 1
-                    // results, not body inputarg sources. Only the UNUSED
-                    // positions in 0..num_inputs correspond to trace
-                    // inputargs (`InputArgRef` / `InputArgInt` /
-                    // `InputArgFloat`). `emitted_positions` is class-C
-                    // (`Op.pos` of emitted ops) used only to decide Case B.
-                    let emitted_positions: crate::FxIndexSet<OpRef> = ctx
-                        .new_operations
-                        .iter()
-                        .map(|op| op.pos().get())
-                        .filter(|p| !p.is_none())
-                        .collect();
-                    let original_args = resolved_args.clone();
-                    for (slot_idx, arg) in resolved_args.iter_mut().enumerate() {
-                        if arg.is_none() || arg.get_box_replacement(false).const_value().is_some() {
-                            continue;
-                        }
-                        let is_dup = !seen.insert(arg.clone());
-                        // Case B fires only when slot k (where
-                        // `k = arg.to_opref().raw()`, the class-C recorder
-                        // slot the current arg numbers) holds a different
-                        // box. If slot k self-forwards
-                        // (`original_args[k].same_box(arg)`), Phase 2
-                        // `make_equal_to` is a no-op — no chain forms, so no
-                        // aliasing is needed.
-                        let target_slot = arg.to_opref().raw() as usize;
-                        let target_slot_self_forwards = original_args
-                            .get(target_slot)
-                            .is_none_or(|other| other.same_box(arg));
-                        let is_cross_inputarg = target_slot < num_inputs
-                            && target_slot != slot_idx
-                            && !emitted_positions.contains(&arg.to_opref())
-                            && !target_slot_self_forwards;
-                        if !is_dup && !is_cross_inputarg {
-                            continue;
-                        }
-                        let orig_box = arg.get_box_replacement(false);
-                        let arg_type = orig_box.type_();
-                        // History.record_same_as: SAME_AS is a ResOp.
-                        let (fresh, b_fresh) = ctx.reserve_virtual_box(arg_type);
-                        let op = Op::new(
-                            OpCode::same_as_for_type(arg_type),
-                            std::slice::from_ref(&orig_box),
-                        );
-                        op.pos().set(fresh);
-                        // unroll.py + compile.py: accumulate the alias op in
-                        // `extra_same_as` and splice it between the preamble
-                        // body and the label at final assembly. Emitting
-                        // directly into `ctx.new_operations` would push the op
-                        // past the already-sent terminal JUMP and force the
-                        // loop-tail relocation workaround below.
-                        loop_info.extra_same_as.push(op);
-                        if let Some(info) = ctx.peek_ptr_info(&orig_box) {
-                            let fresh_info = match info {
-                                crate::optimizeopt::info::PtrInfo::Virtual(mut vinfo) => {
-                                    for field in &mut vinfo.fields {
-                                        // VirtualFieldList already stores
-                                        // Operand. History.record_same_as:
-                                        // SAME_AS is a ResOp.
-                                        let tp = field.1.type_();
-                                        let (ff, b_ff) = ctx.reserve_virtual_box(tp);
-                                        ctx.make_equal_to(&b_ff, &field.1);
-                                        let _ = ff;
-                                        field.1 = b_ff;
+                            .map(|op| op.pos().get())
+                            .filter(|p| !p.is_none())
+                            .collect();
+                        let original_args = resolved_args.clone();
+                        for (slot_idx, arg) in resolved_args.iter_mut().enumerate() {
+                            if arg.is_none()
+                                || arg.get_box_replacement(false).const_value().is_some()
+                            {
+                                continue;
+                            }
+                            let is_dup = !seen.insert(arg.clone());
+                            // Case B fires only when slot k (where
+                            // `k = arg.to_opref().raw()`, the class-C recorder
+                            // slot the current arg numbers) holds a different
+                            // box. If slot k self-forwards
+                            // (`original_args[k].same_box(arg)`), Phase 2
+                            // `make_equal_to` is a no-op — no chain forms, so no
+                            // aliasing is needed.
+                            let target_slot = arg.to_opref().raw() as usize;
+                            let target_slot_self_forwards = original_args
+                                .get(target_slot)
+                                .is_none_or(|other| other.same_box(arg));
+                            let is_cross_inputarg = target_slot < num_inputs
+                                && target_slot != slot_idx
+                                && !emitted_positions.contains(&arg.to_opref())
+                                && !target_slot_self_forwards;
+                            if !is_dup && !is_cross_inputarg {
+                                continue;
+                            }
+                            let orig_box = arg.get_box_replacement(false);
+                            let arg_type = orig_box.type_();
+                            // History.record_same_as: SAME_AS is a ResOp.
+                            let (fresh, b_fresh) = ctx.reserve_virtual_box(arg_type);
+                            let op = Op::new(
+                                OpCode::same_as_for_type(arg_type),
+                                std::slice::from_ref(&orig_box),
+                            );
+                            op.pos().set(fresh);
+                            // unroll.py + compile.py: accumulate the alias op in
+                            // `extra_same_as` and splice it between the preamble
+                            // body and the label at final assembly. Emitting
+                            // directly into `ctx.new_operations` would push the op
+                            // past the already-sent terminal JUMP and force the
+                            // loop-tail relocation workaround below.
+                            loop_info.extra_same_as.push(op);
+                            if let Some(info) = ctx.peek_ptr_info(&orig_box) {
+                                let fresh_info = match info {
+                                    crate::optimizeopt::info::PtrInfo::Virtual(mut vinfo) => {
+                                        for field in &mut vinfo.fields {
+                                            // VirtualFieldList already stores
+                                            // Operand. History.record_same_as:
+                                            // SAME_AS is a ResOp.
+                                            let tp = field.1.type_();
+                                            let (ff, b_ff) = ctx.reserve_virtual_box(tp);
+                                            ctx.make_equal_to(&b_ff, &field.1);
+                                            let _ = ff;
+                                            field.1 = b_ff;
+                                        }
+                                        crate::optimizeopt::info::PtrInfo::Virtual(vinfo)
                                     }
-                                    crate::optimizeopt::info::PtrInfo::Virtual(vinfo)
-                                }
-                                other => other,
-                            };
-                            ctx.set_ptr_info(&b_fresh, fresh_info);
-                        }
-                        *arg = b_fresh;
-                        // After allocating a fresh alias for an inputarg
-                        // position, update `seen` so the next slot
-                        // referencing the same original box goes through
-                        // the duplicate path and gets its own fresh alias.
-                        if is_cross_inputarg {
-                            seen.insert(arg.clone());
+                                    other => other,
+                                };
+                                ctx.set_ptr_info(&b_fresh, fresh_info);
+                            }
+                            *arg = b_fresh;
+                            // After allocating a fresh alias for an inputarg
+                            // position, update `seen` so the next slot
+                            // referencing the same original box goes through
+                            // the duplicate path and gets its own fresh alias.
+                            if is_cross_inputarg {
+                                seen.insert(arg.clone());
+                            }
                         }
                     }
-                }
-                // unroll.py UnrollOptimizer.flush — force lazy sets before
-                // producing short preamble ops (heap.py OptHeap invariant).
-                self.flush(&mut ctx)?;
+                    // unroll.py UnrollOptimizer.flush — force lazy sets before
+                    // producing short preamble ops (heap.py OptHeap invariant).
+                    self.flush(&mut ctx)?;
 
-                // Now force all resolved (and dedup'd) args.
-                // unroll.py OptUnroll.export_state:
-                //   end_args = [force_box_for_end_of_preamble(a)
-                //               for a in original_label_args]
-                let preamble_end_args: Vec<Operand> = resolved_args
-                    .iter()
-                    .map(|arg| {
-                        self.force_box_for_end_of_preamble(
-                            &arg.get_box_replacement(false),
-                            &mut ctx,
-                        )
-                    })
-                    .collect();
-                ctx.preamble_end_args = Some(preamble_end_args.clone());
-                // unroll.py UnrollOptimizer.optimize_bridge calls
-                // `export_state` only in its retrace arm, after
-                // `jump_to_existing_trace` found no match. Steps (1) and (2)
-                // stay eager so that arm can read `ctx.preamble_end_args`;
-                // step (3) is published there immediately before the late
-                // export.
-                if building_bridge {
-                    break 'export None;
+                    // Now force all resolved (and dedup'd) args.
+                    // unroll.py OptUnroll.export_state:
+                    //   end_args = [force_box_for_end_of_preamble(a)
+                    //               for a in original_label_args]
+                    let preamble_end_args: Vec<Operand> = resolved_args
+                        .iter()
+                        .map(|arg| {
+                            self.force_box_for_end_of_preamble(
+                                &arg.get_box_replacement(false),
+                                &mut ctx,
+                            )
+                        })
+                        .collect();
+                    ctx.preamble_end_args = Some(preamble_end_args.clone());
+                    // unroll.py UnrollOptimizer.optimize_peeled_loop exports
+                    // nothing: only the preamble's `export_state` feeds the
+                    // peeled loop.
+                    if self.imported_loop_state.is_some() {
+                        break 'export None;
+                    }
+                    self.publish_preview_short_state(&mut ctx, &preamble_end_args)?;
+                    let exported_int_bounds =
+                        self.collect_exported_int_bounds(jump.args_slice(), &mut ctx);
+                    // unroll.py UnrollOptimizer.optimize_preamble
+                    // `info.renamed_inputargs` are the fresh per-iteration boxes
+                    // from `trace.get_iter()`. They live in this run's iteration
+                    // namespace, not the original frontend's.
+                    // `[inputarg_base..inputarg_base + num_inputs)`:
+                    // `inputarg_base = 0` for top-level loops (`compile_loop` /
+                    // `compile_retrace`) where the frontend already owns
+                    // `[0, num_inputs)`, and `inputarg_base =
+                    // bridge_inputarg_base` for bridges, where
+                    // `prepare_bridge_trace_for_optimizer` shifts the iteration
+                    // into a disjoint range. Use `num_inputs` (the external
+                    // loop-entry contract count) rather than `ctx.num_inputs`
+                    // (which may be widened by virtualizable expansion).
+                    // resoperation.py InputArgInt / InputArgRef / InputArgFloat:
+                    // each renamed inputarg's Box carries `.type` intrinsically
+                    // (`history.py` InputArg type). The exported state's boxes
+                    // are the typed InputArgs already living on this context.
+                    // unroll.py `info.inputargs` — the fresh per-iteration
+                    // InputArg boxes already living on this optimizer context.
+                    let renamed_inputargs: Vec<Operand> = ctx.inputargs[..num_inputs].to_vec();
+                    Some(crate::optimizeopt::unroll::export_state(
+                        &original_jump_args,
+                        &renamed_inputargs,
+                        self,
+                        &mut ctx,
+                        Some(&exported_int_bounds),
+                    ))
                 }
-                // unroll.py UnrollOptimizer.optimize_peeled_loop exports
-                // nothing: only the preamble's `export_state` feeds the
-                // peeled loop.
-                if self.imported_loop_state.is_some() {
-                    break 'export None;
-                }
-                self.publish_preview_short_state(&mut ctx, &preamble_end_args)?;
-                let exported_int_bounds =
-                    self.collect_exported_int_bounds(jump.args_slice(), &mut ctx);
-                // unroll.py UnrollOptimizer.optimize_preamble
-                // `info.renamed_inputargs` are the fresh per-iteration boxes
-                // from `trace.get_iter()`. They live in this run's iteration
-                // namespace, not the original frontend's.
-                // `[inputarg_base..inputarg_base + num_inputs)`:
-                // `inputarg_base = 0` for top-level loops (`compile_loop` /
-                // `compile_retrace`) where the frontend already owns
-                // `[0, num_inputs)`, and `inputarg_base =
-                // bridge_inputarg_base` for bridges, where
-                // `prepare_bridge_trace_for_optimizer` shifts the iteration
-                // into a disjoint range. Use `num_inputs` (the external
-                // loop-entry contract count) rather than `ctx.num_inputs`
-                // (which may be widened by virtualizable expansion).
-                // resoperation.py InputArgInt / InputArgRef / InputArgFloat:
-                // each renamed inputarg's Box carries `.type` intrinsically
-                // (`history.py` InputArg type). The exported state's boxes
-                // are the typed InputArgs already living on this context.
-                // unroll.py `info.inputargs` — the fresh per-iteration
-                // InputArg boxes already living on this optimizer context.
-                let renamed_inputargs: Vec<Operand> = ctx.inputargs[..num_inputs].to_vec();
-                Some(crate::optimizeopt::unroll::export_state(
-                    &original_jump_args,
-                    &renamed_inputargs,
-                    self,
-                    &mut ctx,
-                    Some(&exported_int_bounds),
-                ))
+                None => None,
             }
-            None => None,
         };
         // RPython parity: propagate patchguardop to ExportedState so Phase 2
         // can use it for extra_guards from virtualstate (unroll.py:333-336).
@@ -3649,16 +3677,13 @@ impl Optimizer {
         // RPython parity: store_final_boxes_in_guard handles virtual tagging
         // and rd_numb production inline. No post-pass rescan needed.
 
-        // Finalize cascade removed. PyPy walks args ONCE at op-emit
-        // time via `_emit_operation:614-625 force_box`; never re-walks. The
-        // cited `compile.py:emit_op:403-423` is a virtualizable-only patcher
-        // (5 callers all inside `patch_new_loop_to_load_virtualizable_fields`),
-        // not a general finalize pass. Pyre's emit-time arg walking happens
-        // in two PyPy-parity locations:
-        //   1. `propagate_from_pass_range` — incoming op args
-        //      resolved via `ctx.get_box_replacement` BEFORE pass dispatch.
-        //   2. `Optimizer::emit_operation` — `force_box` on every
-        //      arg unconditionally (PyPy `optimizer.py` parity).
+        // Finalize cascade removed. optimizer.py Optimizer._emit_operation
+        // walks args once at emit via force_box; never re-walks. The
+        // cited compile.py emit_op is a virtualizable-only patcher
+        // (callers all inside patch_new_loop_to_load_virtualizable_fields),
+        // not a general finalize pass. emit_operation_inner force_boxes
+        // every arg. Passes read args through walkers;
+        // send_extra_operation dispatches the op unchanged.
         // After emit, args are frozen on the op. Postprocess setting
         // `box._forwarded = Const` (e.g., `make_constant` from
         // `optimize_GUARD_FALSE`) must NOT retroactively rewrite already-
@@ -3689,10 +3714,9 @@ impl Optimizer {
 
         // Second finalize cascade also removed, on the same rationale:
         // each extra op runs through `propagate_from_pass_range`
-        // which resolves its incoming args at input time via
-        // `ctx.get_box_replacement`, and through `Optimizer::emit_operation`
-        // which `force_box`es every arg. No retroactive walking of pre-existing
-        // new_operations is needed.
+        // (`send_extra_operation` dispatches the op unchanged) and
+        // `Optimizer::emit_operation` which `force_box`es every arg. No
+        // retroactive walking of pre-existing new_operations is needed.
         // RPython: no equivalent filter — Box identity guarantees all
         // references are valid. The retain filter was a majit safety net
         // but incorrectly dropped valid ops (e.g., IntAddOvf referencing
@@ -4461,19 +4485,15 @@ impl Optimizer {
             // export; `retrace_needed` then starts without a state.
             let renamed_inputargs: Vec<Operand> = ctx.inputargs[..num_inputs].to_vec();
             let exported_int_bounds = self.collect_exported_int_bounds(&jump_boxes, &mut ctx);
-            // unroll.py OptUnroll.export_state builds the short-preamble
-            // preview internally; the eager path skipped it for this bridge.
-            // `ctx.preamble_end_args` is the forced list from step (2).
-            let preview_args = ctx.preamble_end_args.clone().unwrap_or_else(|| {
-                jump_boxes
-                    .iter()
-                    .map(|arg| arg.get_box_replacement(false))
-                    .collect()
-            });
-            // A mismatch is the empty-export outcome the eager bridge path
-            // used to take (`break 'export None`); this late export then
-            // recomputes from `ctx.preamble_end_args`.
-            let _ = self.publish_preview_short_state(&mut ctx, &preview_args);
+            // unroll.py OptUnroll.export_state after the failed virtual-state
+            // match. Derive preview args from the JUMP after this arm's
+            // flush + force_box_for_end_of_preamble loop.
+            let preview_args: Vec<Operand> = terminal_jump
+                .args_slice()
+                .iter()
+                .map(|arg| arg.get_box_replacement(false))
+                .collect();
+            self.publish_preview_short_state(&mut ctx, &preview_args)?;
             let mut state = crate::optimizeopt::unroll::export_state(
                 &jump_boxes,
                 &renamed_inputargs,
@@ -4753,54 +4773,11 @@ impl Optimizer {
         // `Op.type_` once the op lands in `new_operations`, so an external
         // type side-table refresh is redundant.
 
-        // Resolve forwarded arguments. PyPy `_emit_operation`
-        // (optimizer.py) walks args via force_box at the entry to
-        // emission; pyre's pre-pass walk via `ctx.get_box_replacement` is
-        // the structural analog (force_box is invoked separately at
-        // `Optimizer::emit_operation` for the post-pass refresh).
-        // fail_args are NOT walked here — PyPy snapshots them once at
-        // `store_final_boxes_in_guard` time via the numbering layer (which
-        // encodes Const entries as TAGCONST in rd_numb, leaving fail_args
-        // as TAGBOX-only references). Re-walking fail_args at pass entry
-        // would be a pyre-only layer that could substitute Const refs
-        // post-`make_equal_to(_, const_target)` and de-sync from the
-        // numbering snapshot.
-        // optimizer.py force_box loop parity: resolve each arg
-        // through its forwarding chain. Store the CANONICAL terminal box
-        // (carrying the live _forwarded chain), not a fresh from_opref box,
-        // so passes can read PtrInfo / IntBound / known-class directly off
-        // op.arg(i) — matching RPython where get_box_replacement returns the
-        // Box object itself. A from_opref box is unbound and drops the chain.
-        //
-        // `optimizer.py _emit_operation` writes the resolution back
-        // with `op.setarg(i, arg)` — into the operation's own slot, because
-        // upstream's operation IS the box the passes forward. Written back
-        // onto `op_rc` here for the same reason. Two things make that sound:
-        //
-        //  - No pass reads `op_rc`'s arguments. A pass reaches `op_rc` only as
-        //    `Operand::from_bound_op(op_rc)`, the `make_equal_to` forwarding
-        //    host, so what the second parameter carries is identity, which
-        //    resolving in place does not change; the argument view every pass
-        //    reads is `current_op` below.
-        //  - The caller has handed its argument slots over. The unroll and
-        //    bridge entries walk `TraceIterator`, whose `next` mints a fresh
-        //    operation per step, so those ops are the pass's own outright;
-        //    `optimize_with_constants_and_inputs_oprc` threads the recorder's
-        //    own ops and documents the transfer on its own signature.
-        for i in 0..op_rc.num_args() {
-            // `optimizer.py Optimizer.get_box_replacement(op.getarg(i))`.
-            // A slot that already holds its chain terminal keeps it:
-            // `setarg` of the same box changes nothing.
-            let replaced = {
-                let arg = &op_rc.args_slice()[i];
-                arg.with_box_replacement(|terminal| {
-                    (!terminal.same_box(arg)).then(|| terminal.clone())
-                })
-            };
-            if let Some(resolved) = replaced {
-                op_rc.setarg(i, resolved);
-            }
-        }
+        // optimizer.py Optimizer.send_extra_operation hands `op` to the
+        // pass chain unchanged; each reader walks (`get_box_replacement` /
+        // `getptrinfo` / `getintbound` / `force_box` / `ensure_ptr_info_arg0`).
+        // optimizer.py Optimizer._emit_operation is the single force_box +
+        // setarg loop, in emit_operation_inner.
 
         // Borrowed until a pass replaces the operation; `Replace` and
         // `Restart` mint their own, and only those need an owned copy.
@@ -4990,7 +4967,7 @@ impl Optimizer {
         }
 
         // If no pass handled it, emit as-is. An unreplaced pass-through is the
-        // recorder input op verbatim (args re-resolved) or an Emit-minted
+        // recorder input op verbatim or an Emit-minted
         // producer, so emit may append that same Rc — no second ResOperation().
         // That append is `Optimizer.emit` (`reuse = true`). A replaced op is a
         // new `ResOperation` and stays on `emit_operation_inner(..., false)`.
@@ -5659,45 +5636,16 @@ impl Optimizer {
 
     /// optimizer.py store_final_boxes_in_guard
     ///
-    /// Resolve fail_args through get_box_replacement and delegate to
-    /// finalize_guard_resume_data for snapshot-based virtual encoding
-    /// (rd_numb, rd_consts, rd_virtuals).
-    ///
-    /// resume.py finish() is unconditional: every guard reaching
-    /// here must have a snapshot. We delegate without any guard condition
-    /// — finalize_guard_resume_data already handles the missing-snapshot
-    /// case internally (silent return for guards without rd_resume_position
-    /// or snapshot_boxes entry).
+    /// Delegate to finalize_guard_resume_data. ResumeDataVirtualAdder.finish
+    /// numbers the snapshot and returns the TAGBOX-only live list;
+    /// ResumeGuardDescr.store_final_boxes installs that list once. The
+    /// previous fail-arg vector is not an input to numbering.
     fn store_final_boxes_in_guard(
         op: &Op,
         ctx: &mut OptContext,
         knowledge: Option<crate::resume::OptimizerKnowledgeForResume>,
         pending_setfields: Vec<majit_ir::GuardPendingFieldEntry>,
     ) {
-        // optimizer.py is_call_pure_pure_canraise + resume.py finish:
-        // RPython finish() handles virtuals without forcing.
-        // _number_boxes tags virtual fail_args as TAGVIRTUAL,
-        // _number_virtuals builds rd_virtuals from PtrInfo.
-        //
-        // PyPy parity: fail_args are canonicalized through
-        // `get_box_replacement(a, True)` in the compile/backend patching
-        // helpers. In RPython the second argument is `not_const=True`:
-        // the chain walk stops before stepping into a Const target, so
-        // the guard fail_arg keeps the runtime box identity here. Const
-        // entries are encoded by `resume.py _number_boxes` as TAGCONST
-        // in rd_numb during numbering, and the liveboxes returned by
-        // `finish()` / `descr.store_final_boxes` remain TAGBOX-only for
-        // backend regalloc.
-        if let Some(fail_args) = op.fail_args_mut() {
-            for fa_idx in 0..fail_args.len() {
-                if !fail_args[fa_idx].is_none()
-                    && let Some(resolved) =
-                        ctx.get_box_replacement_not_const_operand(&fail_args[fa_idx])
-                {
-                    fail_args[fa_idx] = resolved;
-                }
-            }
-        }
         ctx.finalize_guard_resume_data(op, knowledge, pending_setfields);
     }
 
@@ -5893,7 +5841,18 @@ impl Optimizer {
         vable: Option<VirtualizableConfig>,
     ) -> Self {
         let enabled = |name: &str| enable_opts.iter().any(|opt| opt == name);
+        let n_passes = ALL_OPTS
+            .iter()
+            .filter(|(name, instantiate)| *instantiate && enabled(name))
+            .count()
+            + usize::from(
+                !enabled("rewrite")
+                    || !enabled("virtualize")
+                    || !enabled("heap")
+                    || !enabled("pure"),
+            );
         let mut opt = Self::new();
+        opt.passes.reserve(n_passes);
         if let Some(config) = vable.as_ref() {
             // resume.py:399-402 `minimum_virtualizable_size` from
             // `virtualizable_info.minimum_size()` (`num_static_fields`).
@@ -7704,6 +7663,33 @@ mod tests {
     }
 
     #[test]
+    fn test_guard_nonnull_removed_on_forwarded_nonnull_arg() {
+        // rewrite.py optimize_GUARD_NONNULL: getptrinfo(op.getarg(0)) walks
+        // get_box_replacement, then is_nonnull → return (remove). A is
+        // make_equal_to'd onto B; B carries NonNull. The pass chain sees
+        // the raw A slot; the walker still finds B.
+        let mut opt = Optimizer::default_pipeline();
+        let mut ctx = OptContext::with_inputarg_types(16, &[Type::Ref, Type::Ref]);
+        let box_b = rooted_resop_operand(Type::Ref, 1);
+        let box_a = rooted_resop_operand(Type::Ref, 2);
+        ctx.set_ptr_info(&box_b, PtrInfo::nonnull());
+        ctx.make_equal_to(&box_a, &box_b);
+        let guard = OpRc::new(Op::new(OpCode::GuardNonnull, std::slice::from_ref(&box_a)));
+        opt.send_extra_operation(&guard, &mut ctx)
+            .expect("GUARD_NONNULL of a forwarded NonNull box is valid");
+        assert!(
+            ctx.new_operations
+                .iter()
+                .all(|op| op.opcode != OpCode::GuardNonnull),
+            "GUARD_NONNULL(A) with A make_equal_to B (NonNull) is removed; got {:?}",
+            ctx.new_operations
+                .iter()
+                .map(|op| op.opcode)
+                .collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
     fn test_emit_raw_load_i_force_boxes_virtual_buffer_arg() {
         // virtualize.py optimize_RAW_LOAD_I: not a stored virtual-raw item.
         // `return self.emit(op)` then optimizer.py `_emit_operation`
@@ -8170,5 +8156,51 @@ mod tests {
         assert_eq!(exported.len(), 2);
         assert!(exported.keys().any(|k| k.same_box(&a)));
         assert!(exported.keys().any(|k| k.same_box(&b)));
+    }
+
+    /// `UnrollOptimizer.optimize_bridge` closes a JUMP whose argument is a
+    /// virtual. Asserts the optimized opcode sequence and JUMP argument.
+    #[test]
+    fn optimize_bridge_jump_carrying_a_virtual_keeps_current_ops() {
+        use crate::history::TargetToken;
+        use crate::history::test_support::TraceBuilder;
+
+        let mut b = TraceBuilder::new();
+        let p_new = b.op_with_descr(OpCode::New, &[], make_size_descr(16));
+        b.op(OpCode::Jump, std::slice::from_ref(&p_new));
+        let (ops, inputs) = b.build();
+
+        let mut opt = Optimizer::default_pipeline();
+        let mut constants = majit_ir::ConstMap::default();
+        let target_tokens = vec![TargetToken::new_preamble(0)];
+        let mut retraced_count = 0u32;
+        let (result, retrace) = opt
+            .optimize_bridge(
+                &ops,
+                &mut constants,
+                inputs.len(),
+                &target_tokens,
+                &[],
+                false,
+                &mut retraced_count,
+                0,
+                None,
+                0,
+            )
+            .expect("optimize_bridge");
+        assert!(!retrace);
+        let opcodes: Vec<_> = result.iter().map(|op| op.opcode).collect();
+        assert_eq!(opcodes, vec![OpCode::New, OpCode::Jump]);
+        assert_eq!(result[0].pos().get(), OpRef::ref_op(0));
+        assert_eq!(result[0].num_args(), 0);
+        assert_eq!(result[1].pos().get(), OpRef::void_op(1));
+        assert_eq!(
+            result[1]
+                .args_slice()
+                .iter()
+                .map(|a| a.to_opref())
+                .collect::<Vec<_>>(),
+            vec![OpRef::ref_op(0)]
+        );
     }
 }

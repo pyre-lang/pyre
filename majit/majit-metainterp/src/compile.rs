@@ -1766,7 +1766,10 @@ pub fn make_fail_descr(num_live: usize) -> DescrRef {
 pub fn make_fail_descr_with_index(fail_index: u32, num_live: usize) -> DescrRef {
     Arc::new(ResumeGuardDescr {
         fail_index,
-        types: UnsafeCell::new(vec![Type::Int; num_live]),
+        types: UnsafeCell::new(ResumeGuardDescr::pack_fail_arg_types(vec![
+            Type::Int;
+            num_live
+        ])),
         payload: RdPayload::empty(),
         vector_info: UnsafeCell::new(None),
         adr_jump_offset: UnsafeCell::new(0),
@@ -1840,7 +1843,7 @@ pub fn make_finish_fail_descr_typed(types: Vec<Type>, is_exception_exit: bool) -
 pub fn make_resume_guard_descr_typed(types: Vec<Type>) -> DescrRef {
     Arc::new(ResumeGuardDescr {
         fail_index: alloc_fail_index(),
-        types: UnsafeCell::new(types),
+        types: UnsafeCell::new(ResumeGuardDescr::pack_fail_arg_types(types)),
         payload: RdPayload::empty(),
         vector_info: UnsafeCell::new(None),
         adr_jump_offset: UnsafeCell::new(0),
@@ -1950,7 +1953,7 @@ impl FailDescr for ResumeAtPositionDescr {
         unsafe { &*self.inner.types.get() }
     }
     fn set_fail_arg_types(&self, types: Vec<Type>) {
-        unsafe { *self.inner.types.get() = types }
+        FailDescr::set_fail_arg_types(&self.inner, types)
     }
     fn attach_vector_info(&self, info: AccumInfo) {
         push_vector_info(unsafe { &mut *self.inner.vector_info.get() }, info);
@@ -2103,7 +2106,7 @@ pub fn make_resume_at_position_descr_typed(types: Vec<Type>) -> DescrRef {
     Arc::new(ResumeAtPositionDescr {
         inner: ResumeGuardDescr {
             fail_index: alloc_fail_index(),
-            types: UnsafeCell::new(types),
+            types: UnsafeCell::new(ResumeGuardDescr::pack_fail_arg_types(types)),
             payload: RdPayload::empty(),
             vector_info: UnsafeCell::new(None),
             adr_jump_offset: UnsafeCell::new(0),
@@ -2326,7 +2329,7 @@ impl FailDescr for ResumeGuardForcedDescr {
         unsafe { &*self.inner.types.get() }
     }
     fn set_fail_arg_types(&self, types: Vec<Type>) {
-        unsafe { *self.inner.types.get() = types }
+        FailDescr::set_fail_arg_types(&self.inner, types)
     }
     fn attach_vector_info(&self, info: AccumInfo) {
         push_vector_info(unsafe { &mut *self.inner.vector_info.get() }, info);
@@ -2479,7 +2482,7 @@ pub fn make_resume_guard_forced_descr_typed(types: Vec<Type>, jitdriver_sd: usiz
     Arc::new(ResumeGuardForcedDescr {
         inner: ResumeGuardDescr {
             fail_index: alloc_fail_index(),
-            types: UnsafeCell::new(types),
+            types: UnsafeCell::new(ResumeGuardDescr::pack_fail_arg_types(types)),
             payload: RdPayload::empty(),
             vector_info: UnsafeCell::new(None),
             adr_jump_offset: UnsafeCell::new(0),
@@ -2545,7 +2548,7 @@ impl FailDescr for ResumeGuardExcDescr {
         unsafe { &*self.inner.types.get() }
     }
     fn set_fail_arg_types(&self, types: Vec<Type>) {
-        unsafe { *self.inner.types.get() = types }
+        FailDescr::set_fail_arg_types(&self.inner, types)
     }
     fn attach_vector_info(&self, info: AccumInfo) {
         push_vector_info(unsafe { &mut *self.inner.vector_info.get() }, info);
@@ -2698,7 +2701,7 @@ pub fn make_resume_guard_exc_descr_typed(types: Vec<Type>) -> DescrRef {
     Arc::new(ResumeGuardExcDescr {
         inner: ResumeGuardDescr {
             fail_index: alloc_fail_index(),
-            types: UnsafeCell::new(types),
+            types: UnsafeCell::new(ResumeGuardDescr::pack_fail_arg_types(types)),
             payload: RdPayload::empty(),
             vector_info: UnsafeCell::new(None),
             adr_jump_offset: UnsafeCell::new(0),
@@ -3577,7 +3580,7 @@ impl FailDescr for CompileLoopVersionDescr {
         unsafe { &*self.inner.types.get() }
     }
     fn set_fail_arg_types(&self, types: Vec<Type>) {
-        unsafe { *self.inner.types.get() = types }
+        FailDescr::set_fail_arg_types(&self.inner, types)
     }
     /// compile.py:899-900
     fn exits_early(&self) -> bool {
@@ -3736,7 +3739,7 @@ fn make_compile_loop_version_descr_with_payload(types: Vec<Type>, payload: RdPay
     Arc::new(CompileLoopVersionDescr {
         inner: ResumeGuardDescr {
             fail_index: alloc_fail_index(),
-            types: UnsafeCell::new(types),
+            types: UnsafeCell::new(ResumeGuardDescr::pack_fail_arg_types(types)),
             payload,
             vector_info: UnsafeCell::new(None),
             adr_jump_offset: UnsafeCell::new(0),
@@ -4366,7 +4369,7 @@ mod fail_descr_tests {
         let lv = Arc::new(CompileLoopVersionDescr {
             inner: ResumeGuardDescr {
                 fail_index: alloc_fail_index(),
-                types: UnsafeCell::new(vec![Type::Int]),
+                types: UnsafeCell::new(ResumeGuardDescr::pack_fail_arg_types(vec![Type::Int])),
                 payload: RdPayload::empty(),
                 vector_info: UnsafeCell::new(None),
                 adr_jump_offset: UnsafeCell::new(0),
@@ -4501,6 +4504,31 @@ mod fail_descr_tests {
             exc_clone.as_fail_descr().unwrap().fail_arg_types(),
             &[Type::Float]
         );
+    }
+
+    #[test]
+    fn fail_arg_types_round_trip_at_inline_capacity() {
+        let types16 = vec![Type::Int; 16];
+        let types17 = vec![Type::Ref; 17];
+        let descrs: [DescrRef; 4] = [
+            make_resume_guard_descr_typed(types16.clone()),
+            make_resume_at_position_descr_typed(types16.clone()),
+            make_resume_guard_forced_descr_typed(types16.clone(), 0),
+            make_resume_guard_exc_descr_typed(types16.clone()),
+        ];
+        for descr in &descrs {
+            let fd = descr.as_fail_descr().unwrap();
+            assert_eq!(fd.fail_arg_types(), types16.as_slice());
+            fd.set_fail_arg_types(types17.clone());
+            assert_eq!(fd.fail_arg_types(), types17.as_slice());
+            fd.set_fail_arg_types(types16.clone());
+            assert_eq!(fd.fail_arg_types(), types16.as_slice());
+        }
+        let lv = make_compile_loop_version_descr_typed(types16.clone());
+        let fd = lv.as_fail_descr().unwrap();
+        assert_eq!(fd.fail_arg_types(), types16.as_slice());
+        fd.set_fail_arg_types(types17.clone());
+        assert_eq!(fd.fail_arg_types(), types17.as_slice());
     }
 
     /// `handle_guard_failure` arms `seen_loop_header_for_jdindex` from

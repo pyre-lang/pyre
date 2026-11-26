@@ -64,35 +64,83 @@ pub(crate) fn store_info_on_descr(
     faillocs: &[Option<crate::regloc::Loc>],
     slot_for_loc: fn(&crate::regloc::Loc) -> Option<u16>,
 ) -> majit_ir::RdLocs {
-    let mut shared = previous.len() == faillocs.len();
-    let mut positions: Option<Vec<u16>> = if shared {
-        None
-    } else {
-        Some(vec![0; faillocs.len()])
-    };
-    for (i, fl) in faillocs.iter().enumerate() {
+    let mut positions = smallvec::SmallVec::<[u16; 32]>::with_capacity(faillocs.len());
+    for fl in faillocs {
         let position = match fl {
             None => 0xFFFF,
             Some(loc) => slot_for_loc(loc).unwrap_or_else(|| {
                 panic!("store_info_on_descr: cannot encode fail-arg loc {loc:?} (gen_regs.index)")
             }),
         };
-        if shared {
-            if previous[i] == position {
-                continue;
-            }
-            let mut owned = previous.as_slice().to_vec();
-            owned[i] = position;
-            positions = Some(owned);
-            shared = false;
-            continue;
-        }
-        positions.as_mut().expect("rd_locs buffer")[i] = position;
+        positions.push(position);
     }
-    if shared {
+    if previous.as_slice() == positions.as_slice() {
         return previous.clone();
     }
-    let locs = majit_ir::RdLocs::from_vec(positions.expect("rd_locs buffer"));
+    let locs = majit_ir::RdLocs::from_exact_iter(positions.iter().copied());
     *previous = locs.clone();
     locs
+}
+
+#[cfg(test)]
+mod store_info_on_descr_tests {
+    use super::store_info_on_descr;
+    use crate::regloc::{Loc, RegLoc};
+
+    fn slot_reg(loc: &Loc) -> Option<u16> {
+        match loc {
+            Loc::Reg(r) => Some(r.value as u16),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn equal_consecutive_guards_share_allocation() {
+        let mut previous = majit_ir::RdLocs::new();
+        let locs = [
+            Some(Loc::Reg(RegLoc::new(1, false))),
+            None,
+            Some(Loc::Reg(RegLoc::new(3, false))),
+        ];
+        let first = store_info_on_descr(&mut previous, &locs, slot_reg);
+        let second = store_info_on_descr(&mut previous, &locs, slot_reg);
+        assert!(majit_ir::RdLocs::ptr_eq(&first, &second));
+        assert_eq!(first.as_slice(), &[1, 0xFFFF, 3]);
+    }
+
+    #[test]
+    fn empty_and_mismatch_allocate() {
+        let mut previous = majit_ir::RdLocs::new();
+        let empty = store_info_on_descr(&mut previous, &[], slot_reg);
+        assert!(empty.is_empty());
+        assert!(majit_ir::RdLocs::ptr_eq(&empty, &previous));
+
+        let first = [Some(Loc::Reg(RegLoc::new(1, false)))];
+        let second = [Some(Loc::Reg(RegLoc::new(2, false)))];
+        let a = store_info_on_descr(&mut previous, &first, slot_reg);
+        let b = store_info_on_descr(&mut previous, &second, slot_reg);
+        assert!(!majit_ir::RdLocs::ptr_eq(&a, &b));
+        assert_eq!(a.as_slice(), &[1]);
+        assert_eq!(b.as_slice(), &[2]);
+    }
+
+    #[test]
+    fn large_positions_round_trip() {
+        let mut previous = majit_ir::RdLocs::new();
+        let locs: Vec<Option<Loc>> = (0..40)
+            .map(|i| {
+                if i == 7 {
+                    None
+                } else {
+                    Some(Loc::Reg(RegLoc::new(i as u8, false)))
+                }
+            })
+            .collect();
+        let encoded = store_info_on_descr(&mut previous, &locs, slot_reg);
+        assert_eq!(encoded.len(), 40);
+        assert_eq!(encoded[7], 0xFFFF);
+        assert_eq!(encoded[39], 39);
+        let again = store_info_on_descr(&mut previous, &locs, slot_reg);
+        assert!(majit_ir::RdLocs::ptr_eq(&encoded, &again));
+    }
 }

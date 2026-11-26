@@ -28,7 +28,7 @@ use crate::jump::RegallocMoves;
 use crate::regloc::*;
 use majit_ir::forwarding::ForwardingHost;
 use majit_ir::operand::Operand;
-use majit_ir::{InputArgRc, Op, OpCode, OpRc, OpRef, OpTypeIndex, TempVar, Type};
+use majit_ir::{InputArgRc, Op, OpCode, OpRc, OpRef, TempVar, Type};
 #[cfg(test)]
 use smallvec::SmallVec;
 
@@ -230,10 +230,13 @@ type DataBlockWrapperPtr = std::convert::Infallible;
 /// body is the only thing that identifies the op.
 #[track_caller]
 fn const_bits_or_panic(v: &Operand, where_: &str) -> i64 {
-    let opref = v.to_opref();
-    if let Some(bits) = opref.inline_const_bits() {
-        return bits;
+    match v.const_value() {
+        Some(majit_ir::Value::Int(bits)) => return bits,
+        Some(majit_ir::Value::Float(f)) => return f.to_bits() as i64,
+        Some(majit_ir::Value::Ref(g)) => return g.0 as i64,
+        Some(majit_ir::Value::Void) | None => {}
     }
+    let opref = v.to_opref();
     let caller = std::panic::Location::caller();
     let raw = opref.raw();
     let diagnosis = if OpRef::raw_is_constant(raw) {
@@ -1149,12 +1152,6 @@ pub struct RegAlloc<'a> {
     /// Trace operations — borrowed for `opref_type` lookups (reads
     /// `op.type_` directly, RPython `box.type` parity).
     pub(crate) operations: &'a [OpRc],
-    /// `arg.index` raw -> idx in inputargs. Mirrors
-    /// `OpTypeIndex::inputarg_pos`.
-    pub(crate) inputarg_pos: majit_ir::PosIndex,
-    /// `op.pos.raw()` -> idx in operations, skipping Void/None ops.
-    /// Mirrors `OpTypeIndex::op_pos`.
-    pub(crate) op_pos: majit_ir::PosIndex,
     /// x86/regalloc.py:1305 self.jump_target_descr — TargetToken descriptor
     /// of the closing JUMP. PyPy keys it by Python object identity; we use
     /// the underlying `Arc<dyn Descr>` allocation address.
@@ -1190,9 +1187,7 @@ impl<'a> RegAlloc<'a> {
         let longevity = LifetimeManager::new();
         let rm = Self::make_gpr_manager();
         let xrm = Self::make_xmm_manager();
-        let fm = FrameManager::new(0);
-        let inputarg_pos = OpTypeIndex::<OpRc, InputArgRc>::build_inputarg_pos(inputargs);
-        let op_pos = OpTypeIndex::<OpRc, InputArgRc>::build_op_pos(operations);
+        let fm = FrameManager::new(crate::jitframe::FIRST_ITEM_OFFSET as i32);
         RegAlloc {
             longevity,
             rm,
@@ -1201,8 +1196,6 @@ impl<'a> RegAlloc<'a> {
             pending_moves: Vec::new(),
             inputargs,
             operations,
-            inputarg_pos,
-            op_pos,
             jump_target_descr: None,
             final_jump_args: None,
             final_jump_op_position: -1,
@@ -1237,24 +1230,8 @@ impl<'a> RegAlloc<'a> {
     }
 
     #[inline]
-    pub(crate) fn opref_type_at(&self, opref: OpRef, at_op_index: Option<usize>) -> Option<Type> {
-        // history.py:182 / resoperation.py AbstractValue: `box.type` lives on the  allow-line-citation
-        // Box object itself; pyre's typed `OpRef` variants carry the
-        // matching type tag (ConstInt/InputArgInt/IntOp …) so the
-        // variant tag IS Box class identity. Delegate to the shared
-        // `OpTypeIndex` so the variant-tag fast path and side-table
-        // fallbacks stay in lockstep with `compile.rs` and the rest of
-        // the metainterp.
-        let type_index = OpTypeIndex::from_parts(
-            self.inputargs,
-            self.operations,
-            &self.inputarg_pos,
-            &self.op_pos,
-        );
-        match at_op_index {
-            Some(at) => type_index.opref_type_at(opref, at),
-            None => type_index.opref_type(opref),
-        }
+    pub(crate) fn opref_type_at(&self, opref: OpRef, _at_op_index: Option<usize>) -> Option<Type> {
+        opref.ty().filter(|tp| *tp != Type::Void)
     }
 
     /// x86/regalloc.py X86_64_RegisterManager configuration.

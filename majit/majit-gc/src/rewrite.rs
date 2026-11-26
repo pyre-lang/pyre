@@ -800,7 +800,7 @@ impl RewriteState {
         }
         // rewrite.py `remove_constptr` appends the `LOAD_FROM_GC_TABLE`
         // straight onto `_newops`. The only arg is `ConstInt`, so this
-        // must not re-enter `emit` / `remove_constptrs_in`.
+        // must not re-enter `emit` / `replace_args_in_place`.
         let index_box = Operand::const_from_value(Value::Int(index as i64));
         let load_op = OpRc::new(mk_op(OpCode::LoadFromGcTable, &[index_box]));
         let pos = OpRef::ref_op(self.next_pos);
@@ -809,35 +809,6 @@ impl RewriteState {
         let load = self.push_emitted(load_op, pos);
         self.gcrefs_recently_loaded.insert(index, load.clone());
         load
-    }
-
-    /// rewrite.py `emit_op` arg loop — substitute each non-null
-    /// reference-constant argument with a `LoadFromGcTable` result so no
-    /// raw `GcRef` is baked into the backend. JIT_DEBUG keeps its
-    /// constants inline (rewrite.py:105 `keep`). Null pointers stay inline
-    /// (rewrite.py `bool(arg.value)`). Failargs are NOT processed —
-    /// they are resolved as plain constants in `rewrite_op` (rewrite.py:121
-    /// `get_box_replacement`), matching upstream.
-    ///
-    /// rewrite.py:123-126 additionally appends the op's *descr* gcref to
-    /// the table when the descr itself is a GC object. pyre descrs are
-    /// `Arc<FailDescrCell>` pinned via the CLT keepalive
-    /// (`asmmemmgr_gcreftracers`), not moving-GC objects, so there is no
-    /// descr gcref to forward and that branch is intentionally not ported.
-    fn remove_constptrs_in(&mut self, op: &Op) {
-        if op.opcode == OpCode::JitDebug {
-            return;
-        }
-        for i in 0..op.num_args() {
-            let gcref = match op.arg_ref(i).const_value() {
-                Some(Value::Ref(gcref)) if !gcref.is_null() => Some(gcref),
-                _ => None,
-            };
-            if let Some(gcref) = gcref {
-                let load = self.remove_constptr(gcref);
-                op.setarg(i, load);
-            }
-        }
     }
 
     /// Emit an op. Void ops do not consume a result id.
@@ -850,8 +821,10 @@ impl RewriteState {
     }
 
     fn emit_rc(&mut self, op: OpRc) -> Operand {
-        self.replace_args_in_place(&op, true);
-        self.remove_constptrs_in(&op);
+        // rewrite.py GcRewriterAssembler.emit_op: one arg walk performs both
+        // get_box_replacement and non-null ConstPtr removal. JIT_DEBUG is the
+        // upstream `keep` exception.
+        self.replace_args_in_place(&op, op.opcode == OpCode::JitDebug);
         let rt = op.result_type();
         let pos = if rt == Type::Void {
             OpRef::NONE
@@ -879,8 +852,10 @@ impl RewriteState {
     }
 
     fn emit_result_rc(&mut self, op: OpRc, preferred_pos: OpRef) -> Operand {
-        self.replace_args_in_place(&op, true);
-        self.remove_constptrs_in(&op);
+        // rewrite.py GcRewriterAssembler.emit_op: one arg walk performs both
+        // get_box_replacement and non-null ConstPtr removal. JIT_DEBUG is the
+        // upstream `keep` exception.
+        self.replace_args_in_place(&op, op.opcode == OpCode::JitDebug);
         let rt = op.result_type();
         let pos = if preferred_pos.is_none() {
             let pos = OpRef::op_typed(self.next_pos, rt);
@@ -3583,9 +3558,11 @@ fn result_pos_high_water(segments: &[&[OpRc]]) -> u32 {
     for ops in segments {
         for op in *ops {
             reserve(op.pos().get());
-            for arg in op.getarglist() {
-                reserve(arg.to_opref());
-            }
+            op.with_arglist(|args| {
+                for arg in args {
+                    reserve(arg.to_opref());
+                }
+            });
             if let Some(fail_args) = op.guard_fail_args() {
                 for arg in fail_args.iter() {
                     reserve(arg.to_opref());
@@ -7469,6 +7446,32 @@ mod tests {
             !result.iter().any(|o| o.opcode == OpCode::LoadFromGcTable),
             "JIT_DEBUG must not route its ConstPtr through the gc_table"
         );
+    }
+
+    #[test]
+    fn test_remove_constptr_interns_forwarded_constptr_arg() {
+        let _const_ptr_table = const_ptr_table_test_guard();
+        let rw = make_rewriter();
+        let r = majit_ir::GcRef(0x4000);
+        let ia = InputArg::new_ref_rc(0);
+        let operand = Operand::from_bound_inputarg(&ia);
+        operand.set_forwarded_const(Const::from_gcref(r));
+        let ops = vec![Op::new(OpCode::GuardNonnull, &[operand])];
+
+        let (result, gcrefs) = rw.rewrite_ops_with_constants(&ops);
+
+        assert_eq!(gcrefs, vec![r]);
+        let loads: Vec<&OpRc> = result
+            .iter()
+            .filter(|o| o.opcode == OpCode::LoadFromGcTable)
+            .collect();
+        assert_eq!(loads.len(), 1);
+        assert_eq!(loads[0].arg(0).const_value(), Some(Value::Int(0)));
+        let guard = result
+            .iter()
+            .find(|o| o.opcode == OpCode::GuardNonnull)
+            .expect("rewritten consumer");
+        assert_eq!(guard.arg(0).to_opref(), loads[0].pos().get());
     }
 
     #[test]

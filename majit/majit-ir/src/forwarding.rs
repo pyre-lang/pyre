@@ -290,50 +290,32 @@ pub trait ForwardingHost {
     /// into a shared borrow guard. Other states yield `None`. Does not walk
     /// the chain; the caller advances to the terminal identity first.
     fn ptr_info(&self) -> Option<PtrInfoBorrow> {
-        match self.get_forwarded() {
-            Forwarded::Info(OpInfo::Ptr(rc)) => Some(PtrInfoBorrow::new(rc)),
-            _ => None,
-        }
+        ptr_info_from_packed(self.packed_forwarded_word())
     }
 
     /// Live `Rc<RefCell<PtrInfo>>` handle (for `Rc::ptr_eq` identity / handoff).
     fn ptr_info_handle(&self) -> Option<Rc<std::cell::RefCell<PtrInfo>>> {
-        match self.get_forwarded() {
-            Forwarded::Info(OpInfo::Ptr(rc)) => Some(rc),
-            _ => None,
-        }
+        ptr_info_rc_from_packed(self.packed_forwarded_word())
     }
 
     /// Mutable counterpart of `ptr_info`.
     fn ptr_info_mut(&self) -> Option<PtrInfoBorrowMut> {
-        match self.get_forwarded() {
-            Forwarded::Info(OpInfo::Ptr(rc)) => Some(PtrInfoBorrowMut::new(rc)),
-            _ => None,
-        }
+        ptr_info_rc_from_packed(self.packed_forwarded_word()).map(PtrInfoBorrowMut::new)
     }
 
     /// `optimizer.py getintbound`.
     fn int_bound(&self) -> Option<IntBoundBorrow> {
-        match self.get_forwarded() {
-            Forwarded::Info(OpInfo::IntBound(rc)) => Some(IntBoundBorrow::new(rc)),
-            _ => None,
-        }
+        int_bound_from_packed(self.packed_forwarded_word())
     }
 
     /// Live [`IntBoundRc`] handle.
     fn int_bound_handle(&self) -> Option<IntBoundRc> {
-        match self.get_forwarded() {
-            Forwarded::Info(OpInfo::IntBound(rc)) => Some(rc),
-            _ => None,
-        }
+        int_bound_rc_from_packed(self.packed_forwarded_word())
     }
 
     /// Mutable counterpart of `int_bound`.
     fn int_bound_mut(&self) -> Option<IntBoundBorrowMut> {
-        match self.get_forwarded() {
-            Forwarded::Info(OpInfo::IntBound(rc)) => Some(IntBoundBorrowMut::new(rc)),
-            _ => None,
-        }
+        int_bound_rc_from_packed(self.packed_forwarded_word()).map(IntBoundBorrowMut::new)
     }
 }
 
@@ -571,6 +553,44 @@ pub(crate) fn lifetime_info_from_packed(w: u64) -> Option<Rc<Lifetime>> {
     let out = Rc::clone(&rc);
     std::mem::forget(rc);
     Some(out)
+}
+
+/// Peek the packed `_forwarded` tag; clone the `Rc` only on `FW_INFO_PTR`
+/// (`optimizer.py getptrinfo` / `isinstance(fw, PtrInfo)`).
+#[inline]
+fn ptr_info_rc_from_packed(w: u64) -> Option<Rc<RefCell<PtrInfo>>> {
+    if w & FW_TAG != FW_INFO_PTR {
+        return None;
+    }
+    // SAFETY: `FW_INFO_PTR` payload is `Rc<RefCell<PtrInfo>>` owned by the slot.
+    let rc = unsafe { Rc::from_raw(fwd_ptr(w) as *const RefCell<PtrInfo>) };
+    let out = Rc::clone(&rc);
+    std::mem::forget(rc);
+    Some(out)
+}
+
+#[inline]
+pub(crate) fn ptr_info_from_packed(w: u64) -> Option<PtrInfoBorrow> {
+    ptr_info_rc_from_packed(w).map(PtrInfoBorrow::new)
+}
+
+/// Peek the packed `_forwarded` tag; clone the handle only on `FW_INFO_BOUND`
+/// (`optimizer.py getintbound`).
+#[inline]
+fn int_bound_rc_from_packed(w: u64) -> Option<IntBoundRc> {
+    if w & FW_TAG != FW_INFO_BOUND {
+        return None;
+    }
+    // SAFETY: `FW_INFO_BOUND` payload is `IntBoundRc` owned by the slot.
+    let rc = unsafe { IntBoundRc::from_raw(fwd_ptr(w) as *const ()) };
+    let out = rc.clone();
+    std::mem::forget(rc);
+    Some(out)
+}
+
+#[inline]
+pub(crate) fn int_bound_from_packed(w: u64) -> Option<IntBoundBorrow> {
+    int_bound_rc_from_packed(w).map(IntBoundBorrow::new)
 }
 
 fn pack_info(info: OpInfo) -> u64 {

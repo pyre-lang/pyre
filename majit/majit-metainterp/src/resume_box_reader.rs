@@ -1838,7 +1838,7 @@ pub(crate) fn consume_virtualref_boxes(
     rd_virtuals: Option<&[std::rc::Rc<majit_ir::RdVirtualInfo>]>,
     cache: &mut BridgeVirtualCache<'_>,
 ) -> Vec<(OpRef, usize)> {
-    let vref_values = &resume_data.virtualref_values;
+    let vref_values = resume_data.virtualref_values.as_ref();
     assert!(
         vref_values.len().is_multiple_of(2),
         "virtualref_values must contain an even number of entries (got {})",
@@ -2099,12 +2099,12 @@ mod tests {
     fn empty_resume_data(fail_arg_types: Vec<Type>) -> crate::jit_state::ResumeDataResult {
         let num_failargs = fail_arg_types.len() as i32;
         crate::jit_state::ResumeDataResult {
-            frames: Vec::new(),
-            virtualizable_boxes: Vec::new(),
-            virtualref_values: Vec::new(),
+            frames: Vec::new().into(),
+            virtualizable_boxes: Vec::new().into(),
+            virtualref_values: Vec::new().into(),
             storage: None,
             num_failargs,
-            fail_arg_types,
+            fail_arg_types: fail_arg_types.into(),
         }
     }
 
@@ -2435,12 +2435,12 @@ mod tests {
             Vec::new(),
         );
         let resume_data = crate::jit_state::ResumeDataResult {
-            frames: Vec::new(),
-            virtualizable_boxes: Vec::new(),
-            virtualref_values: Vec::new(),
+            frames: Vec::new().into(),
+            virtualizable_boxes: Vec::new().into(),
+            virtualref_values: Vec::new().into(),
             storage: Some(storage),
             num_failargs: 0,
-            fail_arg_types: Vec::new(),
+            fail_arg_types: Vec::new().into(),
         };
         let virtuals = vec![std::rc::Rc::new(majit_ir::RdVirtualInfo::VirtualInfo {
             descr: Some(parent),
@@ -2518,12 +2518,12 @@ mod tests {
 
         let fail_values = [obj_ptr as usize as i64];
         let resume_data = crate::jit_state::ResumeDataResult {
-            frames: Vec::new(),
-            virtualizable_boxes: vec![majit_ir::resumedata::RebuiltValue::Box(0, Type::Ref)],
-            virtualref_values: Vec::new(),
+            frames: Vec::new().into(),
+            virtualizable_boxes: vec![majit_ir::resumedata::RebuiltValue::Box(0, Type::Ref)].into(),
+            virtualref_values: Vec::new().into(),
             storage: None,
             num_failargs: 1,
-            fail_arg_types: vec![Type::Ref],
+            fail_arg_types: vec![Type::Ref].into(),
         };
         let mut cache = BridgeVirtualCache::new(1, default_bridge_array_descr);
         let seeded = seed_bridge_virtualizable_boxes(
@@ -2584,12 +2584,12 @@ mod tests {
             Vec::new(),
         );
         let resume_data = crate::jit_state::ResumeDataResult {
-            frames: Vec::new(),
-            virtualizable_boxes: Vec::new(),
-            virtualref_values: Vec::new(),
+            frames: Vec::new().into(),
+            virtualizable_boxes: Vec::new().into(),
+            virtualref_values: Vec::new().into(),
             storage: Some(storage),
             num_failargs: 0,
-            fail_arg_types: Vec::new(),
+            fail_arg_types: Vec::new().into(),
         };
         let virtuals = vec![std::rc::Rc::new(majit_ir::RdVirtualInfo::VStrConcatInfo {
             fieldnums: vec![tag0, tag1],
@@ -2653,12 +2653,12 @@ mod tests {
             Vec::new(),
         );
         let resume_data = crate::jit_state::ResumeDataResult {
-            frames: Vec::new(),
-            virtualizable_boxes: Vec::new(),
-            virtualref_values: Vec::new(),
+            frames: Vec::new().into(),
+            virtualizable_boxes: Vec::new().into(),
+            virtualref_values: Vec::new().into(),
             storage: Some(storage),
             num_failargs: 0,
-            fail_arg_types: Vec::new(),
+            fail_arg_types: Vec::new().into(),
         };
         let virtuals = vec![std::rc::Rc::new(majit_ir::RdVirtualInfo::VStrConcatInfo {
             fieldnums: vec![tag0, tag1],

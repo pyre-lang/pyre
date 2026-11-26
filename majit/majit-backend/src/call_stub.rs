@@ -874,6 +874,22 @@ fn call_stub_for(calldescr: &BhCallDescr) -> &BhCallStub {
         .get_or_init(|| create_call_stub(&calldescr.arg_classes, calldescr.result_type))
 }
 
+/// `llmodel.py AbstractLLCPU.bh_call_i` after `isinstance`: the
+/// descr's call stub, without the wasm residual-host-call hook.
+///
+/// # Safety
+/// Same as [`bh_call_i_with_descr`].
+#[inline(always)]
+pub unsafe fn call_stub_i(
+    func: usize,
+    args_i: &[i64],
+    args_r: &[i64],
+    args_f: &[i64],
+    calldescr: &BhCallDescr,
+) -> i64 {
+    unsafe { call_stub_for(calldescr).call_i(func, args_i, args_r, args_f) }
+}
+
 /// `llmodel.py AbstractLLCPU.bh_call_i`: read the per-descr stub and call.
 ///
 /// # Safety
@@ -881,9 +897,9 @@ fn call_stub_for(calldescr: &BhCallDescr) -> &BhCallStub {
 #[inline(always)]
 pub unsafe fn bh_call_i_with_descr(
     func: usize,
-    args_i: Option<&[i64]>,
-    args_r: Option<&[i64]>,
-    args_f: Option<&[i64]>,
+    args_i: &[i64],
+    args_r: &[i64],
+    args_f: &[i64],
     calldescr: &BhCallDescr,
 ) -> i64 {
     if residual_host_call().is_some() {
@@ -900,7 +916,23 @@ pub unsafe fn bh_call_i_with_descr(
             return result;
         }
     }
-    unsafe { call_stub_for(calldescr).call_i(func, args_i, args_r, args_f) }
+    unsafe { call_stub_i(func, args_i, args_r, args_f, calldescr) }
+}
+
+/// `llmodel.py AbstractLLCPU.bh_call_f` after `isinstance`: the
+/// descr's call stub, without the wasm residual-host-call hook.
+///
+/// # Safety
+/// Same as [`bh_call_f_with_descr`].
+#[inline(always)]
+pub unsafe fn call_stub_f(
+    func: usize,
+    args_i: &[i64],
+    args_r: &[i64],
+    args_f: &[i64],
+    calldescr: &BhCallDescr,
+) -> f64 {
+    unsafe { call_stub_for(calldescr).call_f(func, args_i, args_r, args_f) }
 }
 
 /// `llmodel.py AbstractLLCPU.bh_call_f` parallel of [`bh_call_i_with_descr`].
@@ -909,9 +941,9 @@ pub unsafe fn bh_call_i_with_descr(
 /// See [`bh_call_i_with_descr`].
 pub unsafe fn bh_call_f_with_descr(
     func: usize,
-    args_i: Option<&[i64]>,
-    args_r: Option<&[i64]>,
-    args_f: Option<&[i64]>,
+    args_i: &[i64],
+    args_r: &[i64],
+    args_f: &[i64],
     calldescr: &BhCallDescr,
 ) -> f64 {
     if residual_host_call().is_some() {
@@ -928,7 +960,23 @@ pub unsafe fn bh_call_f_with_descr(
             return f64::from_bits(bits as u64);
         }
     }
-    unsafe { call_stub_for(calldescr).call_f(func, args_i, args_r, args_f) }
+    unsafe { call_stub_f(func, args_i, args_r, args_f, calldescr) }
+}
+
+/// `llmodel.py AbstractLLCPU.bh_call_v` after `isinstance`: the
+/// descr's call stub, without the wasm residual-host-call hook.
+///
+/// # Safety
+/// Same as [`bh_call_v_with_descr`].
+#[inline(always)]
+pub unsafe fn call_stub_v(
+    func: usize,
+    args_i: &[i64],
+    args_r: &[i64],
+    args_f: &[i64],
+    calldescr: &BhCallDescr,
+) {
+    unsafe { call_stub_for(calldescr).call_v(func, args_i, args_r, args_f) }
 }
 
 /// `llmodel.py AbstractLLCPU.bh_call_v` parallel of [`bh_call_i_with_descr`].
@@ -937,9 +985,9 @@ pub unsafe fn bh_call_f_with_descr(
 /// See [`bh_call_i_with_descr`].
 pub unsafe fn bh_call_v_with_descr(
     func: usize,
-    args_i: Option<&[i64]>,
-    args_r: Option<&[i64]>,
-    args_f: Option<&[i64]>,
+    args_i: &[i64],
+    args_r: &[i64],
+    args_f: &[i64],
     calldescr: &BhCallDescr,
 ) {
     if residual_host_call().is_some() {
@@ -966,7 +1014,7 @@ pub unsafe fn bh_call_v_with_descr(
             return;
         }
     }
-    unsafe { call_stub_for(calldescr).call_v(func, args_i, args_r, args_f) }
+    unsafe { call_stub_v(func, args_i, args_r, args_f, calldescr) }
 }
 
 /// Build the C-ABI class sequence and positional argument list from
@@ -1000,9 +1048,9 @@ pub unsafe fn bh_call_v_with_descr(
 /// with no intermediate collection at all.
 pub fn collect_call_args(
     arg_classes: &str,
-    args_i: Option<&[i64]>,
-    args_r: Option<&[i64]>,
-    args_f: Option<&[i64]>,
+    args_i: &[i64],
+    args_r: &[i64],
+    args_f: &[i64],
 ) -> CallArgs {
     // descr.py verify_types parity: assert per-class counts.
     let count_i: usize = arg_classes
@@ -1014,9 +1062,9 @@ pub fn collect_call_args(
         .chars()
         .filter(|c| matches!(c, 'f' | 'L'))
         .count();
-    let len_i = args_i.map_or(0, <[i64]>::len);
-    let len_r = args_r.map_or(0, <[i64]>::len);
-    let len_f = args_f.map_or(0, <[i64]>::len);
+    let len_i = args_i.len();
+    let len_r = args_r.len();
+    let len_f = args_f.len();
     assert_eq!(
         count_i, len_i,
         "BhCallDescr.verify_types: arg_classes={arg_classes:?} has {count_i} int slots, args_i has {len_i}"
@@ -1037,24 +1085,15 @@ pub fn collect_call_args(
     for c in arg_classes.chars() {
         match c {
             'i' => {
-                out.push(
-                    ArgClass::Int,
-                    args_i.expect("BhCallDescr.collect_call_args: args_i missing")[ii],
-                );
+                out.push(ArgClass::Int, args_i[ii]);
                 ii += 1;
             }
             'r' => {
-                out.push(
-                    ArgClass::Int,
-                    args_r.expect("BhCallDescr.collect_call_args: args_r missing")[ri],
-                );
+                out.push(ArgClass::Int, args_r[ri]);
                 ri += 1;
             }
             'f' => {
-                out.push(
-                    ArgClass::Float,
-                    args_f.expect("BhCallDescr.collect_call_args: args_f missing")[fi],
-                );
+                out.push(ArgClass::Float, args_f[fi]);
                 fi += 1;
             }
             'L' => {
@@ -1062,19 +1101,13 @@ pub fn collect_call_args(
                 // (PyPy rewrites `c = 'f'` for the lookup); FUNC parameter
                 // type = `lltype.SignedLongLong` -> C `long long` ->
                 // 8-byte int dispatched in an integer register.
-                out.push(
-                    ArgClass::Int,
-                    args_f.expect("BhCallDescr.collect_call_args: args_f missing")[fi],
-                );
+                out.push(ArgClass::Int, args_f[fi]);
                 fi += 1;
             }
             'S' => {
                 // descr.py process('S'): storage bank = `args_i`
                 // (`int2singlefloat`); FUNC parameter type = C `float`.
-                out.push(
-                    ArgClass::Single,
-                    args_i.expect("BhCallDescr.collect_call_args: args_i missing")[ii],
-                );
+                out.push(ArgClass::Single, args_i[ii]);
                 ii += 1;
             }
             other => panic!(
@@ -1097,9 +1130,9 @@ pub fn collect_call_args(
 /// trampoline path (see [`residual_host_call`]).
 pub fn collect_call_args_positional(
     arg_classes: &str,
-    args_i: Option<&[i64]>,
-    args_r: Option<&[i64]>,
-    args_f: Option<&[i64]>,
+    args_i: &[i64],
+    args_r: &[i64],
+    args_f: &[i64],
 ) -> Vec<i64> {
     let mut out: Vec<i64> = Vec::with_capacity(arg_classes.len());
     let mut ii = 0usize;
@@ -1108,11 +1141,11 @@ pub fn collect_call_args_positional(
     for c in arg_classes.chars() {
         match c {
             'i' => {
-                out.push(args_i.expect("collect_call_args_positional: args_i missing")[ii]);
+                out.push(args_i[ii]);
                 ii += 1;
             }
             'r' => {
-                out.push(args_r.expect("collect_call_args_positional: args_r missing")[ri]);
+                out.push(args_r[ri]);
                 ri += 1;
             }
             // `f` (Float) and `L` (SignedLongLong) both live in the `args_f`
@@ -1120,7 +1153,7 @@ pub fn collect_call_args_positional(
             // — the host trampoline coerces it to f64/i64 from the callee's
             // reflected parameter type.
             'f' | 'L' => {
-                out.push(args_f.expect("collect_call_args_positional: args_f missing")[fi]);
+                out.push(args_f[fi]);
                 fi += 1;
             }
             other => panic!(
@@ -1145,9 +1178,9 @@ pub fn collect_call_args_positional(
 pub unsafe fn bh_call_i_by_classes(
     func: usize,
     arg_classes: &str,
-    args_i: Option<&[i64]>,
-    args_r: Option<&[i64]>,
-    args_f: Option<&[i64]>,
+    args_i: &[i64],
+    args_r: &[i64],
+    args_f: &[i64],
 ) -> i64 {
     let collected = collect_call_args(arg_classes, args_i, args_r, args_f);
     unsafe { bh_call_i_dispatch(func, collected.classes(), collected.args()) }
@@ -1160,9 +1193,9 @@ pub unsafe fn bh_call_i_by_classes(
 pub unsafe fn bh_call_ref_by_classes(
     func: usize,
     arg_classes: &str,
-    args_i: Option<&[i64]>,
-    args_r: Option<&[i64]>,
-    args_f: Option<&[i64]>,
+    args_i: &[i64],
+    args_r: &[i64],
+    args_f: &[i64],
 ) -> i64 {
     let collected = collect_call_args(arg_classes, args_i, args_r, args_f);
     unsafe { bh_call_r_dispatch(func, collected.classes(), collected.args()) }
@@ -1175,9 +1208,9 @@ pub unsafe fn bh_call_ref_by_classes(
 pub unsafe fn bh_call_f_by_classes(
     func: usize,
     arg_classes: &str,
-    args_i: Option<&[i64]>,
-    args_r: Option<&[i64]>,
-    args_f: Option<&[i64]>,
+    args_i: &[i64],
+    args_r: &[i64],
+    args_f: &[i64],
 ) -> f64 {
     let collected = collect_call_args(arg_classes, args_i, args_r, args_f);
     unsafe { bh_call_f_dispatch(func, collected.classes(), collected.args()) }
@@ -1190,9 +1223,9 @@ pub unsafe fn bh_call_f_by_classes(
 pub unsafe fn bh_call_v_by_classes(
     func: usize,
     arg_classes: &str,
-    args_i: Option<&[i64]>,
-    args_r: Option<&[i64]>,
-    args_f: Option<&[i64]>,
+    args_i: &[i64],
+    args_r: &[i64],
+    args_f: &[i64],
 ) {
     let collected = collect_call_args(arg_classes, args_i, args_r, args_f);
     unsafe { bh_call_v_dispatch(func, collected.classes(), collected.args()) }
@@ -1298,7 +1331,7 @@ mod tests {
     fn call_stub_i_singlefloat_passes_f32() {
         let _hook_test = hold_hook_test_lock();
         let bits = 1.5f32.to_bits() as i64;
-        let collected = collect_call_args("Si", Some(&[bits, 7]), None, None);
+        let collected = collect_call_args("Si", &[bits, 7], &[], &[]);
         assert_eq!(collected.classes(), &[ArgClass::Single, ArgClass::Int]);
         let result = unsafe {
             bh_call_i_dispatch(
@@ -1316,12 +1349,10 @@ mod tests {
         let _hook_test = hold_hook_test_lock();
         let stub = create_call_stub("S", 'S');
         let bits = 1.5f32.to_bits() as i64;
-        let result =
-            unsafe { stub.call_i(single_ret as *const () as usize, Some(&[bits]), None, None) };
+        let result = unsafe { stub.call_i(single_ret as *const () as usize, &[bits], &[], &[]) };
         assert_eq!(result, singlefloat2int(2.5));
         let neg = singlefloat2int(-2.0);
-        let neg_result =
-            unsafe { stub.call_i(single_ret as *const () as usize, Some(&[neg]), None, None) };
+        let neg_result = unsafe { stub.call_i(single_ret as *const () as usize, &[neg], &[], &[]) };
         assert_eq!(neg_result, singlefloat2int(-1.0));
     }
 
@@ -1401,7 +1432,7 @@ mod tests {
     fn collect_call_args_refuses_more_arguments_than_the_table_covers() {
         let too_many = MAX_HOST_CALL_ARITY + 1;
         let args_i = vec![0_i64; too_many];
-        let _ = collect_call_args(&"i".repeat(too_many), Some(&args_i), None, None);
+        let _ = collect_call_args(&"i".repeat(too_many), &args_i, &[], &[]);
     }
 
     /// One argument past that bound the table has no arm, so the call is
@@ -1476,8 +1507,7 @@ mod tests {
         ]));
         assert!(call_stub_arm_exists(&[ArgClass::Int; 8]));
         assert!(call_stub_arm_exists(&[ArgClass::Int; MAX_HOST_CALL_ARITY]));
-        let collected =
-            collect_call_args("iriririr", Some(&[1, 2, 3, 4]), Some(&[5, 6, 7, 8]), None);
+        let collected = collect_call_args("iriririr", &[1, 2, 3, 4], &[5, 6, 7, 8], &[]);
         assert!(collected.classes().iter().all(|c| *c == ArgClass::Int));
         assert!(call_stub_arm_exists(collected.classes()));
         assert!(call_stub_arm_exists(&[ArgClass::Single, ArgClass::Int]));
@@ -1515,10 +1545,52 @@ mod tests {
             'i',
             majit_ir::descr::EffectInfo::MOST_GENERAL,
         );
-        let result = unsafe {
-            bh_call_i_with_descr(7, Some(&[1, 2, 3, 4]), Some(&[5, 6, 7, 8]), None, &descr)
-        };
+        let result = unsafe { bh_call_i_with_descr(7, &[1, 2, 3, 4], &[5, 6, 7, 8], &[], &descr) };
         assert_eq!(result, 42);
+    }
+
+    /// `call_stub_i` is the descr's stub. An installed residual-host-call
+    /// hook is visible only through `bh_call_i_with_descr`.
+    #[test]
+    fn call_stub_i_skips_the_installed_host_hook() {
+        let _hook_test = hold_hook_test_lock();
+        struct Clear;
+        impl Drop for Clear {
+            fn drop(&mut self) {
+                set_residual_host_call(None);
+            }
+        }
+        let _clear = Clear;
+        extern "C" fn eight_ints(
+            a: i64,
+            b: i64,
+            c: i64,
+            d: i64,
+            e: i64,
+            f: i64,
+            g: i64,
+            h: i64,
+        ) -> i64 {
+            a + b + c + d + e + f + g + h
+        }
+        set_residual_host_call(Some(|_func, args, _classes, result, signed, size| {
+            assert_eq!(args, &[1, 5, 2, 6, 3, 7, 4, 8]);
+            assert_eq!(result, 'i');
+            assert!(signed);
+            assert_eq!(size, 8);
+            Some(42)
+        }));
+        let descr = BhCallDescr::from_arg_classes(
+            "iriririr".to_string(),
+            'i',
+            majit_ir::descr::EffectInfo::MOST_GENERAL,
+        );
+        let func = eight_ints as *const () as usize;
+        let from_stub = unsafe { call_stub_i(func, &[1, 2, 3, 4], &[5, 6, 7, 8], &[], &descr) };
+        assert_eq!(from_stub, 36);
+        let from_hook =
+            unsafe { bh_call_i_with_descr(func, &[1, 2, 3, 4], &[5, 6, 7, 8], &[], &descr) };
+        assert_eq!(from_hook, 42);
     }
 
     /// `'L'` is an i64 return stored in the float bank. The host result is the
@@ -1542,7 +1614,7 @@ mod tests {
             'L',
             majit_ir::descr::EffectInfo::MOST_GENERAL,
         );
-        let value = unsafe { bh_call_f_with_descr(3, Some(&[9]), None, None, &descr) };
+        let value = unsafe { bh_call_f_with_descr(3, &[9], &[], &[], &descr) };
         assert_eq!(value, 1.0);
     }
 
@@ -1560,9 +1632,9 @@ mod tests {
         let result = unsafe {
             bh_call_f_with_descr(
                 f2 as *const () as usize,
-                None,
-                Some(&[b.as_ptr() as i64]),
-                Some(&[3.5_f64.to_bits() as i64]),
+                &[],
+                &[b.as_ptr() as i64],
+                &[3.5_f64.to_bits() as i64],
                 &descr,
             )
         };
@@ -1583,25 +1655,11 @@ mod tests {
             'i',
             majit_ir::descr::EffectInfo::MOST_GENERAL,
         );
-        let result = unsafe {
-            bh_call_i_with_descr(
-                rii as *const () as usize,
-                Some(&[2, 3]),
-                Some(&[1]),
-                None,
-                &descr,
-            )
-        };
+        let result =
+            unsafe { bh_call_i_with_descr(rii as *const () as usize, &[2, 3], &[1], &[], &descr) };
         assert_eq!(result, 321);
-        let again = unsafe {
-            bh_call_i_with_descr(
-                rii as *const () as usize,
-                Some(&[2, 3]),
-                Some(&[1]),
-                None,
-                &descr,
-            )
-        };
+        let again =
+            unsafe { bh_call_i_with_descr(rii as *const () as usize, &[2, 3], &[1], &[], &descr) };
         assert_eq!(again, 321);
         assert!(descr.call_stub.get().is_some());
         assert!(descr.call_stub.get().and_then(|s| s.call_i_banks).is_some());

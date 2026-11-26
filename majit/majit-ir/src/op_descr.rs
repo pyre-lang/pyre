@@ -286,9 +286,10 @@ impl Op {
 
     /// Overwrite the per-failarg type vector.  Takes `&self`
     /// (interior mutability through `RefCell`) so shared `Op` instances
-    /// can be re-stamped without `&mut`.
-    pub fn set_fail_arg_types(&self, types: Vec<crate::value::Type>) {
-        self.ensure_guard_extra().set_fail_arg_types(&types);
+    /// can be re-stamped without `&mut`. `GuardExtra::set_fail_arg_types`
+    /// copies inline or interns from the slice.
+    pub fn set_fail_arg_types(&self, types: impl AsRef<[crate::value::Type]>) {
+        self.ensure_guard_extra().set_fail_arg_types(types.as_ref());
     }
 
     /// Clear the per-failarg type vector.

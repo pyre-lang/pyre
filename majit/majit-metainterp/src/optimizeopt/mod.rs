@@ -5088,7 +5088,7 @@ impl OptContext {
         if self.inputarg_base == 0 || !arg.is_inputarg() {
             return None;
         }
-        let slot = arg.to_opref().raw();
+        let slot = arg.inputarg_index()?;
         if slot >= self.num_inputs {
             return None;
         }
@@ -5218,21 +5218,14 @@ impl OptContext {
         }
     }
 
-    /// `optimizer.py getptrinfo + info.is_virtual()` operand-path
-    /// helper. Returns whether the box at `opref` (after chain walk)
-    /// carries a `PtrInfo` whose `is_virtual()` is true. Reads via
-    /// `Operand::ptr_info()` on the chain-walked terminal box; an
-    /// unresolvable opref (synthetic test paths) returns `false`.
     /// `optimizer.py is_virtual(op)`:
     /// ```python
     /// def is_virtual(self, op):
     ///     opinfo = getptrinfo(op)
     ///     return opinfo is not None and opinfo.is_virtual()
     /// ```
-    /// operand-direct read — chain walks via
-    /// `Operand::get_box_replacement` then queries `ptr_info().is_virtual()`.
     pub fn is_virtual(&self, op: &Operand) -> bool {
-        op.with_box_replacement(|b| b.ptr_info().is_some_and(|p| p.is_virtual()))
+        self.with_ptrinfo(op, |info| info.is_some_and(|p| p.is_virtual()))
     }
 
     /// `info.py PtrInfo.is_nonnull` (base False) + subclass
@@ -5324,9 +5317,7 @@ impl OptContext {
     }
 
     /// `info.py getptrinfo(op) is not None` parity — true when
-    /// the box carries any `PtrInfo` in its chain-terminal `_forwarded`
-    /// Info slot. Walks via `Operand::get_box_replacement(false)` then
-    /// queries `ptr_info().is_some()`.
+    /// the box carries any `PtrInfo` after `getptrinfo`.
     pub fn has_ptr_info(&self, op: &Operand) -> bool {
         // Mirror `getptrinfo(op).is_some()` so the gate behaves
         // identically. info.py dispatches by `op.type`: only
@@ -5336,7 +5327,9 @@ impl OptContext {
         // here so callers of `has_ptr_info` can pass any typed operand
         // without first guarding on the type.
         match op.type_() {
-            majit_ir::Type::Int | majit_ir::Type::Ref => self.getptrinfo_handle(op).is_some(),
+            majit_ir::Type::Int | majit_ir::Type::Ref => {
+                self.with_ptrinfo(op, |info| info.is_some())
+            }
             majit_ir::Type::Float | majit_ir::Type::Void => false,
         }
     }
@@ -6640,7 +6633,7 @@ impl OptContext {
                 final_oprefs,
             );
         }
-        op.set_fail_arg_types(new_types.clone());
+        op.set_fail_arg_types(&new_types);
         // optimizer.py `store_final_boxes_in_guard` parity:
         //   if op.getdescr() is not None:
         //       descr = op.getdescr()
@@ -6652,7 +6645,7 @@ impl OptContext {
         // `fail_index`, subtype, vector_info) and only mutates its
         // `fail_arg_types`. Pyre's `ResumeGuardDescr` /
         // ResumeAtPositionDescr / CompileLoopVersionDescr keep `types`
-        // in `UnsafeCell<Vec<Type>>`, exposed via
+        // in `UnsafeCell<SmallVec<[Type; 16]>>`, exposed via
         // `FailDescr::set_fail_arg_types`, so we mutate in place — the
         // load-bearing contract that subtype markers
         // (`is_resume_at_position()`, `loop_version()`) survive
@@ -7434,6 +7427,84 @@ impl OptContext {
         })
     }
 
+    /// info.py `getrawptrinfo(op)` as a callback over a borrowed `PtrInfo`.
+    /// Synthesizes `ConstPtrInfo` on the stack for `ConstInt`; live infos
+    /// are the `PtrInfoBorrow` projection. Identity-sensitive and mutating
+    /// callers keep [`Self::getrawptrinfo_handle`].
+    pub fn with_raw_ptrinfo<R>(&self, op: &Operand, f: impl FnOnce(Option<&PtrInfo>) -> R) -> R {
+        use crate::optimizeopt::info::OpInfo;
+        use majit_ir::forwarding::Forwarded;
+        self.with_resolved_operand(op, |terminal| {
+            let (tp, const_val) = terminal.with_view(|v| (v.type_(), v.const_value()));
+            debug_assert_eq!(
+                tp,
+                majit_ir::Type::Int,
+                "getrawptrinfo: expected 'i'-typed operand"
+            );
+            if let Some(Value::Int(bits)) = const_val {
+                let constant = PtrInfo::Constant(majit_ir::GcRef(bits as usize));
+                return f(Some(&constant));
+            }
+            match terminal.ptr_info() {
+                Some(info) => f(Some(&info)),
+                None => match terminal.get_forwarded() {
+                    Forwarded::None => f(None),
+                    Forwarded::Info(OpInfo::IntBound(_)) => f(None),
+                    Forwarded::Info(other) => panic!(
+                        "getrawptrinfo: forwarded must be IntBound or AbstractRawPtrInfo \
+                         (info.py getrawptrinfo), got {:?}",
+                        std::mem::discriminant(&other),
+                    ),
+                    _ => unreachable!(
+                        "getrawptrinfo: chain terminal must not carry Forwarded::Const \
+                         (forwarding.rs get_box_replacement walker invariant)",
+                    ),
+                },
+            }
+        })
+    }
+
+    /// info.py `getptrinfo(op)` as a callback over a borrowed `PtrInfo`.
+    /// The `PtrInfoBorrow` guard cannot escape the callback. Constant
+    /// `PtrInfo` is a fresh per-call stack object. Callers that retain
+    /// identity (`same_info`) or mutate through `borrow_mut` keep
+    /// [`Self::getptrinfo_handle`].
+    pub fn with_ptrinfo<R>(&self, op: &Operand, f: impl FnOnce(Option<&PtrInfo>) -> R) -> R {
+        use majit_ir::forwarding::Forwarded;
+
+        match op.type_() {
+            majit_ir::Type::Int => {
+                return self.with_raw_ptrinfo(op, f);
+            }
+            majit_ir::Type::Float => return f(None),
+            majit_ir::Type::Ref => {}
+            majit_ir::Type::Void => panic!("getptrinfo: Void box"),
+        }
+
+        self.with_resolved_operand(op, |terminal| {
+            if let Some(Value::Ref(gcref)) = terminal.const_value() {
+                let constant = PtrInfo::Constant(gcref);
+                return f(Some(&constant));
+            }
+            match terminal.ptr_info() {
+                Some(info) => f(Some(&info)),
+                None => {
+                    // Preserve getptrinfo_handle's assertion that a Ref terminal
+                    // cannot carry a non-Ptr Info. `get_forwarded` is only on this
+                    // exceptional branch, not every successful read.
+                    match terminal.get_forwarded() {
+                        Forwarded::None => f(None),
+                        Forwarded::Info(other) => panic!(
+                            "getptrinfo: forwarded must be PtrInfo, got {:?}",
+                            std::mem::discriminant(&other),
+                        ),
+                        _ => unreachable!("resolved terminal has a forwarding target"),
+                    }
+                }
+            }
+        })
+    }
+
     /// info.py `getptrinfo(op)` parity (line-by-line port).
     ///
     /// ```python
@@ -7459,7 +7530,7 @@ impl OptContext {
     /// no synthetic Void filler box exists that would smuggle a
     /// type-erased pointer through this helper.
     pub fn getptrinfo(&self, op: &Operand) -> Option<PtrInfo> {
-        self.getptrinfo_handle(op).map(|h| h.snapshot())
+        self.with_ptrinfo(op, |info| info.cloned())
     }
 
     /// info.py `getptrinfo(op)` parity — orthodox return
@@ -8196,7 +8267,10 @@ impl OptContext {
         &mut self,
         op: &Operand,
     ) -> Option<&mut crate::optimizeopt::info::PtrInfo> {
-        let gcref = self.getptrinfo_handle(op).and_then(|h| h.constant_ref())?;
+        let gcref = self.with_ptrinfo(op, |info| match info {
+            Some(PtrInfo::Constant(g)) => Some(*g),
+            _ => None,
+        })?;
         if gcref.is_null() {
             return None;
         }
@@ -8213,7 +8287,10 @@ impl OptContext {
     ) -> Option<&mut crate::optimizeopt::info::PtrInfo> {
         use crate::optimizeopt::info::PtrInfo;
         // info.py:719: ref = self._const.getref_base()
-        let gcref = self.getptrinfo_handle(op).and_then(|h| h.constant_ref())?;
+        let gcref = self.with_ptrinfo(op, |info| match info {
+            Some(PtrInfo::Constant(g)) => Some(*g),
+            _ => None,
+        })?;
         // info.py:720-721: if not ref: raise InvalidLoop. Recorded as a
         // deferred signal (checked by the driver) and `None` returned so
         // callers take their existing "no info" path until the barrier aborts.
@@ -8266,7 +8343,10 @@ impl OptContext {
         descr: DescrRef,
     ) -> Option<&mut crate::optimizeopt::info::PtrInfo> {
         // info.py:729: ref = self._const.getref_base()
-        let gcref = self.getptrinfo_handle(op).and_then(|h| h.constant_ref())?;
+        let gcref = self.with_ptrinfo(op, |info| match info {
+            Some(PtrInfo::Constant(g)) => Some(*g),
+            _ => None,
+        })?;
         // info.py:730-731: if not ref: raise InvalidLoop. Deferred signal +
         // `None` return; the driver aborts at the next barrier.
         if gcref.is_null() {
@@ -9847,6 +9927,62 @@ mod boxref_forwarding_tests {
             h2.borrow().get_last_guard_pos(),
             Some(99),
             "h2 must observe h1's mutation (shared Rc cell)"
+        );
+    }
+
+    /// info.py getptrinfo read-only path: ConstPtr / live `_forwarded` /
+    /// missing info, without cloning a `PtrInfoHandle`.
+    #[test]
+    fn with_ptrinfo_constant_live_none() {
+        use majit_ir::GcRef;
+
+        let (ctx, live) = ctx_with_one_ref_box();
+        let constant = Operand::const_from_value(Value::Ref(GcRef(0x1000)));
+        ctx.with_ptrinfo(&constant, |info| {
+            assert!(matches!(info, Some(PtrInfo::Constant(g)) if g.0 == 0x1000));
+        });
+
+        ctx.with_ptrinfo(&live, |info| {
+            assert!(info.is_none(), "unset live box has no PtrInfo");
+        });
+        ctx.set_ptr_info(&live, PtrInfo::NonNull { last_guard_pos: 3 });
+        ctx.with_ptrinfo(&live, |info| {
+            assert!(matches!(info, Some(PtrInfo::NonNull { last_guard_pos: 3 })));
+        });
+
+        let raw = Operand::const_from_value(Value::Int(42));
+        ctx.with_ptrinfo(&raw, |info| {
+            assert!(matches!(info, Some(PtrInfo::Constant(g)) if g.0 == 42));
+        });
+    }
+
+    /// A nested exclusive borrow of the same live cell panics (`RefCell`).
+    #[test]
+    fn with_ptrinfo_rejects_nested_mutable_borrow() {
+        let (ctx, b) = ctx_with_one_ref_box();
+        ctx.set_ptr_info(&b, PtrInfo::NonNull { last_guard_pos: 0 });
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            ctx.with_ptrinfo(&b, |_info| {
+                let _ = ctx.with_ptr_info_mut(&b, |info| info.set_last_guard_pos(1));
+            });
+        }));
+        assert!(
+            panicked.is_err(),
+            "with_ptr_info_mut must not run under an active PtrInfoBorrow"
+        );
+    }
+
+    /// Dropping the callback guard releases the cell, so a later
+    /// `_forwarded` write is allowed.
+    #[test]
+    fn with_ptrinfo_allows_forwarded_change_after_callback() {
+        let (ctx, b) = ctx_with_one_ref_box();
+        ctx.set_ptr_info(&b, PtrInfo::NonNull { last_guard_pos: 1 });
+        ctx.with_ptrinfo(&b, |_| ());
+        ctx.set_ptr_info(&b, PtrInfo::NonNull { last_guard_pos: 9 });
+        assert_eq!(
+            ctx.with_ptrinfo(&b, |info| info.and_then(|p| p.get_last_guard_pos())),
+            Some(9)
         );
     }
 

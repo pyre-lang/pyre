@@ -65,8 +65,9 @@ pub fn numbering_gc_type_id() -> u32 {
 }
 
 /// `lltype.malloc(NUMBERING, len)` via the collecting nursery entry.
-fn alloc_numbering_bytes(bytes: &[u8]) -> usize {
-    let len = bytes.len();
+/// Stores the length word; encoded bytes are written after this returns
+/// (`Writer.create_numbering`).
+fn alloc_numbering_bytes(len: usize) -> usize {
     let payload = TRACE_OPS_CHARS + len;
     let mut live = majit_ir::GcRef(0);
     let mut needs_write_barrier = false;
@@ -83,13 +84,6 @@ fn alloc_numbering_bytes(bytes: &[u8]) -> usize {
     }
     unsafe {
         *(fresh.0 as *mut usize) = len;
-        if len > 0 {
-            std::ptr::copy_nonoverlapping(
-                bytes.as_ptr(),
-                (fresh.0 as *mut u8).add(TRACE_OPS_CHARS),
-                len,
-            );
-        }
     }
     let _ = needs_write_barrier;
     let _ = live;
@@ -1762,6 +1756,11 @@ pub(crate) enum Box {
     /// `history.py` `class ConstPtr(Const)` — `getref_base()`
     /// address; `_cached_const_ptr` dedups via `_refs_dict`.
     ConstPtr(u64),
+    /// `history.py` `ConstPtrJitCode` — intern table index already on
+    /// the box (`OpRef::const_ptr_index`). `_cached_const_ptr` reads
+    /// `getref_base` via `const_ptr_table::resolve` and dedups through
+    /// `_refs_dict`; it does not call `intern_under`.
+    ConstPtrIndexed(u32),
     /// `resoperation.py` `AbstractResOpOrInputArg.get_position()`
     /// — the `_index` slot into the trace's op/inputarg namespace.
     ResOp(u32),
@@ -2322,8 +2321,13 @@ impl Trace {
     /// append; pin only on the append that may collect.
     pub fn _encode_ptr(&mut self, addr: u64) -> i64 {
         self._consts_ptr += 1;
+        tag(TAGCONSTPTR, self.intern_ptr_addr(addr)) as i64
+    }
+
+    /// `opencoder.py` `_cached_const_ptr` dict lookup then maybe append.
+    fn intern_ptr_addr(&mut self, addr: u64) -> u32 {
         if addr == 0 {
-            return tag(TAGCONSTPTR, 0) as i64;
+            return 0;
         }
         let key = majit_ir::gc_id_or_identityhash(addr as usize) as u64;
         let cached = self
@@ -2333,7 +2337,7 @@ impl Trace {
             .or_else(|| self._refs_dict.get(&(addr as u64)).copied())
             .filter(|&idx| self._refs.as_slice().get(idx as usize).copied() == Some(addr as usize));
         if let Some(idx) = cached {
-            return tag(TAGCONSTPTR, idx) as i64;
+            return idx;
         }
         let pin = (self._refs.len() == self._refs.capacity())
             .then(|| pin_gc_addr(addr as usize))
@@ -2347,7 +2351,24 @@ impl Trace {
         if key != stored as u64 {
             self._refs_dict.insert(stored as u64, idx);
         }
-        tag(TAGCONSTPTR, idx) as i64
+        idx
+    }
+
+    /// `opencoder.py` `_cached_const_ptr` for `ConstPtrJitCode`.
+    /// `getref_base` is `const_ptr_table::resolve`; `_refs_dict` dedups
+    /// the same way as `_encode_ptr`.
+    fn cached_const_ptr_indexed(&mut self, intern_index: u32) -> u32 {
+        if intern_index == 0 {
+            return 0;
+        }
+        let addr = majit_ir::const_ptr_table::resolve(intern_index).0 as u64;
+        self.intern_ptr_addr(addr)
+    }
+
+    /// `_encode` of `ConstPtrJitCode`: intern index already on the box.
+    fn _encode_ptr_indexed(&mut self, intern_index: u32) -> i64 {
+        self._consts_ptr += 1;
+        tag(TAGCONSTPTR, self.cached_const_ptr_indexed(intern_index)) as i64
     }
 
     /// opencoder.py _encode for AbstractResOp — boxes that live
@@ -2375,6 +2396,8 @@ impl Trace {
             Box::ConstFloat(raw) => self._encode_float(raw),
             // opencoder.py:629-632 ConstPtr.
             Box::ConstPtr(addr) => self._encode_ptr(addr),
+            // `history.py` `ConstPtrJitCode.opencoder_index`.
+            Box::ConstPtrIndexed(index) => self._encode_ptr_indexed(index),
             // opencoder.py:633-638 AbstractResOp.get_position().
             Box::ResOp(p) => Self::_encode_box_position(p),
         };
@@ -3011,9 +3034,7 @@ impl Trace {
             value = 0;
         }
         let (_, old_len) = decode_varint_signed(&self.ops_bytes()[descr_pos..]);
-        let mut encoded = Vec::with_capacity(4);
-        encode_varint_signed(&mut encoded, value);
-        let new_len = encoded.len();
+        let (encoded, new_len) = encode_varint_signed_array(value);
         if new_len != old_len {
             let tail = descr_pos + old_len;
             if new_len > old_len {
@@ -3029,7 +3050,7 @@ impl Trace {
                 self._pos -= d;
             }
         }
-        self._ops.bytes_mut()[descr_pos..descr_pos + new_len].copy_from_slice(&encoded);
+        self._ops.bytes_mut()[descr_pos..descr_pos + new_len].copy_from_slice(&encoded[..new_len]);
     }
 
     /// Patch the named guard's trailing descr slot to `snapshot_index`.
@@ -3286,7 +3307,10 @@ impl Trace {
             match value {
                 Value::Int(v) => Box::ConstInt(v),
                 Value::Float(f) => Box::ConstFloat(f.to_bits()),
-                Value::Ref(r) => Box::ConstPtr(r.as_usize() as u64),
+                Value::Ref(r) => match opref.const_ptr_index() {
+                    Some(index) => Box::ConstPtrIndexed(index),
+                    None => Box::ConstPtr(r.as_usize() as u64),
+                },
                 Value::Void => {
                     panic!("_encode_opref: constant {:?} has Void type", opref)
                 }
@@ -3696,6 +3720,39 @@ mod tests {
         assert_eq!(trace._encode_ptr(0x3000), second);
         assert_eq!(trace._refs.len(), 3);
         assert!(!trace._refs_dict.contains_key(&0x1000));
+    }
+
+    /// `opencoder.py` `Trace._cached_const_ptr`: the same interned
+    /// `ConstPtr` encoded twice reuses `opencoder_index`. Second encode
+    /// returns the same `TAGCONSTPTR` index, `_refs` does not grow
+    /// (unique non-null count stays 1), and `intern` of that address
+    /// still names the same table slot.
+    #[test]
+    fn encode_reuses_an_interned_const_ptr_index_without_intern_under() {
+        let _const_ptr_table = crate::CONST_PTR_TABLE_TEST_LOCK.lock();
+        let addr = majit_ir::GcRef(0x9D_0000_1000);
+        let opref = OpRef::const_ptr(addr);
+        let intern_index = opref.const_ptr_index().expect("non-null const ptr");
+        let mut trace = TraceRecordBuffer::new(0, empty_sd());
+        let first = trace._encode(Box::ConstPtrIndexed(intern_index));
+        let (kind, refs_idx) = untag(first as u32);
+        assert_eq!(kind, TAGCONSTPTR);
+        assert_ne!(refs_idx, 0);
+        let refs_len = trace._refs.len();
+        let second = trace._encode(Box::ConstPtrIndexed(intern_index));
+        assert_eq!(first, second);
+        assert_eq!(untag(second as u32), (TAGCONSTPTR, refs_idx));
+        assert_eq!(trace._refs.len(), refs_len);
+        assert_eq!(
+            trace._refs.iter().filter(|&&a| a != 0).count(),
+            1,
+            "_refs unique non-null stays 1"
+        );
+        assert_eq!(
+            majit_ir::const_ptr_table::intern(addr),
+            intern_index,
+            "encode must not intern_under-allocate a second slot"
+        );
     }
 
     #[test]

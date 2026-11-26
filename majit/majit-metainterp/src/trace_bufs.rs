@@ -424,11 +424,14 @@ impl CharList {
 impl std::ops::Deref for CharList {
     type Target = [u8];
     fn deref(&self) -> &[u8] {
-        let n = unsafe { (*self.header()).length };
+        let h = self.header();
+        let n = unsafe { (*h).length };
         if n == 0 {
             return &[];
         }
-        unsafe { std::slice::from_raw_parts(self.chars(), n) }
+        let items = unsafe { (*h).items };
+        debug_assert_ne!(items, 0);
+        unsafe { std::slice::from_raw_parts((items as *const u8).add(WORD), n) }
     }
 }
 
@@ -710,11 +713,16 @@ impl<T: Copy> WordArray<T> {
 impl<T: Copy> std::ops::Deref for WordArray<T> {
     type Target = [T];
     fn deref(&self) -> &[T] {
-        let n = unsafe { (*self.header()).length };
+        let h = self.header();
+        let n = unsafe { (*h).length };
         if n == 0 {
             return &[];
         }
-        unsafe { std::slice::from_raw_parts(self.item_ptr(), n) }
+        let items = unsafe { (*h).items };
+        debug_assert_ne!(items, 0);
+        unsafe {
+            std::slice::from_raw_parts((items as *const u8).add(items_offset::<T>()) as *const T, n)
+        }
     }
 }
 

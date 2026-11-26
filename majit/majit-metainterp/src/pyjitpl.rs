@@ -819,7 +819,7 @@ pub(crate) fn snapshot_tagged_to_box(tagged: &crate::recorder::SnapshotTagged) -
     match tagged {
         crate::recorder::SnapshotTagged::Box(opref, fallback_tp) => {
             if opref.is_none() || opref.is_constant() {
-                return SnapshotBox::from_cached(Operand::from_opref(*opref));
+                return SnapshotBox::constant(*opref);
             }
             // List-path capture holds only the snapshot coordinate here.
             // The iterator box is planted by `attach_iter_cache` /
@@ -830,17 +830,15 @@ pub(crate) fn snapshot_tagged_to_box(tagged: &crate::recorder::SnapshotTagged) -
         crate::recorder::SnapshotTagged::Const(val, tp) => {
             // `Type::Ref` payload is a const_ptr_table index
             // (`SnapshotTagged::const_ref` / history.py `ConstPtr`).
-            // `Operand::from_opref(OpRef::ConstPtr(idx))` stores
-            // `WideStored::Ref(idx)` without intern. Index 0 is null
-            // (`const_ref(0)` / intern(NULL) → 0) and stays NullRef.
-            if *tp == majit_ir::Type::Ref {
-                if *val == 0 {
-                    SnapshotBox::from_cached(Operand::const_from_value(Value::Ref(GcRef::NULL)))
-                } else {
-                    SnapshotBox::from_cached(Operand::from_opref(OpRef::ConstPtr(*val as u32)))
+            // Index 0 is null (`const_ref(0)` / intern(NULL) → 0).
+            match *tp {
+                majit_ir::Type::Ref if *val == 0 => SnapshotBox::constant(OpRef::ConstPtr(0)),
+                majit_ir::Type::Ref => SnapshotBox::constant(OpRef::ConstPtr(*val as u32)),
+                majit_ir::Type::Int => SnapshotBox::constant(OpRef::const_int(*val)),
+                majit_ir::Type::Float => {
+                    SnapshotBox::constant(OpRef::const_float(f64::from_bits(*val as u64)))
                 }
-            } else {
-                SnapshotBox::from_cached(Operand::const_from_value(heap_value_for(*tp, *val)))
+                majit_ir::Type::Void => SnapshotBox::constant(OpRef::NONE),
             }
         }
     }
@@ -2139,6 +2137,15 @@ fn compute_next_global_opref<T: AsRef<majit_ir::Op>, A: AsRef<InputArg>>(
             r.raw().saturating_add(1)
         }
     }
+    /// Constants have no position in the live-box namespace
+    /// (`resoperation.py AbstractValue.is_constant`).
+    fn operand_high_water(a: &Operand) -> u32 {
+        if a.is_none() || a.is_constant() {
+            0
+        } else {
+            opref_high_water(a.to_opref())
+        }
+    }
     let from_inputargs = inputargs
         .iter()
         .map(|ia| ia.as_ref().index.saturating_add(1))
@@ -2150,11 +2157,11 @@ fn compute_next_global_opref<T: AsRef<majit_ir::Op>, A: AsRef<InputArg>>(
             let op = op.as_ref();
             let mut hw = opref_high_water(op.pos().get());
             for a in op.args_slice().iter() {
-                hw = hw.max(opref_high_water(a.to_opref()));
+                hw = hw.max(operand_high_water(a));
             }
             if let Some(fa) = op.guard_fail_args() {
                 for a in fa.iter() {
-                    hw = hw.max(opref_high_water(a.to_opref()));
+                    hw = hw.max(operand_high_water(a));
                 }
             }
             hw
@@ -2349,7 +2356,7 @@ pub struct MetaInterp<M: Clone> {
     /// and CRN handoff. `blackhole.py` `recycle_merge_point_args` keeps the
     /// six Vec capacities on the pooled interpreter; exits that never enter
     /// the blackhole reuse this buffer the same way.
-    portal_resume_scratch: crate::jitexc::ContinueRunningNormallyArgs,
+    pub(crate) portal_resume_scratch: crate::jitexc::ContinueRunningNormallyArgs,
     /// Recycled terminal blackhole banks for guard-failure resume.
     /// Capacity reuse for the terminal banks, same role as the CRN scratch.
     pub(crate) blackhole_terminal_scratch: Option<crate::blackhole::BlackholeTerminalImage>,
@@ -2465,6 +2472,10 @@ pub struct MetaInterp<M: Clone> {
     pub(crate) jitlog_trace_id: u64,
     /// JIT hooks for profiling and debugging.
     pub(crate) hooks: JitHooks,
+    /// False only when `record_guard_failure_event` can have no work past the
+    /// failure tally for the life of the process (no hook installed, guardlog,
+    /// debug printing and guard census all off).
+    guard_failure_diag_enabled: bool,
     /// Green key of the loop trace currently being recorded. `should_inline_core`
     /// counts it as compiled for the window before the trace is installed
     /// (`warmstate.py get_assembler_token`). The `JitCellToken` itself is made
@@ -2862,6 +2873,10 @@ pub struct MetaInterp<M: Clone> {
     /// opens later (`begin_trace_session`) and may be drained earlier
     /// (`take_trace_meta`) than the profiler event scope.
     pub(crate) profiler_tracing_active: bool,
+    /// Entries into `make_enter_function`. `must_compile_resume_guard`
+    /// reads `jd.warmstate` and must not increment this.
+    #[cfg(test)]
+    make_enter_function_calls: usize,
 }
 
 /// Per-attempt MetaInterp fields stacked while a nested
@@ -4641,11 +4656,7 @@ impl<M: Clone> MetaInterp<M> {
             &mut self.stats.guard_failures
         };
         *tally += 1;
-        if self.hooks.on_guard_failure.is_none()
-            && !guardlog_enabled()
-            && !crate::majit_log_enabled()
-            && !crate::guard_census_enabled()
-        {
+        if !self.guard_failure_diag_enabled {
             return;
         }
         self.record_guard_failure_event_diag(green_key, descr);
@@ -4761,6 +4772,9 @@ impl<M: Clone> MetaInterp<M> {
             next_trace_id: 1,
             jitlog_trace_id: 0,
             hooks: JitHooks::default(),
+            guard_failure_diag_enabled: guardlog_enabled()
+                || crate::debug::debug_prints_configured()
+                || crate::guard_census_enabled(),
             pending_green_key: None,
             stats: JitStatsCounters::default(),
             pending_vable_ptr: std::ptr::null(),
@@ -4827,6 +4841,8 @@ impl<M: Clone> MetaInterp<M> {
             active_trace_session: None,
             bridge_info: None,
             profiler_tracing_active: false,
+            #[cfg(test)]
+            make_enter_function_calls: 0,
         };
         // `pyjitpl.py` `make_and_attach_done_descrs([self, cpu])` —
         // now that both sides of the pair exist, publish the
@@ -5421,6 +5437,10 @@ impl<M: Clone> MetaInterp<M> {
     /// `jd_no` are created so a driver index used without registration
     /// (tests) resolves too.
     pub(crate) fn make_enter_function(&mut self, jd_no: usize) {
+        #[cfg(test)]
+        {
+            self.make_enter_function_calls += 1;
+        }
         if self
             .staticdata
             .jitdrivers_sd
@@ -5491,13 +5511,10 @@ impl<M: Clone> MetaInterp<M> {
     /// unroll.py Optimizer and compile.py CompileData read enable_opts and
     /// pureop_historylength off `jitdriver_sd.warmstate`. Snapshot so later
     /// unroll_opt assignment does not reborrow that slot.
-    fn snapshot_compiling_opt_params(&mut self) -> (Vec<String>, usize) {
+    fn snapshot_compiling_opt_params(&mut self) -> (std::rc::Rc<[String]>, usize) {
         let jd = self.active_jitdriver_sd.unwrap_or(0);
         let ws = self.warm_state_for_driver(jd);
-        (
-            ws.get_enable_opts().to_vec(),
-            ws.pureop_historylength() as usize,
-        )
+        (ws.clone_enable_opts(), ws.pureop_historylength() as usize)
     }
 
     /// compile.py compile_loop reads `warmstate.vec` / `vec_all` /
@@ -6673,14 +6690,14 @@ impl<M: Clone> MetaInterp<M> {
 
     fn make_optimizer(&mut self) -> Optimizer {
         // compile.py `CompileData.optimize_trace` → `build_opt_chain(enable_opts)`.
-        let jd = self.active_jitdriver_sd.unwrap_or(0);
-        let enable_opts = self
-            .warm_state_ref_for_driver(jd)
-            .expect("make_enter_function has not run for the active jitdriver_sd")
-            .get_enable_opts()
-            .to_vec();
-        let mut opt =
-            Optimizer::build_opt_chain(&enable_opts, self.current_virtualizable_optimizer_config());
+        let vable = self.current_virtualizable_optimizer_config();
+        let mut opt = {
+            let jd = self.active_jitdriver_sd.unwrap_or(0);
+            let ws = self
+                .warm_state_ref_for_driver(jd)
+                .expect("make_enter_function has not run for the active jitdriver_sd");
+            Optimizer::build_opt_chain(ws.get_enable_opts(), vable)
+        };
         self.pin_optimizer_host_state(&mut opt);
         opt
     }
@@ -6757,6 +6774,7 @@ impl<M: Clone> MetaInterp<M> {
     /// `f` receives `(green_key, descr_id, count)`.
     pub fn set_on_guard_failure(&mut self, f: impl Fn(u64, usize, u32) + Send + 'static) {
         self.hooks.on_guard_failure = Some(Box::new(f));
+        self.guard_failure_diag_enabled = true;
     }
 
     /// Set a callback fired immediately before a call enters compiled code.
@@ -13899,7 +13917,13 @@ impl<M: Clone> MetaInterp<M> {
         u64,
         Option<std::sync::Arc<majit_backend::JitCellToken>>,
     ) {
-        self.make_enter_function(jd_no);
+        debug_assert!(
+            self.staticdata
+                .jitdrivers_sd
+                .get(jd_no)
+                .is_some_and(|jd| jd.warmstate.is_some()),
+            "entry door used before register_jitdriver_sd/make_enter_function"
+        );
         let mut warm_state = Self::jd_warmstate(&self.staticdata, jd_no);
         if !warm_state.has_confirm_enter_jit() {
             return warm_state.back_edge_step(resolved, None, reds);
@@ -13956,7 +13980,13 @@ impl<M: Clone> MetaInterp<M> {
         greenargs: Option<(&[i64], &[majit_ir::GreenType])>,
         reds: &[Value],
     ) -> crate::warmstate::FunctionEntryStep {
-        self.make_enter_function(jd_no);
+        debug_assert!(
+            self.staticdata
+                .jitdrivers_sd
+                .get(jd_no)
+                .is_some_and(|jd| jd.warmstate.is_some()),
+            "entry door used before register_jitdriver_sd/make_enter_function"
+        );
         let mut warm_state = Self::jd_warmstate(&self.staticdata, jd_no);
         if !warm_state.has_confirm_enter_jit() {
             return warm_state.function_entry_step(resolved, None, reds);
@@ -14002,27 +14032,11 @@ impl<M: Clone> MetaInterp<M> {
 
     /// Take the recycled `ContinueRunningNormally` buffer. Capacity stays
     /// on the returned value; the field is left empty until
-    /// [`Self::recycle_portal_resume_args`] puts it back.
+    /// `JitDriver::recycle_portal_resume` swaps a cleared payload back.
     pub(crate) fn take_portal_resume_scratch(
         &mut self,
     ) -> crate::jitexc::ContinueRunningNormallyArgs {
         std::mem::take(&mut self.portal_resume_scratch)
-    }
-
-    /// Return banks after `handle_jitexception` has assigned them.
-    /// Values are cleared; the six Vec capacities are kept
-    /// (`blackhole.py` `recycle_merge_point_args`).
-    pub(crate) fn recycle_portal_resume_args(
-        &mut self,
-        mut args: crate::jitexc::ContinueRunningNormallyArgs,
-    ) {
-        args.green_int.clear();
-        args.green_ref.clear();
-        args.green_float.clear();
-        args.red_int.clear();
-        args.red_ref.clear();
-        args.red_float.clear();
-        self.portal_resume_scratch = args;
     }
 
     /// pyjitpl.py `ptoken = self.get_procedure_token(greenboxes)` /
@@ -15681,9 +15695,12 @@ impl<M: Clone> MetaInterp<M> {
                     return (false, owning_key);
                 }
             };
-        let fired = self
-            .warm_state_for_driver(jitdriver_sd)
-            .tick_guard_failure(hash);
+        // compile.py AbstractResumeGuardDescr.must_compile: increment =
+        // jitdriver_sd.warmstate.increment_trace_eagerness, then
+        // warmrunnerdesc.jitcounter.tick. jitdriver_sd is the
+        // handle_fail argument, not rd_loop_token.outermost_jitdriver_sd.
+        // warmspot.py make_enter_function(jd) already installed the slot.
+        let fired = Self::jd_warmstate(&self.staticdata, jitdriver_sd).tick_guard_failure(hash);
         if fired {
             crate::mc_diag_bump(4);
         }
@@ -22829,6 +22846,7 @@ impl MetaInterpStaticData {
     }
 
     pub fn new() -> Self {
+        crate::init_optrace_from_env();
         // `pyjitpl.py` `compile.make_and_attach_done_descrs([self, cpu])`.
         // RPython passes `[self, cpu]` — the same `Arc<DoneWithThisFrameDescr*>`
         // lands on both the metainterp and the backend so FINISH-descr
@@ -24041,12 +24059,12 @@ mod portal_resume_rebuild_tests {
             vec![],
         );
         tracing.set_bridge_resume_data(crate::jit_state::ResumeDataResult {
-            frames: vec![],
-            virtualizable_boxes: vec![],
-            virtualref_values: vec![],
+            frames: vec![].into(),
+            virtualizable_boxes: vec![].into(),
+            virtualref_values: vec![].into(),
             storage: Some(storage),
             num_failargs: 0,
-            fail_arg_types: vec![],
+            fail_arg_types: vec![].into(),
         });
         meta.tracing = Some(Box::new(tracing));
 
@@ -24129,12 +24147,12 @@ mod portal_resume_rebuild_tests {
             vec![],
         );
         tracing.set_bridge_resume_data(crate::jit_state::ResumeDataResult {
-            frames: vec![],
-            virtualizable_boxes: vec![],
-            virtualref_values: vec![],
+            frames: vec![].into(),
+            virtualizable_boxes: vec![].into(),
+            virtualref_values: vec![].into(),
             storage: Some(storage),
             num_failargs: 0,
-            fail_arg_types: vec![],
+            fail_arg_types: vec![].into(),
         });
         meta.tracing = Some(Box::new(tracing));
 
@@ -24211,12 +24229,12 @@ mod portal_resume_rebuild_tests {
             vec![],
         );
         let resume_data = crate::jit_state::ResumeDataResult {
-            frames: vec![],
-            virtualizable_boxes: vec![],
-            virtualref_values: vec![],
+            frames: vec![].into(),
+            virtualizable_boxes: vec![].into(),
+            virtualref_values: vec![].into(),
             storage: Some(storage),
             num_failargs: 0,
-            fail_arg_types: vec![],
+            fail_arg_types: vec![].into(),
         };
         tracing.set_bridge_resume_data(resume_data.clone());
 
@@ -24382,12 +24400,12 @@ mod portal_resume_rebuild_tests {
             vec![],
         );
         tracing.set_bridge_resume_data(crate::jit_state::ResumeDataResult {
-            frames: vec![],
-            virtualizable_boxes: vec![],
-            virtualref_values: vec![],
+            frames: vec![].into(),
+            virtualizable_boxes: vec![].into(),
+            virtualref_values: vec![].into(),
             storage: Some(storage),
             num_failargs: 1,
-            fail_arg_types: vec![majit_ir::Type::Ref],
+            fail_arg_types: vec![majit_ir::Type::Ref].into(),
         });
         meta.tracing = Some(Box::new(tracing));
 
@@ -31424,6 +31442,30 @@ mod tests {
         assert!(InputArgRc::ptr_eq(&rebuilt[0], &exported_root));
     }
 
+    #[test]
+    fn compute_next_global_opref_skips_constant_and_none_args() {
+        let producer = OpRc::new(Op::new(OpCode::SameAsI, &[]));
+        producer.pos().set(OpRef::op_typed(4, Type::Int));
+        let add = OpRc::new(Op::new(
+            OpCode::IntAdd,
+            &[
+                Operand::from_bound_op(&producer),
+                Operand::const_from_value(Value::Int(1)),
+            ],
+        ));
+        add.pos().set(OpRef::op_typed(7, Type::Int));
+        let only_consts = OpRc::new(Op::new(
+            OpCode::IntAdd,
+            &[Operand::const_from_value(Value::Int(9)), Operand::none()],
+        ));
+        only_consts.pos().set(OpRef::op_typed(0, Type::Int));
+        let hw = compute_next_global_opref::<OpRc, InputArg>(&[], &[add, only_consts.clone()]);
+        assert_eq!(hw, 8);
+        let ia = InputArg::from_type(Type::Int, 2);
+        let hw_ia = compute_next_global_opref(&[ia], &[only_consts]);
+        assert_eq!(hw_ia, 3);
+    }
+
     /// A resume that starts while another resume is running (a residual call
     /// re-entering the driver) acquires from the same builder.
     /// `blackhole.py` `acquire_interp` pops another interpreter; each
@@ -36560,6 +36602,62 @@ mod tests {
             "outermost_jitdriver_sd's timetable did not receive the owning-key ticks"
         );
         let _keep = token;
+    }
+
+    #[test]
+    fn must_compile_resume_guard_skips_make_enter_function() {
+        // warmspot.py make_enter_function(jd) runs at registration.
+        // compile.py AbstractResumeGuardDescr.must_compile reads
+        // jitdriver_sd.warmstate; it does not construct WarmEnterState.
+        let mut meta = MetaInterp::<()>::new(1);
+        extern "C" fn portal_runner_helper() -> i64 {
+            0
+        }
+        let mut first = crate::jitdriver::JitDriverStaticData::new(vec![], vec![]);
+        first.portal_runner_adr = portal_runner_helper as *const () as i64;
+        first.index = Some(0);
+        let idx0 = meta.register_jitdriver_sd(first);
+        meta.finish_setup_descrs_for_jitdrivers();
+        meta.set_trace_eagerness(8);
+
+        let descr = crate::compile::make_resume_guard_descr_typed(vec![Type::Int]);
+        let fd = descr.as_fail_descr().expect("resume guard");
+        let hash = meta.warm_state_for_driver(idx0).fetch_next_hash();
+        fd.store_hash(hash);
+        let rgd = crate::compile::resume_guard_from_fail(fd).expect("plain ResumeGuardDescr");
+
+        let before = meta.make_enter_function_calls;
+        assert!(!meta.must_compile_resume_guard(rgd, &[], None, 1, idx0).0);
+        assert_eq!(
+            meta.make_enter_function_calls, before,
+            "must_compile_resume_guard must not enter make_enter_function"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "make_enter_function has not run for this jitdriver_sd")]
+    fn must_compile_resume_guard_requires_installed_warmstate() {
+        let mut meta = MetaInterp::<()>::new(1);
+        extern "C" fn portal_runner_helper() -> i64 {
+            0
+        }
+        let mut first = crate::jitdriver::JitDriverStaticData::new(vec![], vec![]);
+        first.portal_runner_adr = portal_runner_helper as *const () as i64;
+        first.index = Some(0);
+        let idx0 = meta.register_jitdriver_sd(first);
+        meta.finish_setup_descrs_for_jitdrivers();
+
+        let descr = crate::compile::make_resume_guard_descr_typed(vec![Type::Int]);
+        let fd = descr.as_fail_descr().expect("resume guard");
+        let hash = meta.warm_state_for_driver(idx0).fetch_next_hash();
+        fd.store_hash(hash);
+        let rgd = crate::compile::resume_guard_from_fail(fd).expect("plain ResumeGuardDescr");
+
+        std::sync::Arc::get_mut(&mut meta.staticdata)
+            .expect("staticdata uniquely owned")
+            .jitdrivers_sd[idx0]
+            .warmstate = None;
+        let _ = meta.must_compile_resume_guard(rgd, &[], None, 1, idx0);
     }
 
     #[test]

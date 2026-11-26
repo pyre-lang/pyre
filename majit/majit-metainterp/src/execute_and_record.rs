@@ -136,15 +136,23 @@ impl TraceCtx {
         // `profiler.count_ops(opnum)` — counted on both paths.
         self.profiler().count_ops(opnum, crate::counters::OPS);
 
+        // `canfold = False` when `_all_constants` fails. Specialized
+        // `execute_and_record` compiles the fold arm out for that opnum;
+        // a non-constant argument is the same `_record_helper` path.
+        // Zero-argument ops still fall through so `is_pure_with_descr`
+        // stays first: `_all_constants` of no arguments is vacuously
+        // true (`ForceToken`).
+        if !args.is_empty() && args.iter().any(|a| !a.is_constant()) {
+            return self.record_helper(opnum, resvalue, descr, args);
+        }
+
         if opnum.is_pure_with_descr(descr.as_ref()) || (opnum.is_ovf() && last_exc_value == 0) {
-            // `canfold = self._all_constants(*argboxes)`. `OpRef::is_constant`
-            // is the variant test, so it answers the `isinstance(box, Const)`
-            // question for every Const subclass at once. The extra
-            // `resvalue.is_some()` conjunct is the `None` rule from the module
-            // doc: a caller that could not compute the value has no register
-            // to receive a constant either.
+            // `canfold = self._all_constants(*argboxes)`. Empty `args`
+            // is the vacuous-true case above. The extra
+            // `resvalue.is_some()` conjunct is the `None` rule from the
+            // module doc: a caller that could not compute the value has
+            // no register to receive a constant either.
             if resvalue.is_some()
-                && args.iter().all(|a| a.is_constant())
                 && let Some(cpu) = cpu
                 && let Some(folded) = Self::fold_value(cpu, opnum, args, descr.as_ref())
             {
@@ -227,6 +235,8 @@ impl TraceCtx {
 mod tests {
     use super::*;
     use crate::recorder::Trace;
+    use majit_ir::descr::SimpleFieldDescr;
+    use std::sync::Arc;
 
     fn fresh_ctx() -> TraceCtx {
         TraceCtx::new(
@@ -470,5 +480,62 @@ mod tests {
             (Some(2), Some(1)),
             "a record is counted on both"
         );
+    }
+
+    /// Getfield of a non-const struct is `_all_constants` false:
+    /// `execute_and_record` records through `_record_helper` and does
+    /// not call `executor.execute_nonspec_const`.
+    #[test]
+    fn a_non_const_getfield_records_without_calling_fold_value() {
+        let mut recorder = Trace::new();
+        let struct_box = recorder.record_input_arg(Type::Ref);
+        let mut ctx = TraceCtx::new(
+            recorder,
+            0,
+            std::sync::Arc::new(crate::MetaInterpStaticData::new()),
+        );
+        let cpu = crate::cpu::default_cpu();
+        let descr: DescrRef = Arc::new(SimpleFieldDescr::new(0, 8, 8, Type::Int, true));
+        let before_ops = ctx.num_ops();
+        let op = ctx.execute_and_record(
+            Some(cpu.as_ref()),
+            OpCode::GetfieldGcI,
+            Some(descr),
+            &[struct_box],
+            Some(Value::Int(7)),
+            0,
+        );
+        assert!(!op.is_constant());
+        assert_eq!(ctx.opcode_of(op), Some(OpCode::GetfieldGcI));
+        assert_eq!(ctx.num_ops(), before_ops + 1);
+        assert_eq!(
+            ctx.profiler().get_counter(crate::counters::RECORDED_OPS),
+            Some(1)
+        );
+    }
+
+    /// All-constant immutable getfield still folds: `is_pure_with_descr`
+    /// admits `descr.is_always_pure()`, `_all_constants` holds, and
+    /// `executor.wrap_constant` returns a Const with nothing recorded.
+    #[test]
+    fn an_all_constant_immutable_getfield_folds() {
+        let _const_ptr_table = crate::CONST_PTR_TABLE_TEST_LOCK.lock();
+        let mut ctx = fresh_ctx();
+        let cpu = crate::cpu::default_cpu();
+        let storage: &'static [i64; 2] = Box::leak(Box::new([0i64, 42]));
+        let base = storage.as_ptr() as usize;
+        let descr: DescrRef = Arc::new(SimpleFieldDescr::new(0, 8, 8, Type::Int, true));
+        let struct_box = OpRef::const_ptr(majit_ir::GcRef(base));
+        let before = ctx.num_ops();
+        let op = ctx.execute_and_record(
+            Some(cpu.as_ref()),
+            OpCode::GetfieldGcI,
+            Some(descr),
+            &[struct_box],
+            Some(Value::Int(42)),
+            0,
+        );
+        assert_eq!(op, OpRef::ConstInt(42));
+        assert_eq!(ctx.num_ops(), before, "a fold records nothing");
     }
 }

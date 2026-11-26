@@ -641,8 +641,8 @@ const DEFAULT_RETRACE_LIMIT: u32 = 0;
 const DEFAULT_MAX_UNROLL_LOOPS: u32 = 0;
 
 /// rlib/jit.py:600 enable_opts = "all"
-fn default_enable_opts() -> Vec<String> {
-    vec![
+fn default_enable_opts() -> Rc<[String]> {
+    Rc::from(vec![
         "intbounds".to_string(),
         "rewrite".to_string(),
         "virtualize".to_string(),
@@ -651,7 +651,7 @@ fn default_enable_opts() -> Vec<String> {
         "earlyforce".to_string(),
         "heap".to_string(),
         "unroll".to_string(),
-    ]
+    ])
 }
 
 /// rlib/jit.py `PARAMETERS['disable_unrolling']`, stored by
@@ -803,7 +803,7 @@ pub struct WarmEnterState {
     /// jit.py:583,604: vec_cost — cost threshold for vectorization decisions.
     vec_cost: u32,
     /// warmstate.py: enable_opts — list of enabled optimization pass names.
-    enable_opts: Vec<String>,
+    enable_opts: Rc<[String]>,
     /// warmstate.py: set_param_inlining — whether inlining is enabled.
     inlining: bool,
     /// warmstate.py: set_param_disable_unrolling — "after how many
@@ -2594,17 +2594,26 @@ impl WarmEnterState {
         self.enable_opts = if value == "all" {
             default_enable_opts()
         } else {
-            value
-                .split(':')
-                .filter(|s| !s.is_empty())
-                .map(String::from)
-                .collect()
+            Rc::from(
+                value
+                    .split(':')
+                    .filter(|s| !s.is_empty())
+                    .map(String::from)
+                    .collect::<Vec<_>>(),
+            )
         };
     }
 
     /// Get enabled optimization pass names.
     pub fn get_enable_opts(&self) -> &[String] {
         &self.enable_opts
+    }
+
+    /// Clone the `enable_opts` handle. Compile snapshots keep this `Rc`
+    /// across later mutable uses of `WarmEnterState` (`compile.py`
+    /// `CompileData.optimize_trace` reads `warmstate.enable_opts`).
+    pub fn clone_enable_opts(&self) -> Rc<[String]> {
+        Rc::clone(&self.enable_opts)
     }
 
     /// `warmstate.py` `make_jitdriver_callbacks` —
@@ -3184,12 +3193,9 @@ impl WarmEnterState {
         if cell.jitdriver_sd != self.jitdriver_sd {
             return DoorCell::Occupied;
         }
-        if cell.is_compiled() {
+        if let Some(token) = Self::cell_entry_procedure_token(&cell) {
             let cell_key = cell.cell_key.get().unwrap_or(hash);
-            return match Self::cell_entry_procedure_token(&cell) {
-                Some(token) => DoorCell::Enter { cell_key, token },
-                None => DoorCell::Occupied,
-            };
+            return DoorCell::Enter { cell_key, token };
         }
         if cell.is_tracing() {
             return DoorCell::Tracing;
@@ -3756,11 +3762,7 @@ mod tests {
     fn an_empty_enable_opts_selects_no_passes() {
         let mut ws = WarmEnterState::new(1);
         let all = default_enable_opts();
-        assert_eq!(
-            ws.get_enable_opts(),
-            all.as_slice(),
-            "default is the full set"
-        );
+        assert_eq!(ws.get_enable_opts(), &*all, "default is the full set");
 
         ws.set_param_enable_opts("");
         assert!(
@@ -3770,7 +3772,7 @@ mod tests {
         );
 
         ws.set_param_enable_opts("all");
-        assert_eq!(ws.get_enable_opts(), all.as_slice(), "`all` restores them");
+        assert_eq!(ws.get_enable_opts(), &*all, "`all` restores them");
 
         ws.set_param_enable_opts("intbounds:heap");
         assert_eq!(ws.get_enable_opts(), ["intbounds", "heap"]);
@@ -6942,8 +6944,10 @@ mod tests {
         );
     }
 
-    /// The door keeps the chain-head token `maybe_compile_and_run` would
-    /// carry, and a comparekey miss at that hash is Occupied.
+    /// The door keeps the token `maybe_compile_and_run` would carry after
+    /// `JC_TRACING | JC_TEMPORARY` then `cell.get_procedure_token()`. A live
+    /// occupant is Enter; a temporary cell ticks (Empty); an invalidated or
+    /// dead token is Occupied. A comparekey miss at that hash is Occupied.
     #[test]
     fn door_cell_carries_the_resolved_token() {
         let mut ws = WarmEnterState::new(100);
@@ -6984,6 +6988,74 @@ mod tests {
         assert!(
             matches!(ws.door_cell(hash, Some(miss)), DoorCell::Occupied),
             "comparekey miss with the same hash is Occupied"
+        );
+
+        let mut ws_tmp = WarmEnterState::new(100);
+        let key_tmp = GreenKey::new(vec![0x7E, 0x11]);
+        let token_tmp = Arc::new(JitCellToken::new(0x7e11));
+        GreenRefPin::with(&key_tmp, |__p, __l| {
+            ws_tmp.get_assembler_token_with_key::<(), _>(__p, __l, |_memmgr| Ok(token_tmp.clone()))
+        })
+        .expect("tmp token");
+        let hash_tmp = key_tmp.get_uhash();
+        let hit_tmp = (key_tmp.values.as_slice(), key_tmp.types.as_slice());
+        assert!(
+            ws_tmp
+                .lookup_chain(hash_tmp)
+                .expect("installed")
+                .flags
+                .get()
+                .contains(JcFlags::JC_TEMPORARY),
+            "fixture: occupant is JC_TEMPORARY"
+        );
+        assert!(
+            matches!(ws_tmp.door_cell(hash_tmp, Some(hit_tmp)), DoorCell::Empty),
+            "a temporary cell ticks; it is not entered"
+        );
+
+        let mut ws_inv = WarmEnterState::new(100);
+        let key_inv = GreenKey::new(vec![0x3, 0x4]);
+        let token_inv = attach_alive_for_key(
+            &mut ws_inv,
+            &key_inv,
+            JitCellToken::new(JitCellToken::NUMBER_UNASSIGNED),
+        );
+        token_inv.invalidate();
+        let hash_inv = key_inv.get_uhash();
+        let hit_inv = (key_inv.values.as_slice(), key_inv.types.as_slice());
+        assert!(
+            matches!(
+                ws_inv.door_cell(hash_inv, Some(hit_inv)),
+                DoorCell::Occupied
+            ),
+            "an invalidated token is Occupied"
+        );
+
+        let mut ws_dead = WarmEnterState::new(100);
+        let key_dead = GreenKey::new(vec![0x70, 0xCE]);
+        GreenRefPin::with(&key_dead, |__p, __l| ws_dead.ensure_cell_for_key(__p, __l));
+        {
+            let token = token_with_compiled_code();
+            let cell = GreenRefPin::with(&key_dead, |__p, __l| {
+                ws_dead.lookup_chain_with_key(__p, __l)
+            })
+            .expect("installed");
+            cell.set_procedure_token(token, false);
+        }
+        let hash_dead = key_dead.get_uhash();
+        let hit_dead = (key_dead.values.as_slice(), key_dead.types.as_slice());
+        assert!(
+            ws_dead.lookup_chain(hash_dead).is_some_and(|cell| {
+                cell.has_seen_a_procedure_token() && cell.get_procedure_token().is_none()
+            }),
+            "fixture: occupant holds a dead token"
+        );
+        assert!(
+            matches!(
+                ws_dead.door_cell(hash_dead, Some(hit_dead)),
+                DoorCell::Occupied
+            ),
+            "a dead token is Occupied"
         );
     }
 

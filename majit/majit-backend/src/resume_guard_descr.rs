@@ -43,6 +43,7 @@ use majit_ir::{
     AccumInfo, Const, Descr, DescrRef, FailDescr, GuardPendingFieldEntry, HandleFailClass,
     RdVirtualInfo, Type,
 };
+use smallvec::SmallVec;
 
 use crate::CompiledLoopToken;
 use crate::rd_payload::RdPayload;
@@ -156,7 +157,7 @@ pub struct ResumeGuardDescr {
     pub fail_index: u32,
     /// `compile.py store_final_boxes` mutates types in place; pyre
     /// uses `UnsafeCell` so identity is preserved across the optimizer.
-    pub types: UnsafeCell<Vec<Type>>,
+    pub types: UnsafeCell<SmallVec<[Type; 16]>>,
     /// `compile.py:855` `_attrs_ = ('rd_numb', 'rd_consts',
     /// 'rd_virtuals', 'rd_pendingfields', 'status')`.
     pub payload: RdPayload,
@@ -355,7 +356,7 @@ impl FailDescr for ResumeGuardDescr {
         unsafe { &*self.types.get() }
     }
     fn set_fail_arg_types(&self, types: Vec<Type>) {
-        unsafe { *self.types.get() = types }
+        unsafe { *self.types.get() = Self::pack_fail_arg_types(types) }
     }
     fn attach_vector_info(&self, info: AccumInfo) {
         push_vector_info(unsafe { &mut *self.vector_info.get() }, info);
@@ -523,7 +524,7 @@ impl FailDescr for ResumeGuardDescr {
 pub fn make_resume_guard_descr_typed(types: Vec<Type>) -> DescrRef {
     Arc::new(ResumeGuardDescr {
         fail_index: alloc_fail_index(),
-        types: UnsafeCell::new(types),
+        types: UnsafeCell::new(ResumeGuardDescr::pack_fail_arg_types(types)),
         payload: RdPayload::empty(),
         vector_info: UnsafeCell::new(None),
         adr_jump_offset: UnsafeCell::new(0),
@@ -538,6 +539,21 @@ pub fn make_resume_guard_descr_typed(types: Vec<Type>) -> DescrRef {
 }
 
 impl ResumeGuardDescr {
+    /// Inline when `len <= 16`; otherwise take the Vec's heap buffer.
+    pub fn pack_fail_arg_types(types: Vec<Type>) -> SmallVec<[Type; 16]> {
+        if types.len() > 16 {
+            SmallVec::from_vec(types)
+        } else {
+            SmallVec::from_slice(&types)
+        }
+    }
+
+    /// Slice form of [`FailDescr::set_fail_arg_types`] for a known
+    /// `ResumeGuardDescr` (no `Vec` on the setter path).
+    pub fn set_fail_arg_types_from_slice(&self, types: &[Type]) {
+        unsafe { *self.types.get() = SmallVec::from_slice(types) }
+    }
+
     /// Publish the external-JUMP target.  Write-once;
     /// panics if invoked twice on the same descr (mirrors PyPy's
     /// `assembler.py closing_jump` codegen-time finality —
@@ -593,5 +609,32 @@ impl ResumeGuardDescr {
     /// to reclaim.
     pub fn bridge_dispatch_swap(&self, new_ptr: *mut (), drop_fn: unsafe fn(*mut ())) -> *mut () {
         self.bridge_cells().dispatch_swap(new_ptr, drop_fn)
+    }
+}
+
+#[cfg(test)]
+mod fail_arg_types_inline_tests {
+    use super::*;
+
+    #[test]
+    fn pack_and_slice_setter_cover_inline_capacity() {
+        let types16 = vec![Type::Int; 16];
+        let types17 = vec![Type::Float; 17];
+        let descr = make_resume_guard_descr_typed(types16.clone());
+        let fd = descr.as_fail_descr().expect("ResumeGuardDescr");
+        assert_eq!(fd.fail_arg_types(), types16.as_slice());
+        let rg = descr
+            .as_any()
+            .and_then(|a| a.downcast_ref::<ResumeGuardDescr>())
+            .expect("plain ResumeGuardDescr");
+        rg.set_fail_arg_types_from_slice(&types17);
+        assert_eq!(fd.fail_arg_types(), types17.as_slice());
+        fd.set_fail_arg_types(types16.clone());
+        assert_eq!(fd.fail_arg_types(), types16.as_slice());
+        assert_eq!(
+            ResumeGuardDescr::pack_fail_arg_types(types17.clone()).len(),
+            17
+        );
+        assert_eq!(ResumeGuardDescr::pack_fail_arg_types(types16).len(), 16);
     }
 }

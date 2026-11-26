@@ -8,36 +8,65 @@
 //! - 21-bit: 1xxxxxxx 1xxxxxxx 0xxxxxxx
 //! - 28-bit: 1xxxxxxx 1xxxxxxx 1xxxxxxx xxxxxxxx
 
-/// resumecode.py: append_numbering(lst, item)
-pub fn encode_varint(buf: &mut Vec<u8>, value: i32) {
+fn zigzag_item(value: i32) -> u32 {
     let mut item = (value as i64) * 2;
     if item < 0 {
         item = -1 - item;
     }
     assert!(item >= 0);
-    let item = item as u32;
+    item as u32
+}
+
+fn encoded_len_of(value: i32) -> usize {
+    let item = zigzag_item(value);
     if item < (1 << 7) {
-        buf.push(item as u8);
+        1
     } else if item < (1 << 14) {
-        buf.push((item | 0x80) as u8);
-        buf.push((item >> 7) as u8);
+        2
+    } else if item < (1 << 21) {
+        3
+    } else {
+        assert!(item < (1 << 29), "resumecode item too large: {item}");
+        4
+    }
+}
+
+/// Slice-cursor form of `encode_varint`. Returns the offset after this item.
+fn encode_varint_into(buf: &mut [u8], offset: usize, value: i32) -> usize {
+    let item = zigzag_item(value);
+    if item < (1 << 7) {
+        buf[offset] = item as u8;
+        offset + 1
+    } else if item < (1 << 14) {
+        buf[offset] = (item | 0x80) as u8;
+        buf[offset + 1] = (item >> 7) as u8;
+        offset + 2
     } else if item < (1 << 21) {
         // Three-byte form: `assembler.py` `fix_labels` targets were
         // `<= 0xFFFF` (zigzag `< 2**17`). pyre's three-byte `L` names
         // a pc `< 2**24`; zigzag `< 2**21` still fits here with the
         // third-byte high bit clear, so existing encodings decode.
-        buf.push((item | 0x80) as u8);
-        buf.push(((item >> 7) | 0x80) as u8);
-        buf.push((item >> 14) as u8);
+        buf[offset] = (item | 0x80) as u8;
+        buf[offset + 1] = ((item >> 7) | 0x80) as u8;
+        buf[offset + 2] = (item >> 14) as u8;
+        offset + 3
     } else {
         // Four-byte form: zigzag `>= 2**21` (pc `>= 2**20`). The third
         // byte's high bit continues; the fourth holds `item >> 21`.
         assert!(item < (1 << 29), "resumecode item too large: {item}");
-        buf.push((item | 0x80) as u8);
-        buf.push(((item >> 7) | 0x80) as u8);
-        buf.push(((item >> 14) | 0x80) as u8);
-        buf.push((item >> 21) as u8);
+        buf[offset] = (item | 0x80) as u8;
+        buf[offset + 1] = ((item >> 7) | 0x80) as u8;
+        buf[offset + 2] = ((item >> 14) | 0x80) as u8;
+        buf[offset + 3] = (item >> 21) as u8;
+        offset + 4
     }
+}
+
+/// resumecode.py: append_numbering(lst, item)
+pub fn encode_varint(buf: &mut Vec<u8>, value: i32) {
+    let mut tmp = [0u8; 4];
+    let n = encode_varint_into(&mut tmp, 0, value);
+    buf.extend_from_slice(&tmp[..n]);
 }
 
 /// resumecode.py: append_numbering(lst, item)
@@ -239,10 +268,26 @@ impl Writer {
         buf
     }
 
+    /// Encoded length of `current` under the same varint rules as
+    /// `encode_bytes` / `encode_into`.
+    pub fn encoded_len(&self) -> usize {
+        self.current.iter().map(|&item| encoded_len_of(item)).sum()
+    }
+
+    /// Write the same bytes `encode_bytes` would produce into `buf`.
+    /// `buf.len()` is `encoded_len()`.
+    pub fn encode_into(&self, buf: &mut [u8]) {
+        let mut off = 0;
+        for &item in &self.current {
+            off = encode_varint_into(buf, off, item);
+        }
+        debug_assert_eq!(off, buf.len());
+    }
+
     /// resumecode.py `Writer.create_numbering`: malloc `NUMBERING` and
-    /// copy the encoded bytes into `numb.code`.
+    /// write the encoded bytes into `numb.code`.
     pub fn create_numbering(&self) -> NumberingRef {
-        NumberingRef::from_bytes(&self.encode_bytes())
+        NumberingRef::from_encoded_writer(self)
     }
 
     /// Same object as `create_numbering`. Kept so callers that shared
@@ -437,19 +482,21 @@ impl<'a> Reader<'a> {
 /// Absent in GC-less unit tests, which use the host block below.
 static NUMBERING_ALLOC: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-/// `fn(&[u8]) -> usize` payload address of a fresh `NUMBERING`.
-pub fn set_numbering_alloc(hook: Option<fn(&[u8]) -> usize>) {
+/// `fn(usize) -> usize` payload address of a fresh `NUMBERING` whose
+/// `code` length is the argument. The hook stores the length word;
+/// encoded bytes are written after it returns (`Writer.create_numbering`).
+pub fn set_numbering_alloc(hook: Option<fn(usize) -> usize>) {
     let bits = hook.map(|f| f as usize).unwrap_or(0);
     NUMBERING_ALLOC.store(bits, std::sync::atomic::Ordering::Release);
 }
 
-fn call_numbering_alloc(bytes: &[u8]) -> Option<usize> {
+fn call_numbering_alloc(len: usize) -> Option<usize> {
     let bits = NUMBERING_ALLOC.load(std::sync::atomic::Ordering::Acquire);
     if bits == 0 {
         return None;
     }
-    let hook: fn(&[u8]) -> usize = unsafe { std::mem::transmute(bits) };
-    Some(hook(bytes))
+    let hook: fn(usize) -> usize = unsafe { std::mem::transmute(bits) };
+    Some(hook(len))
 }
 
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -578,33 +625,64 @@ impl NumberingRef {
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Self {
-        if let Some(addr) = call_numbering_alloc(bytes) {
-            return Self::from_gc_addr(addr);
+        if let Some(addr) = call_numbering_alloc(bytes.len()) {
+            let n = Self::from_gc_addr(addr);
+            n.as_mut_slice().copy_from_slice(bytes);
+            return n;
         }
         Self::host_from_bytes(bytes)
     }
 
+    /// Allocate `NUMBERING` to `Writer.encoded_len`, then write the
+    /// varints into that payload (`Writer.create_numbering`).
+    pub fn from_encoded_writer(w: &Writer) -> Self {
+        let len = w.encoded_len();
+        if let Some(addr) = call_numbering_alloc(len) {
+            let n = Self::from_gc_addr(addr);
+            w.encode_into(n.as_mut_slice());
+            return n;
+        }
+        Self::host_from_encoded_writer(w)
+    }
+
     fn host_from_bytes(bytes: &[u8]) -> Self {
-        let layout = host_layout(bytes.len());
+        let n = Self::host_alloc_len(bytes.len());
+        n.as_mut_slice().copy_from_slice(bytes);
+        n
+    }
+
+    fn host_from_encoded_writer(w: &Writer) -> Self {
+        let n = Self::host_alloc_len(w.encoded_len());
+        w.encode_into(n.as_mut_slice());
+        n
+    }
+
+    fn host_alloc_len(len: usize) -> Self {
+        let layout = host_layout(len);
         let block = unsafe { std::alloc::alloc_zeroed(layout) };
         if block.is_null() {
             std::alloc::handle_alloc_error(layout);
         }
         unsafe {
             let body = block.add(numb_len_word());
-            *(body as *mut usize) = bytes.len();
-            if !bytes.is_empty() {
-                std::ptr::copy_nonoverlapping(
-                    bytes.as_ptr(),
-                    body.add(numb_len_word()),
-                    bytes.len(),
-                );
-            }
+            *(body as *mut usize) = len;
             let slot = fresh_slot(body as usize, true);
             Self {
                 slot: std::ptr::NonNull::new(slot).expect("numb slot"),
             }
         }
+    }
+
+    /// Bytes after the length word. The numbering is already a live
+    /// root; a collection that can move it has not run since the
+    /// allocation that created this payload.
+    fn as_mut_slice(&self) -> &mut [u8] {
+        let addr = self.payload_addr();
+        let (ptr, len) = payload_parts(addr);
+        if len == 0 {
+            return &mut [];
+        }
+        unsafe { std::slice::from_raw_parts_mut(ptr as *mut u8, len) }
     }
 
     /// Address of the `NUMBERING` payload. One relaxed load.
@@ -765,6 +843,10 @@ fn detach(
         }
     };
     let index = index_ptr.load(Ordering::Relaxed);
+    if index == usize::MAX {
+        // Absent from this list: nothing to unlink.
+        return;
+    }
     let pos = if index < list.len() && list[index] == slot {
         Some(index)
     } else {
@@ -883,6 +965,37 @@ mod tests {
         for (name, values) in cases {
             roundtrip(name, values);
         }
+    }
+
+    #[test]
+    fn encode_into_matches_encode_bytes_at_varint_boundaries() {
+        // One-byte zigzag `item < 2**7`, two-byte `< 2**14`, then the
+        // three-byte label range `append_int` accepts. Zigzag `>= 2**29`
+        // (`i32::MIN` / `i32::MAX`) is outside `encode_varint`.
+        let values: &[i32] = &[
+            0,
+            63,
+            64,
+            -64,
+            -65,
+            8191,
+            8192,
+            -8192,
+            -8193,
+            (1 << 20) - 1,
+            1 << 20,
+            (1 << 24) - 1,
+        ];
+        let mut w = Writer::new(values.len());
+        for &v in values {
+            w.append_short(v);
+        }
+        let encoded = w.encode_bytes();
+        assert_eq!(w.encoded_len(), encoded.len());
+        let mut into = vec![0u8; w.encoded_len()];
+        w.encode_into(&mut into);
+        assert_eq!(into, encoded);
+        assert_eq!(w.create_numbering().as_slice(), encoded.as_slice());
     }
 
     #[test]

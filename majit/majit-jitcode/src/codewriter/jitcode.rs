@@ -757,6 +757,18 @@ impl JitCodeSetup {
         unsafe { &*self.data.get() }
     }
 
+    /// Load the `setup` payload without the publication acquire.
+    ///
+    /// # Safety
+    /// `set_once` has published the immutable payload, and an owning
+    /// `Arc` pins this `JitCode` (`JitCode.setup`).
+    #[inline(always)]
+    unsafe fn published_assume_set(&self) -> &JitCodeBody {
+        // SAFETY: discharged by the caller: `set_once` published the
+        // immutable payload, and an owning Arc pins this JitCode.
+        unsafe { &*self.data.get() }
+    }
+
     fn published_mut(&mut self) -> &mut JitCodeBody {
         self.data.get_mut()
     }
@@ -880,9 +892,6 @@ impl JitCode {
     /// fields live here so `Arc<JitCode>` shells can be filled while
     /// shared (e.g. when `IndirectCallTargets` already holds clones).
     pub fn body(&self) -> &JitCodeBody {
-        if !self.body.is_set() {
-            panic!("JitCode body not yet set — call set_body() before reading body fields");
-        }
         self.body.published()
     }
 
@@ -1239,6 +1248,88 @@ impl JitCode {
         labelvalue
     }
 
+    /// Field load of a published `JitCode.setup` payload.
+    ///
+    /// # Safety
+    /// `set_once` has published the body and an owning `Arc` pins this
+    /// `JitCode` (`JitCode.setup`).
+    #[inline(always)]
+    pub unsafe fn body_assume_published(&self) -> &JitCodeBody {
+        // SAFETY: `set_once` published the immutable payload, and an
+        // owning Arc pins this JitCode (`JitCode.setup`).
+        unsafe { self.body.published_assume_set() }
+    }
+
+    /// `ord(self.c_num_regs_r)` on a published body.
+    ///
+    /// # Safety
+    /// `set_once` has published the body (`JitCode.setup`).
+    #[inline(always)]
+    pub unsafe fn num_regs_r_assume_published(&self) -> usize {
+        // SAFETY: `set_once` published the payload (`JitCode.setup`).
+        unsafe { self.body_assume_published() }.c_num_regs_r as usize
+    }
+
+    /// `code[position - 1]`, the destination of a resumed `xxx_call_yyy`.
+    ///
+    /// # Safety
+    /// The body is published and `position` names the byte after an
+    /// assembled call whose last operand is the destination register
+    /// (`blackhole.py _setup_return_value_*`).
+    #[inline(always)]
+    pub unsafe fn result_reg_assume_published(&self, position: usize) -> usize {
+        // SAFETY: `set_once` published the payload (`JitCode.setup`).
+        let code = &unsafe { self.body_assume_published() }.code;
+        debug_assert!(position != 0 && position <= code.len());
+        // SAFETY: assembled call bytecode stores the destination at
+        // `code[position - 1]` (`blackhole.py _setup_return_value_*`).
+        unsafe { *code.get_unchecked(position - 1) as usize }
+    }
+
+    /// `JitCode.get_live_vars_info` on a published assembled body.
+    ///
+    /// # Safety
+    /// `set_once` has published the body (`JitCode.setup`). `pc` is a
+    /// resume start in that assembled code.
+    #[inline(always)]
+    pub unsafe fn get_live_vars_info_assume_published(&self, pc: usize, op_live: u8) -> usize {
+        // SAFETY: `set_once` published the payload (`JitCode.setup`).
+        let code = &unsafe { self.body_assume_published() }.code;
+        #[cfg(debug_assertions)]
+        self.assert_startpoint(pc);
+        // SAFETY: `code` is the published assembled body;
+        // `get_live_vars_info_in` is `JitCode.get_live_vars_info`.
+        unsafe { self.get_live_vars_info_in(code, pc, op_live) }
+    }
+
+    /// Opcode test, optional backstep, and offset decode of
+    /// `JitCode.get_live_vars_info`.
+    ///
+    /// # Safety
+    /// `code` is this jitcode's published assembled body.
+    #[inline(always)]
+    unsafe fn get_live_vars_info_in(&self, code: &[u8], mut pc: usize, op_live: u8) -> usize {
+        debug_assert!(pc < code.len());
+        // SAFETY: `pc` is in `code` (`JitCode.get_live_vars_info` opcode test).
+        if unsafe { *code.get_unchecked(pc) } != op_live {
+            let Some(back) = pc.checked_sub(super::liveness::OFFSET_SIZE + 1) else {
+                self.missing_liveness(pc);
+            };
+            pc = back;
+            #[cfg(debug_assertions)]
+            self.assert_startpoint(pc);
+            debug_assert!(pc < code.len());
+            // SAFETY: the backstep pc is in `code` (`JitCode.get_live_vars_info`).
+            if unsafe { *code.get_unchecked(pc) } != op_live {
+                self.missing_liveness(pc);
+            }
+        }
+        debug_assert!(pc + super::liveness::OFFSET_SIZE < code.len());
+        // SAFETY: `pc` names a `-live-` opcode and `pc+1 .. pc+OFFSET_SIZE`
+        // are in `code` (`JitCode.get_live_vars_info` after the opcode test).
+        unsafe { super::liveness::decode_offset_unchecked(code, pc + 1) }
+    }
+
     /// RPython `jitcode.py` `get_live_vars_info(pc, op_live)`:
     ///
     /// ```python
@@ -1270,33 +1361,17 @@ impl JitCode {
         //
         // `self.code` is a field (`jitcode.py` `JitCode.code`). Resume
         // loads it off this `JitCode`; `Arc<JitCode>` pins the allocation.
-        self.assert_startpoint(pc);
         let code = &self.body.published().code;
-        let mut pc = pc;
-        // Translated `get_live_vars_info` indexes `self.code[pc]` after the
-        // untranslated `_startpoints` assert. Length is a debug_assert; a
-        // short pc that is not `-live-` still takes `_missing_liveness`
-        // (`pc -= OFFSET_SIZE + 1` cannot name a previous marker).
-        debug_assert!(pc < code.len());
-        if unsafe { *code.get_unchecked(pc) } != op_live {
-            let Some(back) = pc.checked_sub(super::liveness::OFFSET_SIZE + 1) else {
-                self.missing_liveness(pc);
-            };
-            pc = back;
-            self.assert_startpoint(pc);
-            debug_assert!(pc < code.len());
-            if unsafe { *code.get_unchecked(pc) } != op_live {
-                self.missing_liveness(pc);
-            }
-        }
-        debug_assert!(pc + super::liveness::OFFSET_SIZE < code.len());
-        // SAFETY: `pc` names a `-live-` opcode and `pc+1 .. pc+OFFSET_SIZE`
-        // are in `code` (`JitCode.get_live_vars_info` after the opcode test).
-        unsafe { super::liveness::decode_offset_unchecked(code, pc + 1) }
+        #[cfg(debug_assertions)]
+        self.assert_startpoint(pc);
+        // SAFETY: `published()` proved the body is set;
+        // `get_live_vars_info_in` is `JitCode.get_live_vars_info`.
+        unsafe { self.get_live_vars_info_in(code, pc, op_live) }
     }
 
     /// `jitcode.py` `JitCode.get_live_vars_info`: `if not
     /// we_are_translated(): assert pc in self._startpoints`.
+    #[cfg(debug_assertions)]
     #[inline]
     fn assert_startpoint(&self, pc: usize) {
         // `jitcode.py get_live_vars_info`: `if not we_are_translated():
@@ -1822,39 +1897,36 @@ impl BhCallStub {
     #[inline(always)]
     fn place<'a>(
         &self,
-        args_i: Option<&[i64]>,
-        args_r: Option<&[i64]>,
-        args_f: Option<&[i64]>,
+        args_i: &[i64],
+        args_r: &[i64],
+        args_f: &[i64],
         buf: &'a mut [i64; super::insns::MAX_HOST_CALL_ARITY],
     ) -> &'a [i64] {
         debug_assert_eq!(
-            args_i.map_or(0, <[i64]>::len),
+            args_i.len(),
             self.expect_i as usize,
             "BhCallDescr.verify_types: arg_classes has {} int slots, args_i has {}",
             self.expect_i,
-            args_i.map_or(0, <[i64]>::len),
+            args_i.len(),
         );
         debug_assert_eq!(
-            args_r.map_or(0, <[i64]>::len),
+            args_r.len(),
             self.expect_r as usize,
             "BhCallDescr.verify_types: arg_classes has {} ref slots, args_r has {}",
             self.expect_r,
-            args_r.map_or(0, <[i64]>::len),
+            args_r.len(),
         );
         debug_assert_eq!(
-            args_f.map_or(0, <[i64]>::len),
+            args_f.len(),
             self.expect_f as usize,
             "BhCallDescr.verify_types: arg_classes has {} float slots, args_f has {}",
             self.expect_f,
-            args_f.map_or(0, <[i64]>::len),
+            args_f.len(),
         );
         let n = self.arity as usize;
         // descr.py `create_call_stub` indexes `args_i[k]` / `args_r[k]` /
-        // `args_f[k]` directly. Unwrap the banks once; a per-slot `expect`
-        // is not in the generated stub.
-        let args_i = args_i.unwrap_or(&[]);
-        let args_r = args_r.unwrap_or(&[]);
-        let args_f = args_f.unwrap_or(&[]);
+        // `args_f[k]` directly. A per-slot `expect` is not in the generated
+        // stub. An unused bank is `&[]`.
         for i in 0..n {
             let slot = self.slots[i];
             let idx = (slot & 0x3f) as usize;
@@ -1946,13 +2018,10 @@ impl BhCallStub {
     pub unsafe fn call_i(
         &self,
         func: usize,
-        args_i: Option<&[i64]>,
-        args_r: Option<&[i64]>,
-        args_f: Option<&[i64]>,
+        args_i: &[i64],
+        args_r: &[i64],
+        args_f: &[i64],
     ) -> i64 {
-        let args_i = args_i.unwrap_or(&[]);
-        let args_r = args_r.unwrap_or(&[]);
-        let args_f = args_f.unwrap_or(&[]);
         debug_assert_eq!(args_i.len(), self.expect_i as usize);
         debug_assert_eq!(args_r.len(), self.expect_r as usize);
         debug_assert_eq!(args_f.len(), self.expect_f as usize);
@@ -1980,9 +2049,9 @@ impl BhCallStub {
     pub unsafe fn call_f(
         &self,
         func: usize,
-        args_i: Option<&[i64]>,
-        args_r: Option<&[i64]>,
-        args_f: Option<&[i64]>,
+        args_i: &[i64],
+        args_r: &[i64],
+        args_f: &[i64],
     ) -> f64 {
         let mut buf = [0i64; super::insns::MAX_HOST_CALL_ARITY];
         let args = self.place(args_i, args_r, args_f, &mut buf);
@@ -1993,13 +2062,7 @@ impl BhCallStub {
     ///
     /// # Safety
     /// `func` must match the ABI this stub was selected for.
-    pub unsafe fn call_v(
-        &self,
-        func: usize,
-        args_i: Option<&[i64]>,
-        args_r: Option<&[i64]>,
-        args_f: Option<&[i64]>,
-    ) {
+    pub unsafe fn call_v(&self, func: usize, args_i: &[i64], args_r: &[i64], args_f: &[i64]) {
         let mut buf = [0i64; super::insns::MAX_HOST_CALL_ARITY];
         let args = self.place(args_i, args_r, args_f, &mut buf);
         unsafe { (self.call_stub_v)(func, args) }
@@ -4176,6 +4239,11 @@ mod tests {
         for pc in [0, width] {
             assert!(jc.can_decode_live_vars(pc, live));
             assert_eq!(jc.get_live_vars_info(pc, live), 0);
+            // SAFETY: `set_body` published this fixture (`JitCode.setup`).
+            assert_eq!(
+                unsafe { jc.get_live_vars_info_assume_published(pc, live) },
+                0
+            );
         }
         assert!(!jc.can_decode_live_vars(width + 1, live));
         // Even a real instruction must not backtrack into an operand byte.
@@ -4196,6 +4264,13 @@ mod tests {
             startpoints: Some([0].into_iter().collect()),
             ..JitCodeBody::default()
         });
+        jc.get_live_vars_info(0, 42);
+    }
+
+    #[test]
+    #[should_panic(expected = "JitCode body not yet set")]
+    fn get_live_vars_info_panics_on_unset_shell() {
+        let jc = JitCode::new("unset");
         jc.get_live_vars_info(0, 42);
     }
 

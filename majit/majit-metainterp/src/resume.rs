@@ -13,6 +13,7 @@ use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 
 use majit_backend::{ExitPendingFieldLayout, ExitValueSourceLayout, FailArgSource};
+use majit_gc::shadow_stack::ShadowRoot;
 use majit_ir::operand::Operand;
 use majit_ir::{Const, GcRef, OpRef, Type};
 
@@ -65,6 +66,14 @@ pub const UNASSIGNEDVIRTUAL: i16 = ((-1i32 << 13) << 2 | TAGVIRTUAL as i32) as i
 pub const NULLREF: i16 = ((-1i32 << 2) | TAGCONST as i32) as i16;
 pub const UNINITIALIZED_TAG: i16 = ((-2i32 << 2) | TAGCONST as i32) as i16;
 pub const TAG_CONST_OFFSET: i32 = 0;
+
+/// Translated size of `resume.py ResumeDataDirectReader`: one header word and
+/// the nine fields that survive translation (`cpu`, `metainterp_sd` and
+/// `callinfocollection` are prebuilt constants).
+const RESUME_DIRECT_READER_NURSERY_BYTES: usize = 8 + 9 * 8;
+/// Translated size of `resumecode.py Reader`: one header word, `code`,
+/// `cur_pos`, `items_read`.
+const RESUMECODE_READER_NURSERY_BYTES: usize = 8 + 3 * 8;
 
 /// Ordered livebox map: canonical box (`Rc::ptr_eq`) → i16 tag.
 ///
@@ -306,6 +315,19 @@ impl SnapshotBox {
         SnapshotBox {
             opref,
             cached,
+            const_gcref: None,
+        }
+    }
+
+    /// Constant or none snapshot slot. Same fields as [`Self::from_cached`]
+    /// for a constant operand (`cached` empty, `const_gcref` unset).
+    /// `opref` is already a const/none `OpRef`; a `ConstPtr` payload is a
+    /// const-ptr-table index (`history.py` `ConstPtr`).
+    pub fn constant(opref: majit_ir::OpRef) -> Self {
+        debug_assert!(opref.is_none() || opref.is_constant());
+        SnapshotBox {
+            opref,
+            cached: None,
             const_gcref: None,
         }
     }
@@ -2719,9 +2741,9 @@ pub struct ResumeDataLoopMemo {
     /// We store (value, type) pairs to preserve type information.
     consts: Arc<majit_ir::SharedConstPool>,
     /// resume.py — large integers (outside TAGINT range) → tagged const.
-    large_ints: indexmap::IndexMap<i64, i16>,
+    large_ints: indexmap::IndexMap<i64, i16, rustc_hash::FxBuildHasher>,
     /// resume.py:149 — ref pointers → tagged const.
-    refs: indexmap::IndexMap<i64, i16>,
+    refs: indexmap::IndexMap<i64, i16, rustc_hash::FxBuildHasher>,
     /// resume.py self.consts — shared constant pool.
     /// Becomes storage.rd_consts (resume.py:467).
     ///
@@ -2767,8 +2789,8 @@ impl ResumeDataLoopMemo {
     pub fn new() -> Self {
         ResumeDataLoopMemo {
             consts: majit_ir::SharedConstPool::new(Vec::new()),
-            large_ints: indexmap::IndexMap::new(),
-            refs: indexmap::IndexMap::new(),
+            large_ints: indexmap::IndexMap::default(),
+            refs: indexmap::IndexMap::default(),
             cached_boxes: indexmap::IndexMap::new(),
             cached_virtuals: indexmap::IndexMap::new(),
             nvirtuals: 0,
@@ -2919,7 +2941,8 @@ impl ResumeDataLoopMemo {
         if self.refs.is_empty() {
             return;
         }
-        let mut rebuilt: IndexMap<i64, i16> = IndexMap::with_capacity(self.refs.len());
+        let mut rebuilt: IndexMap<i64, i16, rustc_hash::FxBuildHasher> =
+            IndexMap::with_capacity_and_hasher(self.refs.len(), rustc_hash::FxBuildHasher);
         for (_, &tagged) in self.refs.iter() {
             let (num, _) = untag(tagged);
             let idx = (num - TAG_CONST_OFFSET) as usize;
@@ -5993,14 +6016,20 @@ pub struct ResumeDataDirectReader<'a> {
     /// resume.py `ResumeDataDirectReader.deadframe` — the jitframe GCREF
     /// `cpu.get_int_value(self.deadframe, num)` / `get_ref_value` load.
     /// Zero means the test-only dense-slice arm (`FailArgSource::Slice`).
+    /// A `FailArgSource::JitFrame` arm also holds `deadframe_owner`; TAGBOX
+    /// loads reread that slot (`live_deadframe`).
     pub deadframe: i64,
+    /// `FailArgSource::from_held_root`: the `DeadFrame` owner slot
+    /// `compile.py` `ResumeGuardDescr.handle_fail` keeps for
+    /// `resume.py` `blackhole_from_resumedata`. None on Slice / Libc.
+    deadframe_owner: Option<&'a ShadowRoot>,
     /// `llmodel.py _decode_pos`: `descr.rd_locs` already fetched off the
     /// failing guard. Empty on the Slice arm (identity index).
     deadframe_rd_locs: &'a [u16],
     /// Dense fail-arg list used only when `deadframe` is 0.
     deadframe_slice: &'a [i64],
-    /// GC jitframe: the GCREF field is a resume root so a collection
-    /// during decode forwards it in place (`self.deadframe` is traced).
+    /// GC jitframe. When `deadframe_owner` is set, that owner slot is
+    /// the only root for the jitframe; bind does not push a copy.
     deadframe_on_heap: bool,
     deadframe_root_base_depth: Option<usize>,
     // resume.py:1358 resume_after_guard_not_forced
@@ -6040,11 +6069,12 @@ pub struct ResumeDataDirectReader<'a> {
     decode_calls: Vec<ResumeDecodeCall>,
 }
 
-/// Holds `&mut ResumeDataDirectReader` while `self.deadframe` and
-/// `Reader.code` are resume GCREF roots. `resume.py`
+/// Holds `&mut ResumeDataDirectReader` while `Reader.code` (and, on the
+/// Slice/Libc path, `self.deadframe`) are resume GCREF roots. `resume.py`
 /// `ResumeDataDirectReader.__init__` traces those fields; the borrow
 /// keeps the reader from moving while the collector can rewrite them
-/// in place.
+/// in place. A `FailArgSource::JitFrame` jitframe is the `DeadFrame`
+/// owner slot, not a resume-ref copy.
 #[must_use]
 pub struct DeadframeRootGuard<'r, 'a> {
     reader: &'r mut ResumeDataDirectReader<'a>,
@@ -7209,17 +7239,23 @@ impl<'a> ResumeDataDirectReader<'a> {
         // then calls `cpu.get_int_value(self.deadframe, num)` on that GCREF
         // (`llmodel.py get_int_value` / `get_ref_value`). Unpack the
         // FailArgSource once here so each slot does not match Slice /
-        // JitFrame / LibcJitFrame.
-        let (deadframe_gcref, deadframe_rd_locs, deadframe_slice, deadframe_on_heap) =
-            match deadframe {
-                FailArgSource::Slice(s) => (0, &[][..], s, false),
-                FailArgSource::JitFrame { root, rd_locs, .. } => {
-                    (root.get().0 as i64, rd_locs, &[][..], true)
-                }
-                FailArgSource::LibcJitFrame { ptr, rd_locs, .. } => {
-                    (ptr as i64, rd_locs, &[][..], false)
-                }
-            };
+        // JitFrame / LibcJitFrame. The JitFrame arm keeps the owner
+        // `ShadowRoot` so every later load rereads `root.get()`.
+        let (
+            deadframe_gcref,
+            deadframe_rd_locs,
+            deadframe_slice,
+            deadframe_on_heap,
+            deadframe_owner,
+        ) = match deadframe {
+            FailArgSource::Slice(s) => (0, &[][..], s, false, None),
+            FailArgSource::JitFrame { root, rd_locs, .. } => {
+                (root.get().0 as i64, rd_locs, &[][..], true, Some(root))
+            }
+            FailArgSource::LibcJitFrame { ptr, rd_locs, .. } => {
+                (ptr as i64, rd_locs, &[][..], false, None)
+            }
+        };
 
         ResumeDataDirectReader {
             resumecodereader,
@@ -7227,6 +7263,7 @@ impl<'a> ResumeDataDirectReader<'a> {
             count,
             consts: rd_consts,
             deadframe: deadframe_gcref,
+            deadframe_owner,
             deadframe_rd_locs,
             deadframe_slice,
             deadframe_on_heap,
@@ -7243,17 +7280,20 @@ impl<'a> ResumeDataDirectReader<'a> {
         }
     }
 
-    /// Root `self.deadframe` and `Reader.code` after the reader sits in
-    /// its final stack slot. `resume.py` `ResumeDataDirectReader.__init__`
-    /// traces those GCREF fields; a collection during `consume_one_section`
-    /// / virtual allocate forwards them in place. The returned guard holds
-    /// `&mut self` so the reader cannot move while registered. Off-heap
-    /// and Slice arms skip the deadframe push; a MiniMark numbering is
-    /// still pushed. Host blocks are not GCREFs.
+    /// Root `Reader.code` after the reader sits in its final stack slot
+    /// when that numbering is a MiniMark GCREF. `resume.py`
+    /// `ResumeDataDirectReader.__init__` traces `self.deadframe` and
+    /// `Reader.code`; MiniMark already traces those fields on the GC
+    /// reader, so there is no second jitframe copy. The jitframe here is
+    /// the `DeadFrame` owner `ShadowRoot`
+    /// (`FailArgSource::from_held_root`); bind does not push that GCREF
+    /// again. Off-heap and Slice arms skip the deadframe push; a MiniMark
+    /// numbering is still pushed. Host blocks are not GCREFs.
     #[must_use]
     pub fn bind_deadframe_root(&mut self) -> DeadframeRootGuard<'_, 'a> {
         if self.deadframe_root_base_depth.is_none() {
-            let root_deadframe = self.deadframe_on_heap && self.deadframe != 0;
+            let root_deadframe =
+                self.deadframe_owner.is_none() && self.deadframe_on_heap && self.deadframe != 0;
             let root_numbering = self.resumecodereader.has_gc_code();
             if root_deadframe || root_numbering {
                 self.deadframe_root_base_depth =
@@ -7275,12 +7315,21 @@ impl<'a> ResumeDataDirectReader<'a> {
         DeadframeRootGuard { reader: self }
     }
 
+    /// `resume.py` `cpu.get_int_value(self.deadframe, num)` reads the
+    /// GCREF field MiniMark traces. The owner `ShadowRoot` is that field.
+    #[inline(always)]
+    fn live_deadframe(&self) -> i64 {
+        self.deadframe_owner
+            .map(|root| root.get().0 as i64)
+            .unwrap_or(self.deadframe)
+    }
+
     /// `llmodel.py get_int_value` / `get_ref_value`: `_decode_pos` then
     /// `get_*_value_direct` on `self.deadframe`.
     #[inline(always)]
     fn cpu_get_value(&self, index: usize) -> i64 {
         let locs = self.deadframe_rd_locs;
-        self.cpu_get_value_at(self.deadframe, locs, locs.is_empty(), index)
+        self.cpu_get_value_at(self.live_deadframe(), locs, locs.is_empty(), index)
     }
 
     #[inline(always)]
@@ -7310,7 +7359,7 @@ impl<'a> ResumeDataDirectReader<'a> {
             numb_len,
             cur_pos: self.resumecodereader.cur_pos,
             items_read: self.resumecodereader.items_read,
-            deadframe: self.deadframe,
+            deadframe: self.live_deadframe(),
             locs: self.deadframe_rd_locs,
             count: self.count,
             locs_empty: self.deadframe_rd_locs.is_empty(),
@@ -7942,10 +7991,18 @@ impl<'a> ResumeDataDirectReader<'a> {
             while it.remaining() != 0 {
                 // SAFETY: `it` walks a complete `all_liveness` bank
                 // (`liveness.py` `LivenessIterator.next`).
-                let reg_idx = unsafe { it.next_index() };
+                let reg_idx = unsafe { it.next_index() } as usize;
                 // resume.py `_callback_i`: `write_an_int(index, next_int())`.
                 let tagged = cur.next_item() as i16;
-                bh.registers_i[reg_idx as usize] = self.decode_int_tagged(tagged, &mut cur);
+                let value = self.decode_int_tagged(tagged, &mut cur);
+                debug_assert!(reg_idx < bh.registers_i.len());
+                // SAFETY: `LivenessIterator` indexes this jitcode's assembled
+                // integer bank; `setposition_ref` sized it to
+                // `num_regs_i + constants_i` before consumption
+                // (`resume.py write_an_int`).
+                unsafe {
+                    *bh.registers_i.get_unchecked_mut(reg_idx) = value;
+                }
             }
             offset = it.offset();
             cur.write_to_reader(&mut self.resumecodereader);
@@ -7956,11 +8013,18 @@ impl<'a> ResumeDataDirectReader<'a> {
             let mut it = unsafe { LivenessIterator::new(offset, length_r, all_liveness) };
             while it.remaining() != 0 {
                 // SAFETY: complete `all_liveness` bank (`LivenessIterator.next`).
-                let reg_idx = unsafe { it.next_index() };
+                let reg_idx = unsafe { it.next_index() } as usize;
                 // resume.py `_callback_r`: `write_a_ref(index, next_ref())`.
                 let tagged = cur.next_item() as i16;
                 let value = self.decode_ref_tagged(tagged, &mut cur);
-                bh.registers_r[reg_idx as usize] = value;
+                debug_assert!(reg_idx < bh.registers_r.len());
+                // SAFETY: `LivenessIterator` indexes this jitcode's assembled
+                // ref bank; `setposition_ref` sized it to
+                // `num_regs_r + constants_r` before consumption
+                // (`resume.py write_a_ref`).
+                unsafe {
+                    *bh.registers_r.get_unchecked_mut(reg_idx) = value;
+                }
                 if let Some(vinfo) = vinfo_heap {
                     vinfo.push_resume_ref_roots_for_value(value);
                 }
@@ -7974,10 +8038,18 @@ impl<'a> ResumeDataDirectReader<'a> {
             let mut it = unsafe { LivenessIterator::new(offset, length_f, all_liveness) };
             while it.remaining() != 0 {
                 // SAFETY: complete `all_liveness` bank (`LivenessIterator.next`).
-                let reg_idx = unsafe { it.next_index() };
+                let reg_idx = unsafe { it.next_index() } as usize;
                 // resume.py `_callback_f`: `write_a_float(index, next_float())`.
                 let tagged = cur.next_item() as i16;
-                bh.registers_f[reg_idx as usize] = self.decode_float_tagged(tagged, &cur);
+                let value = self.decode_float_tagged(tagged, &cur);
+                debug_assert!(reg_idx < bh.registers_f.len());
+                // SAFETY: `LivenessIterator` indexes this jitcode's assembled
+                // float bank; `setposition_ref` sized it to
+                // `num_regs_f + constants_f` before consumption
+                // (`resume.py write_a_float`).
+                unsafe {
+                    *bh.registers_f.get_unchecked_mut(reg_idx) = value;
+                }
             }
             // `offset` is the end of the float section; no further use.
             let _ = offset;
@@ -8232,7 +8304,7 @@ impl<'a> ResumeDataDirectReader<'a> {
             cur.write_to_reader(&mut self.resumecodereader);
             let idx = self.virtual_index(num);
             let value = self.getvirtual_int(idx);
-            cur.reload_bases(&self.resumecodereader, self.deadframe);
+            cur.reload_bases(&self.resumecodereader, self.live_deadframe());
             value
         } else {
             debug_assert_eq!(tag, TAGBOX);
@@ -8270,7 +8342,7 @@ impl<'a> ResumeDataDirectReader<'a> {
             cur.write_to_reader(&mut self.resumecodereader);
             let idx = self.virtual_index(num);
             let value = self.getvirtual_ptr(idx);
-            cur.reload_bases(&self.resumecodereader, self.deadframe);
+            cur.reload_bases(&self.resumecodereader, self.live_deadframe());
             value
         } else {
             if tag != TAGBOX {
@@ -9027,6 +9099,107 @@ mod pendingfields_tests {
     }
 }
 
+#[cfg(test)]
+mod deadframe_owner_tests {
+    use super::*;
+    use majit_backend::FailArgSource;
+    use majit_backend::deadframe::{ExitDescr, JitFrameDeadFrame};
+    use majit_backend::jitframe::{JitFrame, alloc_off_gc_jitframe, free_off_gc_jitframe};
+    use majit_ir::descr::SimpleSizeDescr;
+    use majit_ir::{SimpleFailDescr, Type};
+
+    struct NoAlloc;
+
+    impl BlackholeAllocator for NoAlloc {}
+
+    fn walked_owner_count() -> usize {
+        let mut n = 0;
+        majit_gc::shadow_stack::walk_roots(|_| n += 1);
+        n
+    }
+
+    /// `FailArgSource::from_held_root` reuses the `DeadFrame` owner slot.
+    /// `bind_deadframe_root` must not register a second jitframe GCREF;
+    /// TAGBOX `decode_int` / `cpu_get_value` reread `ShadowRoot::get`
+    /// after a forwarding store.
+    #[test]
+    fn bind_deadframe_root_rereads_the_owner_slot_and_does_not_push_a_copy() {
+        let from = alloc_off_gc_jitframe(JitFrame::alloc_size(4));
+        let to = alloc_off_gc_jitframe(JitFrame::alloc_size(4));
+        assert!(!from.is_null() && !to.is_null());
+        unsafe {
+            JitFrame::init(from, std::ptr::null(), 4);
+            JitFrame::init(to, std::ptr::null(), 4);
+            majit_backend::llmodel::set_int_value(from, 0, 111);
+            majit_backend::llmodel::set_int_value(to, 0, 222);
+        }
+
+        let baseline_owners = walked_owner_count();
+        let baseline_resume = majit_gc::shadow_stack::resume_ref_roots_depth();
+        let descr = SimpleFailDescr::new(0, vec![Type::Int]);
+        let size: majit_ir::DescrRef = Arc::new(SimpleSizeDescr::new(0, 8, 0));
+        let deadframe = majit_backend::DeadFrame::JitFrame(JitFrameDeadFrame::from_shadow_root(
+            ShadowRoot::new(GcRef(from as usize)),
+            ExitDescr::owned(size),
+            None,
+        ));
+        assert_eq!(walked_owner_count(), baseline_owners + 1);
+
+        {
+            let root = deadframe
+                .as_jitframe()
+                .expect("JitFrame deadframe")
+                .shadow_root()
+                .expect("owner slot");
+            let source = FailArgSource::from_held_root(root, &descr, 1);
+            let alloc = NoAlloc;
+            let mut reader = ResumeDataDirectReader::new(&[0, 0], &[], &[], source, None, &alloc);
+            let mut bound = reader.bind_deadframe_root();
+            let mut saw_from = false;
+            majit_gc::shadow_stack::walk_resume_ref_roots(|slot| {
+                if slot.0 == from as usize {
+                    saw_from = true;
+                }
+            });
+            assert!(
+                !saw_from,
+                "the owner ShadowRoot already covers the jitframe"
+            );
+            assert_eq!(
+                majit_gc::shadow_stack::resume_ref_roots_depth(),
+                baseline_resume
+            );
+
+            majit_gc::shadow_stack::walk_roots(|slot| {
+                if slot.0 == from as usize {
+                    *slot = GcRef(to as usize);
+                }
+            });
+            let tagged = tag(0, TAGBOX).unwrap();
+            assert_eq!(
+                bound.decode_int(tagged),
+                222,
+                "TAGBOX decode_int must load through the forwarded owner slot"
+            );
+            drop(bound);
+            drop(reader);
+        }
+
+        assert_eq!(
+            majit_gc::shadow_stack::resume_ref_roots_depth(),
+            baseline_resume
+        );
+        assert_eq!(walked_owner_count(), baseline_owners + 1);
+        drop(deadframe);
+        assert_eq!(walked_owner_count(), baseline_owners);
+
+        unsafe {
+            free_off_gc_jitframe(from);
+            free_off_gc_jitframe(to);
+        }
+    }
+}
+
 /// resume.py blackhole_from_resumedata
 ///
 /// Build a chain of BlackholeInterpreters from encoded resume data.
@@ -9091,9 +9264,9 @@ impl<'a> ResolvedJitCode<'a> {
 /// index here pairs with the i-th int-bank `RebuiltValue`.
 #[derive(Default, Clone, Debug)]
 pub struct FrameLivenessRegIndices {
-    pub int: Vec<u32>,
-    pub ref_: Vec<u32>,
-    pub float: Vec<u32>,
+    pub int: SmallVec<[u32; 16]>,
+    pub ref_: SmallVec<[u32; 16]>,
+    pub float: SmallVec<[u32; 16]>,
 }
 
 impl FrameLivenessRegIndices {
@@ -9145,9 +9318,9 @@ pub fn read_frame_liveness_reg_indices(
         return FrameLivenessRegIndices::default();
     }
     // `enumerate_vars` yields exactly these many indices per bank.
-    let mut int = Vec::with_capacity(all_liveness[info] as usize);
-    let mut ref_ = Vec::with_capacity(all_liveness[info + 1] as usize);
-    let mut float = Vec::with_capacity(all_liveness[info + 2] as usize);
+    let mut int = SmallVec::<[u32; 16]>::with_capacity(all_liveness[info] as usize);
+    let mut ref_ = SmallVec::<[u32; 16]>::with_capacity(all_liveness[info + 1] as usize);
+    let mut float = SmallVec::<[u32; 16]>::with_capacity(all_liveness[info + 2] as usize);
     // SAFETY: `liveness_record_is_complete` proved the three count bytes
     // and the three `encode_liveness` banks of those lengths
     // (`jitcode.py` `enumerate_vars`).
@@ -9161,6 +9334,122 @@ pub fn read_frame_liveness_reg_indices(
         );
     }
     FrameLivenessRegIndices { int, ref_, float }
+}
+
+#[cfg(test)]
+mod liveness_bank_tests {
+    use super::{FrameLivenessRegIndices, read_frame_liveness_reg_indices};
+    use crate::jitcode::JitCode;
+    use crate::jitcode::insns::BC_LIVE;
+    use majit_jitcode::codewriter::liveness::encode_liveness;
+    use majit_jitcode::jitcode::JitCodeBody;
+
+    fn live_jitcode() -> JitCode {
+        let mut startpoints = indexmap::IndexSet::new();
+        startpoints.insert(0);
+        let jc = JitCode::new("liveness-banks");
+        jc.set_body(JitCodeBody {
+            code: vec![BC_LIVE, 0, 0],
+            startpoints: Some(startpoints),
+            ..JitCodeBody::default()
+        });
+        jc
+    }
+
+    fn record(int: &[u8], ref_: &[u8], float: &[u8]) -> Vec<u8> {
+        let mut buf = vec![int.len() as u8, ref_.len() as u8, float.len() as u8];
+        for live in [int, ref_, float] {
+            buf.extend_from_slice(&encode_liveness(live));
+        }
+        buf
+    }
+
+    fn indices(int: &[u8], ref_: &[u8], float: &[u8]) -> FrameLivenessRegIndices {
+        let jc = live_jitcode();
+        let all = record(int, ref_, float);
+        read_frame_liveness_reg_indices(&jc, 0, BC_LIVE, &all)
+    }
+
+    fn regs(n: u8) -> Vec<u8> {
+        (0..n).collect()
+    }
+
+    fn as_u32(live: &[u8]) -> Vec<u32> {
+        live.iter().map(|&i| i as u32).collect()
+    }
+
+    #[test]
+    fn read_frame_liveness_reg_indices_covers_empty_inline_and_heap_banks() {
+        let empty = indices(&[], &[], &[]);
+        assert_eq!(empty.int.as_slice(), &[] as &[u32]);
+        assert_eq!(empty.ref_.as_slice(), &[] as &[u32]);
+        assert_eq!(empty.float.as_slice(), &[] as &[u32]);
+
+        for n in [16u8, 17] {
+            let live = regs(n);
+            let want = as_u32(&live);
+            let int_only = indices(&live, &[], &[]);
+            assert_eq!(int_only.int.as_slice(), want.as_slice());
+            assert_eq!(int_only.ref_.as_slice(), &[] as &[u32]);
+            assert_eq!(int_only.float.as_slice(), &[] as &[u32]);
+            let ref_only = indices(&[], &live, &[]);
+            assert_eq!(ref_only.int.as_slice(), &[] as &[u32]);
+            assert_eq!(ref_only.ref_.as_slice(), want.as_slice());
+            assert_eq!(ref_only.float.as_slice(), &[] as &[u32]);
+            let float_only = indices(&[], &[], &live);
+            assert_eq!(float_only.int.as_slice(), &[] as &[u32]);
+            assert_eq!(float_only.ref_.as_slice(), &[] as &[u32]);
+            assert_eq!(float_only.float.as_slice(), want.as_slice());
+        }
+
+        let mixed_int = regs(16);
+        let mixed_ref = regs(17);
+        let mixed_float = regs(0);
+        let mixed = indices(&mixed_int, &mixed_ref, &mixed_float);
+        assert_eq!(mixed.int.as_slice(), as_u32(&mixed_int).as_slice());
+        assert_eq!(mixed.ref_.as_slice(), as_u32(&mixed_ref).as_slice());
+        assert_eq!(mixed.float.as_slice(), &[] as &[u32]);
+        let mut order = Vec::new();
+        order.extend(mixed.int.iter().copied());
+        order.extend(mixed.ref_.iter().copied());
+        order.extend(mixed.float.iter().copied());
+        let mut want_order = as_u32(&mixed_int);
+        want_order.extend(as_u32(&mixed_ref));
+        assert_eq!(order, want_order);
+    }
+}
+
+#[cfg(test)]
+mod numbering_encode_tests {
+    use majit_ir::resumecode::Writer;
+
+    #[test]
+    fn encode_into_matches_encode_bytes_at_varint_boundaries() {
+        let values: &[i32] = &[
+            0,
+            63,
+            64,
+            -64,
+            -65,
+            8191,
+            8192,
+            -8192,
+            -8193,
+            (1 << 20) - 1,
+            1 << 20,
+            (1 << 24) - 1,
+        ];
+        let mut w = Writer::new(values.len());
+        for &v in values {
+            w.append_short(v);
+        }
+        let encoded = w.encode_bytes();
+        assert_eq!(w.encoded_len(), encoded.len());
+        let mut into = vec![0u8; w.encoded_len()];
+        w.encode_into(&mut into);
+        assert_eq!(into, encoded);
+        assert_eq!(w.create_numbering().as_slice(), encoded.as_slice());
+    }
 }
 
 /// One `resume.py` `ResumeDataBoxReader.decode_box` result: the box to
@@ -9400,6 +9689,11 @@ where
     // reads `storage.rd_numb`). The caller may allocate before this call,
     // and a minor would then decode the header from a stale slice while
     // the bind below reloads the rest.
+    // `resume.py ResumeDataDirectReader` and the `resumecode.Reader` it
+    // owns are nursery instances; the reader here is a stack value.
+    majit_gc::charge_translated_nursery(
+        RESUME_DIRECT_READER_NURSERY_BYTES + RESUMECODE_READER_NURSERY_BYTES,
+    );
     let mut resumereader = ResumeDataDirectReader::new(
         numb_root.as_slice(),
         rd_consts,
@@ -9419,14 +9713,15 @@ where
     let empty_pending = rd_guard_pendingfields.is_none_or(|p| p.is_empty());
     let empty_virtuals = rd_virtuals.is_none_or(|v| v.is_empty());
     let skip_prepare = !resuming_after_guard_not_forced && empty_virtuals && empty_pending;
-    // `resume.py` traces `self.deadframe` and `Reader.code`; bind so a
-    // collection forwards those fields. The guard keeps the reader from
-    // moving. `numb_next_item` indexes `Reader.code` for the rest of
-    // this window (`ResumeGuardDescr.rd_numb` holds the numbering).
+    // `resume.py` traces `self.deadframe` and `Reader.code`. The jitframe
+    // is the `DeadFrame` owner slot; bind registers MiniMark numbering.
+    // The guard keeps the reader from moving. `numb_next_item` indexes
+    // `Reader.code` for the rest of this window (`ResumeGuardDescr.rd_numb`
+    // holds the numbering).
     let mut resumereader = resumereader.bind_deadframe_root();
     let _resume_roots = if resuming_after_guard_not_forced {
         // Virtuals already live in the cache; a collection during
-        // consume still forwards `self.deadframe`.
+        // consume still rereads the owner slot (`live_deadframe`).
         Some(prepare_resume_heap_with_roots(
             &mut *resumereader,
             None,

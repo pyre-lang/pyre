@@ -84,7 +84,12 @@ const WIDE_MAX_CHUNKS: usize = 8192;
 static NEXT_WIDE_ID: AtomicU32 = AtomicU32::new(1);
 static WIDE_CHUNKS: [AtomicPtr<Cell<WideStored>>; WIDE_MAX_CHUNKS] =
     [const { AtomicPtr::new(ptr::null_mut()) }; WIDE_MAX_CHUNKS];
+/// Chunk 0 of [`WIDE_CHUNKS`]. `const_ptr_table::resolve` loads `FIRST_CHUNK`
+/// the same way; this is that array slot, not a second table.
+static FIRST_WIDE: &AtomicPtr<Cell<WideStored>> = &WIDE_CHUNKS[0];
 
+#[cold]
+#[inline(never)]
 fn init_wide_chunk(chunk_i: usize) -> *mut Cell<WideStored> {
     let boxed: Box<[Cell<WideStored>]> = (0..WIDE_CHUNK)
         .map(|_| Cell::new(WideStored::Void))
@@ -109,10 +114,21 @@ fn init_wide_chunk(chunk_i: usize) -> *mut Cell<WideStored> {
     }
 }
 
+#[inline]
 fn wide_slot(id: u32) -> &'static Cell<WideStored> {
     let idx = id as usize;
+    if idx < WIDE_CHUNK {
+        let p = FIRST_WIDE.load(Ordering::Acquire);
+        let p = if p.is_null() { init_wide_chunk(0) } else { p };
+        return unsafe { &*p.add(idx) };
+    }
+    wide_slot_tail(id)
+}
+
+fn wide_slot_tail(id: u32) -> &'static Cell<WideStored> {
+    let idx = id as usize;
     let chunk_i = idx / WIDE_CHUNK;
-    assert!(
+    debug_assert!(
         chunk_i < WIDE_MAX_CHUNKS,
         "wide Const identity space exhausted"
     );
@@ -141,7 +157,14 @@ pub(crate) fn fresh_wide(value: Value) -> u64 {
 
 fn fresh_wide_stored(stored: WideStored) -> u64 {
     let id = NEXT_WIDE_ID
-        .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| {
+            let next = id.checked_add(1)?;
+            if (next as usize) / WIDE_CHUNK >= WIDE_MAX_CHUNKS {
+                None
+            } else {
+                Some(next)
+            }
+        })
         .unwrap_or_else(|_| panic!("wide Const identity space exhausted"));
     wide_slot(id).set(stored);
     u64::from(id)
@@ -153,12 +176,37 @@ pub fn wide_ids_minted() -> u32 {
     NEXT_WIDE_ID.load(Ordering::Relaxed)
 }
 
+/// `history.py` `ConstInt.getint` / `ConstFloat.value` / `ConstPtr.getref_base`.
+/// Int and Float are the stored payload; Ref is `const_ptr_table::resolve`.
+#[inline]
 pub(crate) fn wide_value(id: u64) -> Value {
-    match wide_slot(id as u32).get() {
+    let stored = wide_slot(id as u32).get();
+    match stored {
         WideStored::Int(v) => Value::Int(v),
         WideStored::Float(v) => Value::Float(v),
+        _ => wide_value_ref(stored),
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn wide_value_ref(stored: WideStored) -> Value {
+    match stored {
         WideStored::Ref(index) => Value::Ref(crate::const_ptr_table::resolve(index)),
         WideStored::Void => Value::Void,
+        WideStored::Int(v) => Value::Int(v),
+        WideStored::Float(v) => Value::Float(v),
+    }
+}
+
+/// `same_box` on two wide constants, without materializing `Value`s.
+fn wide_stored_same(a: u64, b: u64) -> bool {
+    match (wide_slot(a as u32).get(), wide_slot(b as u32).get()) {
+        (WideStored::Int(x), WideStored::Int(y)) => x == y,
+        (WideStored::Float(x), WideStored::Float(y)) => x.to_bits() == y.to_bits(),
+        (WideStored::Ref(x), WideStored::Ref(y)) => x == y,
+        (WideStored::Void, WideStored::Void) => true,
+        _ => false,
     }
 }
 
@@ -195,8 +243,8 @@ const OP_TEMPVAR: u64 = 6;
 
 /// `SmallWide` packed word (`history.py` Const carries its type on the object):
 /// bits 0–2 tag `OP_SMALLWIDE`, bits 3–61 slab index (59 bits), bits 62–63
-/// `Type`. The index field is 59 bits; `wide_slot` asserts
-/// `id / WIDE_CHUNK < WIDE_MAX_CHUNKS`, so the maximum index is
+/// `Type`. The index field is 59 bits; `fresh_wide_stored` panics when
+/// `id / WIDE_CHUNK` would leave `WIDE_MAX_CHUNKS`, so the maximum index is
 /// `WIDE_MAX_CHUNKS * WIDE_CHUNK - 1` (4_194_303). `Operand` is always a
 /// `u64` and SmallWide is a slab index, not a stolen pointer, so bits 62–63
 /// are free on every pointer width. Type bits are a function of the slab
@@ -282,6 +330,7 @@ pub struct OperandView<'a> {
 impl OperandView<'_> {
     /// The operand's `Type` (`Int` / `Float` / `Ref` / `Void`).
     /// SmallWide reads the packed 2-bit type and does not load the slab.
+    #[inline]
     pub fn type_(&self) -> Type {
         match &self.inner {
             Opnd::Op(op) => op.pos().get().ty().unwrap_or(op.type_),
@@ -297,6 +346,7 @@ impl OperandView<'_> {
 
     /// The inline constant value (`history.py` `Const.getint` family),
     /// `None` for non-`Const`.
+    #[inline]
     pub fn const_value(&self) -> Option<Value> {
         match &self.inner {
             Opnd::SmallInt(encoded) => Some(Value::Int(small_int_value(*encoded))),
@@ -654,6 +704,7 @@ impl Operand {
     /// re-expressed, never retired. An `Op` reads its (post-compaction)
     /// position straight off `op.pos`; a `Const*` maps to the matching inline
     /// `OpRef` (`history.py:227/268/314`).
+    #[inline]
     pub fn to_opref(&self) -> OpRef {
         match self.view() {
             Opnd::None => OpRef::NONE,
@@ -691,6 +742,7 @@ impl Operand {
     /// The operand's `Type` (`Int` / `Float` / `Ref` / `Void`).
     /// SmallWide reads the 2-bit type packed at mint (`history.py` Const type
     /// on the object) and does not load the slab.
+    #[inline]
     pub fn type_(&self) -> Type {
         if self.packed & OP_TAG == OP_SMALLWIDE {
             return small_wide_type(self.packed);
@@ -709,6 +761,7 @@ impl Operand {
 
     /// The inline constant value (`history.py` `Const.getint` family),
     /// `None` for non-`Const`.
+    #[inline]
     pub fn const_value(&self) -> Option<Value> {
         match self.view() {
             Opnd::SmallInt(encoded) => Some(Value::Int(small_int_value(encoded))),
@@ -768,6 +821,16 @@ impl Operand {
         self.packed != 0 && self.packed & OP_TAG == OP_INPUTARG
     }
 
+    /// Recorder slot of an `InputArg` operand (`optimizer.py` `self.inputargs[idx]`).
+    #[inline]
+    pub fn inputarg_index(&self) -> Option<u32> {
+        if self.packed == 0 || self.packed & OP_TAG != OP_INPUTARG {
+            return None;
+        }
+        // SAFETY: `OP_INPUTARG` packs the `InputArg` pointer this operand holds.
+        Some(unsafe { (*((self.packed & !OP_TAG) as *const crate::value::InputArg)).index })
+    }
+
     pub fn is_resop(&self) -> bool {
         self.packed != 0 && self.packed & OP_TAG == OP_OP
     }
@@ -792,30 +855,25 @@ impl Operand {
         self.packed
     }
 
-    /// `resoperation.py AbstractValue.same_box`: pointer identity
-    /// (`Rc::ptr_eq`) for `Op` / `InputArg`, value comparison for `Const`
-    /// (`history.py Const.same_box` delegates to `same_constant`), and the
-    /// `None` sentinel matches only itself. Native dispatch on the operand
-    /// union: two operands carrying the same producer `Rc` are `ptr_eq`; two
-    /// `Const` operands compare by value (`Value`'s `==` is bit-exact, so
-    /// `0.0 != -0.0` and `NaN == NaN` — `history.py:251/292/338`); cross-kind
-    /// is never the same box. Unlike `==` (uniform `Rc::ptr_eq`, so two equal
-    /// fresh `Const`s differ), `same_box` is the value-aware predicate callers
-    /// opt into exactly where RPython spells out `same_box(...)`. Equivalent to
-    /// the former box-wrapper round-trip (`from_bound_*` memoizes one
-    /// wrapper per producer, so its `Rc::ptr_eq` short-circuit and this
-    /// producer-`Rc` `ptr_eq` agree), without re-minting a `Const` box.
+    /// `resoperation.py AbstractValue.same_box`: packed-word identity
+    /// (`self is other`) for producers and `None`. After packed inequality,
+    /// constants still match by value (`history.py Const.same_box` →
+    /// `same_constant`; `Value` `==` is bit-exact).
+    #[inline]
     pub fn same_box(&self, other: &Operand) -> bool {
-        if (self.is_resop() && other.is_resop())
-            || (self.is_inputarg() && other.is_inputarg())
-            || (self.is_temp_var() && other.is_temp_var())
-        {
-            return self.packed == other.packed;
+        if self.packed == other.packed {
+            return true;
         }
         if self.is_constant() && other.is_constant() {
+            if self.packed & OP_TAG == OP_SMALLWIDE && other.packed & OP_TAG == OP_SMALLWIDE {
+                return wide_stored_same(
+                    small_wide_index(self.packed),
+                    small_wide_index(other.packed),
+                );
+            }
             return self.const_value() == other.const_value();
         }
-        self.is_none() && other.is_none()
+        false
     }
 
     /// `resoperation.py get_box_replacement(not_const=False)`.
@@ -857,6 +915,7 @@ impl Operand {
 
     /// Packed word of the `_forwarded` chain terminal, not counted: `self`
     /// or a hop's `_forwarded` slot keeps it alive.
+    #[inline]
     fn replacement_packed(&self, not_const: bool) -> u64 {
         if !self.is_resop() && !self.is_inputarg() && !self.is_temp_var() {
             return self.packed;
@@ -1227,6 +1286,7 @@ mod tests {
         let o_ia = Operand::from_bound_inputarg(&ia);
         assert!(o_ia.is_inputarg());
         assert_eq!(o_ia.position(), Some(1));
+        assert_eq!(o_ia.inputarg_index(), Some(1));
         assert_eq!(o_ia.type_(), Type::Float);
 
         let o_c = Operand::const_(Const::Int(9));
@@ -1295,6 +1355,34 @@ mod tests {
         assert!(!Operand::from_bound_op(&op).same_box(&Operand::from_bound_inputarg(&ia)));
         assert!(!Operand::from_bound_op(&op).same_box(&Operand::const_(Const::Int(0))));
         assert!(!Operand::from_bound_inputarg(&ia).same_box(&Operand::none()));
+    }
+
+    #[test]
+    fn same_box_wide_constants_compare_stored_values() {
+        let v = i64::MAX - 7;
+        let a = Operand::const_from_value(Value::Int(v));
+        let b = Operand::const_from_value(Value::Int(v));
+        assert!(a.is_small_wide());
+        assert!(b.is_small_wide());
+        assert!(a.same_box(&b));
+        assert!(!a.same_box(&Operand::const_from_value(Value::Int(v - 1))));
+
+        let f1 = Operand::const_from_value(Value::Float(1.25));
+        let f2 = Operand::const_from_value(Value::Float(1.25));
+        assert!(f1.is_small_wide());
+        assert!(f1.same_box(&f2));
+
+        let n1 = Operand::const_from_value(Value::Float(f64::NAN));
+        let n2 = Operand::const_from_value(Value::Float(f64::NAN));
+        assert!(n1.same_box(&n2));
+
+        assert!(
+            !Operand::const_from_value(Value::Float(0.0))
+                .same_box(&Operand::const_from_value(Value::Float(-0.0)))
+        );
+
+        assert!(!a.same_box(&Operand::const_from_value(Value::Float(1.0))));
+        assert!(a.same_box(&a.clone()));
     }
 
     /// `from_opref` builds the absent / inline-const arms natively (mirror of
@@ -1572,15 +1660,24 @@ mod tests {
 
         let a = Operand::from_bound_op(&op_at(0, Type::Ref));
         assert!(a.ptr_info().is_none() && a.int_bound().is_none());
+        assert!(a.ptr_info_handle().is_none() && a.int_bound_handle().is_none());
+        assert!(a.ptr_info_mut().is_none() && a.int_bound_mut().is_none());
         a.set_forwarded_info(OpInfo::ptr(PtrInfo::nonnull()));
         assert!(a.ptr_info().expect("ptr_info Some").is_nonnull());
+        assert!(a.ptr_info_handle().is_some());
         assert!(a.int_bound().is_none());
+        assert!(a.int_bound_handle().is_none());
+        assert!(a.int_bound_mut().is_none());
 
         let b = Operand::from_bound_op(&op_at(1, Type::Int));
         b.set_forwarded_info(OpInfo::int_bound(IntBound::from_constant(42)));
         let ib = b.int_bound().expect("int_bound Some");
         assert!(ib.is_constant());
         assert_eq!(ib.get_constant_int(), 42);
+        assert!(b.int_bound_handle().is_some());
+        assert!(b.ptr_info().is_none());
+        assert!(b.ptr_info_handle().is_none());
+        assert!(b.ptr_info_mut().is_none());
 
         // Const has no _forwarded slot -> readers return None (no panic).
         assert!(Operand::const_(Const::Int(0)).ptr_info().is_none());
@@ -1661,6 +1758,28 @@ mod tests {
     }
 
     #[test]
+    fn wide_value_int_float_ref_match_stored_payload() {
+        let i = Operand::const_from_value(Value::Int(i64::MAX - 3));
+        assert!(i.is_small_wide());
+        assert_eq!(i.const_value(), Some(Value::Int(i64::MAX - 3)));
+        assert_eq!(
+            wide_value(small_wide_index(i.packed)),
+            Value::Int(i64::MAX - 3)
+        );
+
+        let f = Operand::const_from_value(Value::Float(-0.0));
+        assert_eq!(f.const_value(), Some(Value::Float(-0.0)));
+        assert_eq!(wide_value(small_wide_index(f.packed)), Value::Float(-0.0));
+
+        let r = Operand::const_from_value(Value::Ref(GcRef(0x2000)));
+        assert_eq!(r.const_value(), Some(Value::Ref(GcRef(0x2000))));
+        assert_eq!(
+            wide_value(small_wide_index(r.packed)),
+            Value::Ref(GcRef(0x2000))
+        );
+    }
+
+    #[test]
     fn set_forwarded_const_wide_keeps_token_identity() {
         let host = Operand::from_bound_op(&op_at(0, Type::Ref));
         host.set_forwarded_const(Const::from_gcref(GcRef(0x1000)));
@@ -1698,5 +1817,17 @@ mod tests {
         assert_eq!(tv.to_opref(), OpRef::TempVar(0xFFFF_0003));
         assert!(tv.is_same_box(&tv.clone()));
         assert!(matches!(tv.get_forwarded(), Forwarded::None));
+    }
+
+    #[test]
+    fn inputarg_index_loads_recorder_slot() {
+        let ia = InputArgRc::new(InputArg::from_type(Type::Int, 7));
+        let o = Operand::from_bound_inputarg(&ia);
+        assert_eq!(o.inputarg_index(), Some(7));
+        assert_eq!(o.to_opref().raw(), 7);
+        assert_eq!(Operand::const_(Const::Int(1)).inputarg_index(), None);
+        assert_eq!(Operand::none().inputarg_index(), None);
+        let op = op_at(3, Type::Int);
+        assert_eq!(Operand::from_bound_op(&op).inputarg_index(), None);
     }
 }

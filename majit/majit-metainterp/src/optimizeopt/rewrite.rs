@@ -694,10 +694,14 @@ impl OptRewrite {
         // info: ConstPtrInfo.get_known_class(cpu) (info.py) reads
         // the typeptr at offset 0 via cls_of_box and compares against
         // expectedclassbox. Mismatch → proven-fail guard → InvalidLoop.
-        let obj_info_for_class = ctx.getptrinfo(&op.arg_ref(0).get_box_replacement(false));
-        if let Some(known_class) = obj_info_for_class
-            .as_ref()
-            .and_then(|i| i.get_known_class(ctx.cpu.as_ref()))
+        let (known_class, is_virtual_struct) =
+            ctx.with_ptrinfo(&op.arg_ref(0).get_box_replacement(false), |info| {
+                (
+                    info.and_then(|i| i.get_known_class(ctx.cpu.as_ref())),
+                    matches!(info, Some(PtrInfo::VirtualStruct(_))),
+                )
+            });
+        if let Some(known_class) = known_class
             && op.num_args() >= 2
         {
             // RPython GuardClass / GuardNonnullClass class operands are
@@ -731,7 +735,7 @@ impl OptRewrite {
         // (`rewrite_op_malloc` fill-from-published-group) and stays on
         // `PtrInfo::Virtual`, whose `get_known_class` filters 0.
         if op.num_args() >= 2
-            && matches!(obj_info_for_class.as_ref(), Some(PtrInfo::VirtualStruct(_)))
+            && is_virtual_struct
             && ctx.get_constant_int_box(&op.arg(1)) == Some(0)
         {
             return OptimizationResult::Remove;
@@ -1532,13 +1536,17 @@ impl OptRewrite {
                 //         elif opinfo.is_null(): raise InvalidLoop(...)
                 //     return self.emit(op)
                 let obj_box = op.arg_ref(0).get_box_replacement(false);
-                if let Some(info) = ctx.getptrinfo(&obj_box) {
-                    if info.is_nonnull() {
-                        return OptimizationResult::Remove;
-                    }
-                    if info.is_null() {
-                        return raise_invalid_loop("GUARD_NONNULL proven to always fail", op, ctx);
-                    }
+                let (is_nonnull, is_null) = ctx.with_ptrinfo(&obj_box, |info| {
+                    (
+                        info.is_some_and(|i| i.is_nonnull()),
+                        info.is_some_and(|i| i.is_null()),
+                    )
+                });
+                if is_nonnull {
+                    return OptimizationResult::Remove;
+                }
+                if is_null {
+                    return raise_invalid_loop("GUARD_NONNULL proven to always fail", op, ctx);
                 }
                 // rewrite.py postprocess_GUARD_NONNULL:
                 // make_nonnull runs immediately; mark_last_guard deferred
@@ -1559,13 +1567,19 @@ impl OptRewrite {
                 //         elif info.is_nonnull(): raise InvalidLoop(...)
                 //     return self.emit(op)
                 let obj_box = ctx.resolve_operand_operand_opt(op.arg_ref(0));
-                if let Some(info) = obj_box.as_ref().and_then(|b| ctx.getptrinfo(b)) {
-                    if info.is_null() {
-                        return OptimizationResult::Remove;
-                    }
-                    if info.is_nonnull() {
-                        return raise_invalid_loop("GUARD_ISNULL proven to always fail", op, ctx);
-                    }
+                let (is_null, is_nonnull) = obj_box.as_ref().map_or((false, false), |b| {
+                    ctx.with_ptrinfo(b, |info| {
+                        (
+                            info.is_some_and(|i| i.is_null()),
+                            info.is_some_and(|i| i.is_nonnull()),
+                        )
+                    })
+                });
+                if is_null {
+                    return OptimizationResult::Remove;
+                }
+                if is_nonnull {
+                    return raise_invalid_loop("GUARD_ISNULL proven to always fail", op, ctx);
                 }
                 // rewrite.py `postprocess_GUARD_ISNULL` runs its
                 // `make_constant(op.getarg(0), CONST_NULL)` in
@@ -1584,9 +1598,9 @@ impl OptRewrite {
                 //     if info and info.is_null():
                 //         raise InvalidLoop(...)
                 //     return self.optimize_GUARD_CLASS(op)
-                if let Some(info) = ctx.getptrinfo(&op.arg_ref(0).get_box_replacement(false))
-                    && info.is_null()
-                {
+                if ctx.with_ptrinfo(&op.arg_ref(0).get_box_replacement(false), |info| {
+                    info.is_some_and(|i| i.is_null())
+                }) {
                     return raise_invalid_loop(
                         "GUARD_NONNULL_CLASS proven to always fail",
                         op,
@@ -2032,10 +2046,9 @@ impl OptRewrite {
                         // getptrinfo synthesizes ConstPtrInfo for constant
                         // Refs so `get_known_class` reads cls_of_box for them.
                         let obj_box = op.arg_ref(0).get_box_replacement(false);
-                        if let Some(known) = ctx
-                            .getptrinfo(&obj_box)
-                            .and_then(|i| i.get_known_class(ctx.cpu.as_ref()))
-                        {
+                        if let Some(known) = ctx.with_ptrinfo(&obj_box, |info| {
+                            info.and_then(|i| i.get_known_class(ctx.cpu.as_ref()))
+                        }) {
                             debug_assert_eq!(known, expected_class);
                             return OptimizationResult::Remove;
                         }

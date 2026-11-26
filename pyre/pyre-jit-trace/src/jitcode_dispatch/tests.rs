@@ -653,12 +653,12 @@ fn reconstruct_ctor_tail_recipe(
         }
     }
     let resume_data = majit_metainterp::ResumeDataResult {
-        frames: Vec::new(),
-        virtualizable_boxes: Vec::new(),
-        virtualref_values: Vec::new(),
+        frames: Vec::new().into(),
+        virtualizable_boxes: Vec::new().into(),
+        virtualref_values: Vec::new().into(),
         storage: None,
         num_failargs: 0,
-        fail_arg_types: Vec::new(),
+        fail_arg_types: Vec::new().into(),
     };
     let mut cache = majit_metainterp::BridgeVirtualCache::new(0, crate::descr::make_array_descr);
     crate::state::reconstruct_inline_recipe(

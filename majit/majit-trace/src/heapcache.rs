@@ -170,6 +170,23 @@ fn constant_from_op(opref: OpRef, boxes: &dyn HeapcBoxes) -> OpRef {
     }
 }
 
+/// heapcache.py `maybe_replace_with_const(box)`.
+fn maybe_replace_with_const(opref: OpRef, boxes: &dyn HeapcBoxes) -> OpRef {
+    if opref.is_constant() {
+        return opref;
+    }
+    if boxes
+        .heapc(opref)
+        .is_some_and(|rec| rec.replaced_with_const)
+    {
+        let replaced = constant_from_op(opref, boxes);
+        if replaced.ty() == opref.ty() {
+            return replaced;
+        }
+    }
+    opref
+}
+
 /// heapcache.py CacheEntry — per-descr cache of fieldbox values.
 ///
 /// `cache_anything` / `cache_seen_allocation` store the cached
@@ -211,15 +228,20 @@ impl CacheEntry {
         }
     }
 
-    /// heapcache.py _seen_alloc
+    /// heapcache.py `CacheEntry._seen_alloc`.
     ///
-    /// Pyre adapt: needs an explicit `cache: &HeapCache` parameter
-    /// because `CacheEntry` is a separate struct from `HeapCache`
-    /// (RPython attaches the heapcache reference to CacheEntry at
-    /// __init__ time; in Rust we pass it through to avoid a back-
-    /// reference + interior mutability dance).
-    pub fn _seen_alloc(&self, ref_box: OpRef, cache: &HeapCache, boxes: &dyn HeapcBoxes) -> bool {
-        cache.saw_allocation(ref_box, boxes)
+    /// A `Const` is not a `RefFrontendOp`, so this is false. Otherwise
+    /// `HeapCache._check_flag(ref_box, HF_SEEN_ALLOCATION)`, which reads
+    /// `head_version` and the box's `_heapc_flags`. Passing `head_version`
+    /// lets the entry stay in `heap_cache` (`CacheEntry.heapcache` is the
+    /// matching back-reference).
+    pub fn _seen_alloc(&self, ref_box: OpRef, head_version: u32, boxes: &dyn HeapcBoxes) -> bool {
+        if ref_box.is_constant() {
+            return false;
+        }
+        let flags = boxes.heapc(ref_box).map(|rec| rec.flags).unwrap_or(0);
+        HeapCache::versioned_or(flags, head_version)
+            && (flags & u32::from(HeapFlags::SEEN_ALLOCATION.bits())) != 0
     }
 
     /// heapcache.py _getdict
@@ -246,12 +268,12 @@ impl CacheEntry {
         &mut self,
         ref_box: OpRef,
         fieldbox: OpRef,
-        cache: &HeapCache,
+        head_version: u32,
         boxes: &dyn HeapcBoxes,
         oracle: &dyn SameConstantOracle,
     ) {
         let ref_box = self._unique_const_heuristic(ref_box, oracle);
-        let seen_alloc = self._seen_alloc(ref_box, cache, boxes);
+        let seen_alloc = self._seen_alloc(ref_box, head_version, boxes);
         self._clear_cache_on_write(seen_alloc);
         self._getdict_mut(seen_alloc).insert(ref_box, fieldbox);
     }
@@ -284,15 +306,15 @@ impl CacheEntry {
     pub fn read(
         &mut self,
         ref_box: OpRef,
-        cache: &HeapCache,
+        head_version: u32,
         boxes: &dyn HeapcBoxes,
         oracle: &dyn SameConstantOracle,
     ) -> Option<OpRef> {
         let ref_box = self._unique_const_heuristic(ref_box, oracle);
-        let seen_alloc = self._seen_alloc(ref_box, cache, boxes);
+        let seen_alloc = self._seen_alloc(ref_box, head_version, boxes);
         self._getdict(seen_alloc)
             .get(&ref_box)
-            .map(|fieldbox| cache.maybe_replace_with_const(*fieldbox, boxes))
+            .map(|fieldbox| maybe_replace_with_const(*fieldbox, boxes))
     }
 
     /// heapcache.py read_now_known
@@ -300,12 +322,12 @@ impl CacheEntry {
         &mut self,
         ref_box: OpRef,
         fieldbox: OpRef,
-        cache: &HeapCache,
+        head_version: u32,
         boxes: &dyn HeapcBoxes,
         oracle: &dyn SameConstantOracle,
     ) {
         let ref_box = self._unique_const_heuristic(ref_box, oracle);
-        let seen_alloc = self._seen_alloc(ref_box, cache, boxes);
+        let seen_alloc = self._seen_alloc(ref_box, head_version, boxes);
         self._getdict_mut(seen_alloc).insert(ref_box, fieldbox);
     }
 
@@ -404,9 +426,9 @@ impl<'a> FieldUpdater<'a> {
             Some(pair) => pair,
             None => return,
         };
-        let mut entry = cache.heap_cache.remove(&descr_index).unwrap_or_default();
-        entry.read_now_known(ref_box, fieldbox, cache, boxes, oracle);
-        cache.heap_cache.insert(descr_index, entry);
+        let head_version = cache.head_version;
+        let entry = cache.heap_cache.entry(descr_index).or_default();
+        entry.read_now_known(ref_box, fieldbox, head_version, boxes, oracle);
     }
 
     /// heapcache.py setfield
@@ -421,9 +443,9 @@ impl<'a> FieldUpdater<'a> {
             Some(pair) => pair,
             None => return,
         };
-        let mut entry = cache.heap_cache.remove(&descr_index).unwrap_or_default();
-        entry.do_write_with_aliasing(ref_box, fieldbox, cache, boxes, oracle);
-        cache.heap_cache.insert(descr_index, entry);
+        let head_version = cache.head_version;
+        let entry = cache.heap_cache.entry(descr_index).or_default();
+        entry.do_write_with_aliasing(ref_box, fieldbox, head_version, boxes, oracle);
     }
 
     fn cache_and_descr(&mut self) -> Option<(&mut HeapCache, &mut (dyn HeapcBoxes + 'a), u32)> {
@@ -508,19 +530,7 @@ impl HeapCache {
 
     /// heapcache.py `maybe_replace_with_const(box)`.
     pub(crate) fn maybe_replace_with_const(&self, opref: OpRef, boxes: &dyn HeapcBoxes) -> OpRef {
-        if opref.is_constant() {
-            return opref;
-        }
-        if boxes
-            .heapc(opref)
-            .is_some_and(|rec| rec.replaced_with_const)
-        {
-            let replaced = constant_from_op(opref, boxes);
-            if replaced.ty() == opref.ty() {
-                return replaced;
-            }
-        }
-        opref
+        maybe_replace_with_const(opref, boxes)
     }
 
     fn flags_for_ref(&self, opref: OpRef, boxes: &dyn HeapcBoxes) -> u32 {
@@ -810,10 +820,9 @@ impl HeapCache {
     ///
     /// `CacheEntry.read` (heapcache.py) handles the
     /// `_unique_const_heuristic` ConstPtr canonicalisation and the
-    /// `maybe_replace_with_const` forwarding internally.  We take the
-    /// entry out of `heap_cache` for the duration of the call so the
-    /// borrow checker accepts `&mut entry` and `&self.heap_cache`'s
-    /// neighbour fields simultaneously, then put it back.
+    /// `maybe_replace_with_const` forwarding internally. The entry
+    /// stays in `heap_cache` (`CacheEntry.heapcache` back-reference);
+    /// `head_version` is the flag word `_seen_alloc` needs.
     pub fn getfield_cached(
         &mut self,
         obj: OpRef,
@@ -824,10 +833,9 @@ impl HeapCache {
         if declines_unnumbered_field(field_index) {
             return None;
         }
-        let mut entry = self.heap_cache.remove(&field_index)?;
-        let result = entry.read(obj, self, boxes, oracle);
-        self.heap_cache.insert(field_index, entry);
-        result
+        let head_version = self.head_version;
+        let entry = self.heap_cache.get_mut(&field_index)?;
+        entry.read(obj, head_version, boxes, oracle)
     }
 
     /// heapcache.py `setfield(self, box, fieldbox, descr)`.
@@ -857,9 +865,9 @@ impl HeapCache {
         if declines_unnumbered_field(field_index) {
             return;
         }
-        let mut entry = self.heap_cache.remove(&field_index).unwrap_or_default();
-        entry.do_write_with_aliasing(obj, value, self, boxes, oracle);
-        self.heap_cache.insert(field_index, entry);
+        let head_version = self.head_version;
+        let entry = self.heap_cache.entry(field_index).or_default();
+        entry.do_write_with_aliasing(obj, value, head_version, boxes, oracle);
     }
 
     /// heapcache.py `getfield_now_known(self, box, descr,
@@ -885,9 +893,9 @@ impl HeapCache {
         if declines_unnumbered_field(field_index) {
             return;
         }
-        let mut entry = self.heap_cache.remove(&field_index).unwrap_or_default();
-        entry.read_now_known(obj, value, self, boxes, oracle);
-        self.heap_cache.insert(field_index, entry);
+        let head_version = self.head_version;
+        let entry = self.heap_cache.entry(field_index).or_default();
+        entry.read_now_known(obj, value, head_version, boxes, oracle);
     }
 
     /// heapcache.py: invalidate_unescaped — clear cached values for
@@ -1780,15 +1788,9 @@ impl HeapCache {
         oracle: &dyn SameConstantOracle,
         boxes: &'a mut dyn HeapcBoxes,
     ) -> FieldUpdater<'a> {
-        let fieldbox = if let Some(mut entry) = self.heap_cache.remove(&descr_index) {
-            let result = entry.read(obj, self, boxes, oracle);
-            self.heap_cache.insert(descr_index, entry);
-            result
-        } else {
-            // heapcache.py `cache = self.heap_cache[descr] = CacheEntry(self)`.
-            self.heap_cache.insert(descr_index, CacheEntry::new());
-            None
-        };
+        let head_version = self.head_version;
+        let entry = self.heap_cache.entry(descr_index).or_default();
+        let fieldbox = entry.read(obj, head_version, boxes, oracle);
         FieldUpdater::with_cache(obj, self, boxes, descr_index, fieldbox)
     }
 
@@ -2733,6 +2735,34 @@ mod tests {
             cache.getfield_cached(obj, field, IDENTITY_ORACLE),
             Some(val)
         );
+    }
+
+    /// `setfield_cached` then `getfield_cached` on the same
+    /// `(obj, field_index)` returns the stored box. Repeated writes to
+    /// that field keep a single `CacheEntry` in `heap_cache`
+    /// (`heapcache.py` `get_field_updater` insert-once).
+    #[test]
+    fn setfield_cached_keeps_one_entry_across_repeated_writes() {
+        let mut fx = Fixture::new();
+        let mut cache = fx.view();
+        let obj = OpRef::ref_op(0);
+        let field = 3;
+        let first = OpRef::ref_op(10);
+        cache.setfield_cached(obj, field, first, IDENTITY_ORACLE);
+        assert_eq!(
+            cache.getfield_cached(obj, field, IDENTITY_ORACLE),
+            Some(first)
+        );
+        assert_eq!(cache.heap_cache.len(), 1);
+        for i in 0..10 {
+            let value = OpRef::ref_op(20 + i);
+            cache.setfield_cached(obj, field, value, IDENTITY_ORACLE);
+            assert_eq!(
+                cache.getfield_cached(obj, field, IDENTITY_ORACLE),
+                Some(value)
+            );
+            assert_eq!(cache.heap_cache.len(), 1);
+        }
     }
 
     #[test]
