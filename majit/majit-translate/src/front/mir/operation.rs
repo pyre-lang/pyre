@@ -7316,6 +7316,100 @@ impl<'a> Lowering<'a> {
         Some((recorded, inner, field_payload, place_ty))
     }
 
+    /// Parent class root of a field-0 inlined parent read of a GC class
+    /// instance.
+    ///
+    /// `lltype.py` `Struct._first_struct` is the by-value first field of
+    /// the same gckind. `rclass.py` `InstanceRepr.upcast` /
+    /// `pairtype(InstanceRepr, InstanceRepr).convert_from_to` is
+    /// `cast_pointer` of the instance pointer onto that parent; the child
+    /// address is the parent address. A FieldRead/getattr of the prefix
+    /// would walk `allinstancefields` and load an ancestor slot of the
+    /// same name. Enums, closures, integer newtypes, Raw owners, and
+    /// local (non-deref) aggregates are not that parent. A nested
+    /// field-0 parent (`(*p).base.base`) is still that address: the
+    /// container is a Deref, or is itself this parent read.
+    fn gc_instance_first_struct_parent_root(
+        &self,
+        field_ty: &TyRef,
+        place_ty: &TyRef,
+        host_index: Option<(u32, u32)>,
+        container_is_enum: bool,
+        owner_is_closure_env: bool,
+        owner_id: Option<&majit_ir::descr::StructId>,
+        owner_root: &str,
+        container: &Place,
+    ) -> Option<String> {
+        if container_is_enum || owner_is_closure_env {
+            return None;
+        }
+        if !(container.is_deref_projection()
+            || self
+                .gc_instance_first_struct_parent_root_of_place(container)
+                .is_some())
+        {
+            return None;
+        }
+        if host_index != Some((0, 0)) {
+            return None;
+        }
+        let owner_gc = match owner_id {
+            Some(id) => struct_id_is_declared_gc(self.gc_struct_ids, *id, owner_root),
+            None => spelling_path_is_declared_gc(self.gc_struct_ids, owner_root),
+        };
+        if !owner_gc {
+            return None;
+        }
+        let parent_td = tyref_by_value_struct_decl(
+            field_ty,
+            self.llbc,
+            self.tombstoned_leaves,
+            self.gc_struct_ids,
+            &self.raw_alloc_flavor_structs,
+        )
+        .or_else(|| {
+            tyref_by_value_struct_decl(
+                place_ty,
+                self.llbc,
+                self.tombstoned_leaves,
+                self.gc_struct_ids,
+                &self.raw_alloc_flavor_structs,
+            )
+        })?;
+        if type_decl_is_by_value_integer_newtype(parent_td, self.llbc) {
+            return None;
+        }
+        let parent_root = tyref_class_root_with(place_ty, self.llbc, self.tombstoned_leaves)
+            .or_else(|| tyref_class_root_with(field_ty, self.llbc, self.tombstoned_leaves))?;
+        let parent_id = struct_id_for_type_decl(parent_td);
+        if !struct_id_is_declared_gc(self.gc_struct_ids, parent_id, &parent_root) {
+            return None;
+        }
+        Some(parent_root)
+    }
+
+    /// [`Self::gc_instance_first_struct_parent_root`] of a Field place.
+    fn gc_instance_first_struct_parent_root_of_place(&self, place: &Place) -> Option<String> {
+        let PlaceKind::Projection(inner, elem) = &place.kind else {
+            return None;
+        };
+        let payload = elem.field_payload()?;
+        let (owner_root, _, field_ty, owner_id, host_index) =
+            self.resolve_adt_field(&inner.ty, payload)?;
+        let field_ty = tyref_subst_bound_typevar(&field_ty, &inner.ty, self.llbc);
+        let place_ty = tyref_subst_bound_typevar(&place.ty, &inner.ty, self.llbc);
+        self.gc_instance_first_struct_parent_root(
+            &field_ty,
+            &place_ty,
+            host_index,
+            tyref_is_enum_free(&inner.ty, self.llbc),
+            tyref_is_closure_env(&inner.ty, self.llbc),
+            owner_id.as_ref(),
+            &owner_root,
+            inner,
+        )
+    }
+
     /// Ordinary Adt `Field` getattr after the base Variable is known
     /// (`PtrRepr.rtype_getattr` / `InstanceRepr.rtype_getattr`). Field-only
     /// interior uses this with the owner Variable as base
@@ -7509,6 +7603,16 @@ impl<'a> Lowering<'a> {
         // a `&self` deref leaves it `None`, so it cannot stand
         // in for this test.
         let base_is_deref = inner.is_deref_projection();
+        let first_struct_parent_root = self.gc_instance_first_struct_parent_root(
+            &field_ty,
+            &place_ty,
+            host_index,
+            container_is_enum,
+            owner_is_closure_env,
+            owner_id.as_ref(),
+            &owner_root,
+            inner,
+        );
         let field_vt = tyref_to_value_type_with(
             &place_ty,
             self.llbc,
@@ -7578,6 +7682,16 @@ impl<'a> Lowering<'a> {
         } else {
             base
         };
+        if let Some(parent_root) = first_struct_parent_root {
+            let res = self
+                .graph
+                .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                result: Some(res.clone()),
+                kind: crate::model::cast_instance_call(parent_root, base),
+            });
+            return Ok(res);
+        }
         let base = if enum_payload_class {
             let narrowed = self
                 .graph

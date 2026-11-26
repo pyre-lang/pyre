@@ -24256,6 +24256,114 @@ fn null_mut_of_typed_items_block_is_gcarray_nullptr() {
     );
 }
 
+/// `std::ptr::null_mut::<ItemsBlock>()` of the object-item GcArray recasts
+/// onto that block (`push_niche_null`). Residual `ptr_null_constant` is a
+/// classdef-less Instance because the ItemsBlock root is not a class;
+/// dest recast is `SomeList` so a NULL return unions with the live items
+/// arm (`annmodel.SomeList.noneify`, `rlist.py`
+/// `AbstractBaseListRepr.convert_const(None)`). A scalar `TypedItemsBlock`
+/// stays `cast_int_to_ptr` above.
+#[test]
+fn null_mut_of_items_block_recasts_list_root() {
+    use crate::model::{CallTarget, OpKind, ValueType};
+    let usize_ty = interior_usize();
+    let pyobj = interior_struct(
+        1,
+        &["pyobject", "PyObject"],
+        &[("type_ptr", usize_ty.clone())],
+        8,
+        &[0],
+        false,
+    );
+    let items = interior_array_zero(interior_raw_mut(interior_adt(1)));
+    let block = interior_struct(
+        0,
+        &["object_array", "ItemsBlock"],
+        &[("capacity", usize_ty), ("items", items)],
+        8,
+        &[0, 8],
+        false,
+    );
+    let ptr = interior_raw_mut(interior_adt(0));
+    let caller = interior_caller(
+        "null_items_block_ptr",
+        0,
+        vec![],
+        ptr.clone(),
+        vec![interior_local(0, None, &ptr)],
+        vec![
+            interior_bb(
+                vec![],
+                interior_call(1, vec![], interior_place(0, &ptr), 2, 1),
+            ),
+            interior_bb(vec![], interior_unwind()),
+            interior_bb(vec![], interior_return()),
+        ],
+    );
+    let null_mut = interior_opaque(1, &["std", "ptr", "null_mut"], vec![], ptr);
+    let llbc = llbc_with_types("fixture", vec![block, pyobj], vec![caller, null_mut]);
+    let graph = lower_interior(&llbc, "null_items_block_ptr");
+    let ops: Vec<_> = graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .collect();
+    let null = ops
+        .iter()
+        .find(|op| {
+            matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } if segments.as_slice() == ["core", "ptr", "null_mut"]
+                    || segments.as_slice() == ["std", "ptr", "null_mut"]
+            )
+        })
+        .unwrap_or_else(|| panic!("expected dest-list null_mut; ops={ops:?}"));
+    let null_var = null.result.as_ref().expect("null_mut produces a result");
+    match &null.kind {
+        OpKind::Call { args, .. } => {
+            assert!(
+                args.is_empty(),
+                "ItemsBlock null_mut stays unspelled so dest recast can project SomeList, got {args:?}"
+            );
+        }
+        other => panic!("expected null_mut call, got {other:?}"),
+    }
+    let recast = ops
+        .iter()
+        .find(|op| crate::model::cast_instance_of(&op.kind, null_var).is_some())
+        .unwrap_or_else(|| {
+            panic!("dest-list null_mut must recast onto the ItemsBlock pointee; ops={ops:?}")
+        });
+    let root = crate::model::cast_instance_root(&recast.kind).expect("recast names a root");
+    assert!(
+        majit_ir::descr::is_object_gcarray_items_block(root),
+        "recast root must be object ItemsBlock, got {root}"
+    );
+    match &recast.kind {
+        OpKind::Call { result_ty, .. } => {
+            assert_eq!(
+                result_ty,
+                &ValueType::Ref(Some(root.to_string())),
+                "ItemsBlock recast is dest-list Ref, got {result_ty:?}"
+            );
+        }
+        other => panic!("expected recast call, got {other:?}"),
+    }
+    assert!(
+        ops.iter().all(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } => segments.last().map(String::as_str) != Some("cast_int_to_ptr"),
+            _ => true,
+        }),
+        "object ItemsBlock must not take the TypedItemsBlock GcArray nullptr; ops={ops:?}"
+    );
+}
+
 #[test]
 fn niche_option_raw_nominal_ptr_without_layout_is_null_test() {
     use crate::model::OpKind;

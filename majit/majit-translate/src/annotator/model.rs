@@ -3725,7 +3725,10 @@ pub fn union(s1: &SomeValue, s2: &SomeValue) -> Result<SomeValue, UnionError> {
                 return Err(UnionError {
                     lhs: Box::new(s1.clone()),
                     rhs: Box::new(s2.clone()),
-                    msg: "RPython cannot unify distinct low-level pointer types".into(),
+                    msg: format!(
+                        "RPython cannot unify distinct low-level pointer types: {:?} and {:?}",
+                        a.ll_ptrtype, b.ll_ptrtype
+                    ),
                 });
             }
             Ok(SomeValue::Ptr(SomePtr::new(a.ll_ptrtype.clone())))
