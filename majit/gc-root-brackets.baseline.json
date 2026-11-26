@@ -1,7 +1,7 @@
 {
   "darwin": {
     "base": "6eb4ea66fb6a30f7405d5d32f2dad1f3792f44c7",
-    "brackets_reaching_no_collection": 150,
+    "brackets_reaching_no_collection": 153,
     "frame_tier1_calls": 0,
     "frame_tier1_calls_fns": 0,
     "frames_across_collecting": 0,
@@ -29,7 +29,7 @@
   },
   "linux": {
     "base": "d427378a92329fad3fd9ac620bd8d2a17b28797d",
-    "brackets_reaching_no_collection": 148,
+    "brackets_reaching_no_collection": 151,
     "frame_tier1_calls": 0,
     "frame_tier1_calls_fns": 0,
     "frames_across_collecting": 0,
