@@ -848,7 +848,7 @@ fn harvested_refcell_stub_token_and_field_layout_agree_with_ordinary() {
         layout.contains("RefCell"),
         "field layout of a layout-present RefCell is the cell class, got {layout}"
     );
-    let stub_token = stubs.iter().find_map(|(segments, _, tok, _, _)| {
+    let stub_token = stubs.iter().find_map(|(segments, _, tok, _, _, _, _)| {
         segments
             .last()
             .is_some_and(|leaf| leaf == "cell_result")

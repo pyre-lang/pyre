@@ -857,7 +857,7 @@ fn fn_const_incoming(bookkeeper: Option<&Rc<Bookkeeper>>, kind: &OpKind) -> Opti
         return None;
     }
     let path = crate::model::fn_const_resolved_path(target)?;
-    let host = fn_const_registered_host(bk, &path.segments)?;
+    let host = fn_const_registered_host(bk, &path)?;
     match bk.immutablevalue(&ConstValue::HostObject(host)) {
         Ok(sv @ SomeValue::PBC(_)) => Some(Incoming::Annotation(Rc::new(sv))),
         _ => None,
@@ -876,7 +876,7 @@ fn fn_const_name_matches(name: &str, segments: &[String]) -> bool {
     name == dotted || name == colon
 }
 
-fn fn_const_registered_host(bk: &Bookkeeper, segments: &[String]) -> Option<HostObject> {
+fn fn_const_registered_host(bk: &Bookkeeper, path: &crate::parse::CallPath) -> Option<HostObject> {
     let mut found: Option<HostObject> = None;
     for entry in bk.descs.borrow().values() {
         let Some(fd) = entry.as_function() else {
@@ -889,10 +889,30 @@ fn fn_const_registered_host(bk: &Bookkeeper, segments: &[String]) -> Option<Host
         let Some(gf) = host.user_function() else {
             continue;
         };
-        if !fn_const_name_matches(&gf.name, segments)
-            && !fn_const_name_matches(&fd.name, segments)
-            && !fn_const_name_matches(host.qualname(), segments)
-        {
+        // Descriptors registered through CallRegistry carry FunDecl
+        // identity (`FunctionDesc.funcobj_keys` / `Bookkeeper.getdesc`
+        // of the function object). Select by that identity.
+        // `FunctionDesc::new` fixtures and pure host-name stubs have
+        // an empty key list: they never saw a FunDecl, so match the
+        // GraphFunc / FunctionDesc / HostObject name the way a
+        // 1-segment harvest did on main.
+        let matches = if fd.funcobj_keys.is_empty() {
+            fn_const_name_matches(&gf.name, &path.segments)
+                || fn_const_name_matches(&fd.name, &path.segments)
+                || fn_const_name_matches(host.qualname(), &path.segments)
+        } else {
+            // Same crate-strip as `CallRegistry::lookup`: normalise
+            // both the query and each recorded key so a crate-prefixed
+            // identity matches a stripped `funcobj_keys` row (and the
+            // reverse) through one function.
+            let query = crate::local_crates::call_registry_funcobj_spellings(&path.segments);
+            fd.funcobj_keys.iter().any(|k| {
+                crate::local_crates::call_registry_funcobj_spellings(k)
+                    .iter()
+                    .any(|stored| query.iter().any(|q| q == stored))
+            })
+        };
+        if !matches {
             continue;
         }
         match &found {
@@ -3933,6 +3953,68 @@ mod tests {
             other => panic!("expected noneified SomePBC join, got {other:?}"),
         }
         assert_eq!(read_binding(&mixed), ValueType::Int);
+    }
+
+    /// Residual-only nested FunDecl `c::parent#2::f`: the descriptor's
+    /// GraphFunc name is the short leaf `f`, the constant names the
+    /// FunDecl identity. Select by `FunctionDesc.funcobj_keys`
+    /// (`bookkeeper.py Bookkeeper.getdesc`), not by scanning short names.
+    #[test]
+    fn fn_const_residual_nested_identity_annotates_somepbc() {
+        use crate::flowspace::argument::Signature;
+        use crate::flowspace::model::GraphFunc;
+        use crate::translator::rtyper::call_registry::{CallRegistry, FunctionPathKey};
+
+        let bk = Rc::new(Bookkeeper::new());
+        let registry = CallRegistry::new(Rc::clone(&bk));
+        let identity_path = crate::parse::CallPath::from_segments(["c", "parent#2", "f"]);
+        let identity = FunctionPathKey::from(&identity_path);
+        let harvest = FunctionPathKey::from_segments(["parent", "f"]);
+        let gf = GraphFunc::new(
+            "f",
+            crate::flowspace::model::Constant::new(ConstValue::Dict(Default::default())),
+        );
+        registry.get_or_register_with_func(
+            identity,
+            Signature::new(vec!["x".into()], None, None),
+            gf,
+        );
+        registry.alias(harvest, &FunctionPathKey::from(&identity_path));
+
+        let mut incoming_graph = FunctionGraph::new("fn_const_residual_nested");
+        let entry = incoming_graph.startblock;
+        let fn_var = incoming_graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: vec![
+                            crate::model::FN_CONST_HEAD.to_string(),
+                            "parent".to_string(),
+                            "f".to_string(),
+                        ],
+                        resolved_path: Some(identity_path),
+                        fun_decl_id: None,
+                        specialization: crate::parse::GraphSpecialization::Regular,
+                    },
+                    args: crate::model::call_args(vec![]),
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        incoming_graph.set_return(entry, Some(fn_var.clone()));
+        annotate_with_bookkeeper(&incoming_graph, Some(&bk));
+        match read_binding_some(&fn_var).as_deref() {
+            Some(SomeValue::PBC(pbc)) => {
+                assert!(
+                    !pbc.can_be_none,
+                    "residual fn_const dest is SomePBC, got {pbc:?}"
+                );
+                assert_eq!(pbc.descriptions.len(), 1);
+            }
+            other => panic!("residual nested fn_const dest expected SomePBC, got {other:?}"),
+        }
     }
 
     fn builtin_code_fn_spelling() -> &'static str {

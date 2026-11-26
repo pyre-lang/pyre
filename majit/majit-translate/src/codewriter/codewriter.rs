@@ -290,6 +290,7 @@ impl CodeWriter {
                 &callcontrol.unsafe_fn_stubs,
                 &callcontrol.foreign_opaque_method_externals,
                 &callcontrol.atomic_load_decls,
+                &callcontrol.fun_decl_identity_aliases,
                 &registry,
             );
         if let Err(err) = populate_result {

@@ -121,6 +121,26 @@ impl FunctionPathKey {
         }
     }
 
+    /// CallRegistry key of a FunDecl identity. AccessDirect is
+    /// `description.py FunctionDesc.cachedgraph` on the Regular origin
+    /// FunctionDesc, not a second funcobj. Populate never mints an
+    /// AccessDirect canonical entry; copies created after populate
+    /// (`ensure_access_directly_copy`) live in GraphStore only.
+    /// Corpus: GraphStore copies are registered (`own_hit=356
+    /// own_miss=0`); CallRegistry AccessDirect-spec keys of those
+    /// identities are not. Derive the origin from specialization
+    /// before lookup. An AccessDirect alias of the origin, when one
+    /// exists, names the same FunctionDesc.
+    pub fn for_call_registry(path: &CallPath) -> Self {
+        FunctionPathKey {
+            segments: path.segments.clone().into(),
+            specialization: match path.specialization {
+                GraphSpecialization::AccessDirect => GraphSpecialization::Regular,
+                other => other,
+            },
+        }
+    }
+
     pub fn with_segments<I, S>(&self, segments: I) -> Self
     where
         I: IntoIterator<Item = S>,
@@ -1108,8 +1128,11 @@ impl CallRegistry {
     /// `materialize_residual_inst`, does not invoke `getdesc`, and
     /// does not fall back to leaf-match.
     pub fn lookup_existing(&self, key: &FunctionPathKey) -> Option<Rc<FunctionEntry>> {
-        if let Some(entry) = self.lookup_registered(key) {
-            return Some(entry);
+        for spelling in crate::local_crates::call_registry_funcobj_spellings(key.segments()) {
+            let spelling_key = key.with_segments(spelling);
+            if let Some(entry) = self.lookup_registered(&spelling_key) {
+                return Some(entry);
+            }
         }
         // `populate_call_registry_from_call_graphs` dedupes by
         // `canonical_dedup_key`, stripping a leading `crate` / local /
@@ -1532,6 +1555,10 @@ impl CallRegistry {
                  callable cannot legally project to two distinct signatures.",
                 key.segments(),
             );
+            existing
+                .function_desc
+                .borrow_mut()
+                .record_funcobj_key(key.segments());
             return existing.clone();
         }
         // `annlowlevel.specialize` / `getfunctionptr` name residual
@@ -1550,6 +1577,10 @@ impl CallRegistry {
                  project to two distinct signatures.",
                 key.segments(),
             );
+            existing
+                .function_desc
+                .borrow_mut()
+                .record_funcobj_key(key.segments());
             return existing;
         }
         // `bookkeeper.py Bookkeeper.getdesc`: a GraphStore funcobj already
@@ -1570,6 +1601,10 @@ impl CallRegistry {
                  project to two distinct signatures.",
                 key.segments(),
             );
+            entry
+                .function_desc
+                .borrow_mut()
+                .record_funcobj_key(key.segments());
             return entry;
         }
         let name = key.name().to_string();
@@ -1609,6 +1644,10 @@ impl CallRegistry {
                 Some(graph_func.id),
                 "source callable metadata must be installed before registration"
             );
+            existing
+                .function_desc
+                .borrow_mut()
+                .record_funcobj_key(key.segments());
             return existing;
         }
         let host_object = HostObject::new_user_function(graph_func);
@@ -1640,6 +1679,9 @@ impl CallRegistry {
             .descs
             .borrow_mut()
             .insert(host_object.clone(), desc);
+        function_desc
+            .borrow_mut()
+            .record_funcobj_key(key.segments());
         let entry = Rc::new(FunctionEntry {
             host_object,
             function_desc,
@@ -1721,6 +1763,12 @@ impl CallRegistry {
                 alias_key.segments(),
             );
             return;
+        }
+        if let Some(entry) = self.entries.borrow().get(canonical_key) {
+            entry
+                .function_desc
+                .borrow_mut()
+                .record_funcobj_key(alias_key.segments());
         }
         self.aliases
             .borrow_mut()
@@ -2899,6 +2947,22 @@ mod tests {
         registry.alias(earlier.clone(), &canonical);
         let keys = registry.keys_for_entry(&canonical);
         assert_eq!(keys, vec![canonical, earlier, alias]);
+    }
+
+    #[test]
+    fn for_call_registry_derives_regular_origin_from_access_direct() {
+        let origin = CallPath::from_segments(["Owner", "method"]);
+        let ad = crate::codewriter::call::access_directly_path(&origin);
+        let key = FunctionPathKey::for_call_registry(&ad);
+        assert_eq!(key, FunctionPathKey::from(&origin));
+        assert_eq!(key.specialization, GraphSpecialization::Regular);
+        let registry = CallRegistry::new(Rc::new(Bookkeeper::new()));
+        let origin_entry =
+            registry.get_or_register(FunctionPathKey::from(&origin), signature(&["self"]));
+        let resolved = registry
+            .lookup(&key)
+            .expect("Regular origin must be the CallRegistry key");
+        assert_eq!(resolved.host_object, origin_entry.host_object);
     }
 
     /// A `cachedgraph` AccessDirect key names a specialized graph on the desc

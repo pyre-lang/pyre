@@ -2489,15 +2489,34 @@ fn run_erase_walk(cx: &mut EraseWalk<'_>) -> Result<(), Refusal> {
                         cx.reach(bb, ERASE_SINGLE_EDGE, depth, lo, rel, open)?;
                         continue;
                     }
-                    // Observes at Known(0) reads the caller's slots.
-                    // Inside our Open the callee reads our pins, which
-                    // become slot locals (`eval_slice_index` / `getindex_w`).
                     if call_is_anchor_identity(call, llbc) {
                         cx.reach(bb, ERASE_SINGLE_EDGE, depth, lo, rel, open)?;
                         continue;
                     }
                     let effect =
                         resolved_callee_effect(call, llbc, &|id| callee_effect_of(llbc, id));
+                    // Observes at Known(0): every live slot is still the
+                    // caller's physical root (`stack_walk` sets
+                    // `reads_below` when `callee.observes &&
+                    // !depth.above_entry()`). Refuse, matching
+                    // `ShadowStackFrameworkGCTransformer.push_roots`
+                    // publishing those livevars before a call that can
+                    // see them.
+                    //
+                    // Inside our Open (`depth > 0`) Observes is accepted.
+                    // The callee's own body is refused at *its* entry
+                    // (`calls-stack-sensitive-fn`), so it keeps physical
+                    // Gets of its own pins / params. This body's
+                    // Index/Guard specials cannot be an argument of a
+                    // surviving Observes call (`unmodeled-use-in-terminator`
+                    // / `unmodeled-use-in-statement` / `returns-slot-index`);
+                    // ParamSlots already `refuses_erase()`. Residual and
+                    // inlined Observes callees therefore take the pin
+                    // *values* (`pin_root` dest; `eval_slice_index` /
+                    // `getindex_w`) or a nested owned RootScope they still
+                    // hold (`SimpleBufferBytes::recopy_live_storage`).
+                    // Slot locals stay rooted by the jitframe gcmap /
+                    // blackhole `registers_r`.
                     if effect.observes && depth == 0 {
                         if crate::decline::enabled() {
                             eprintln!(

@@ -1638,6 +1638,11 @@ pub struct SemanticProgram {
     /// Feeds `CallControl.unsafe_fn_stubs` →
     /// `cutover::register_unsafe_fn_stubs`.
     pub unsafe_fn_stubs: Vec<crate::translator::rtyper::cutover::ResidualStubSpec>,
+    /// FunDecl identity plus display spellings of the same callable.
+    /// `populate_call_registry_from_call_graphs` aliases each identity
+    /// onto a host-name / harvest entry already registered for *this*
+    /// FunDecl (`Bookkeeper.getdesc`).
+    pub fun_decl_identity_aliases: Vec<crate::translator::rtyper::cutover::FunDeclIdentityAlias>,
     /// `(path-segments, Signature, result ValueType)` for every method on
     /// a foreign **opaque** ADT owner (`malachite_bigint::bigint::BigInt`,
     /// …) whose result is faithfully modelable, harvested from the LLBC by

@@ -1258,8 +1258,11 @@ pub(in crate::front::mir) fn collect_fn_stubs_from_llbc_if(
         {
             continue;
         }
-        // Both free functions and impl-owned functions are collected.
-        // `name_path()` is the `CallKind::Fun(Regular)` spelling.  When
+        // FunDecl identity is the CallRegistry / GraphStore key
+        // (`bookkeeper.py Bookkeeper.getdesc`). Display spellings
+        // (`name_path()`, harvest `spec_segments`, Type-split owner)
+        // are aliases of that same entry. `name_path()` is the
+        // `CallKind::Fun(Regular)` spelling.  When
         // `Lowering::impl_method_owner` declines `CallTarget::Method`
         // (raw-storage ADT, associated fn, field-name collision),
         // `unspecialized_fun_segments` emits the Type-split
@@ -1269,20 +1272,28 @@ pub(in crate::front::mir) fn collect_fn_stubs_from_llbc_if(
         // `name_path` (`…::<Impl>::settrace`) misses that callsite.
         // `ExecutionContext.settrace` is `@jit.dont_look_inside`; emit both
         // so the FunctionPath the declined-Method arm emits resolves.
+        let identity = registered_path_for_fun_decl(llbc, fd);
+        let harvest = harvest_path_for_fun_decl(llbc, fd);
         let name_path: Vec<String> = fd
             .item_meta
             .name_path_str()
             .split("::")
             .map(String::from)
             .collect();
-        let mut keys = vec![name_path];
+        let mut keys = Vec::new();
+        let mut push_key = |segs: Vec<String>| {
+            if keys.iter().all(|k| k != &segs) {
+                keys.push(segs);
+            }
+        };
+        push_key(identity.segments.clone());
+        push_key(harvest.segments.clone());
+        push_key(name_path);
         if let Some((owner_qualified, leaf)) = impl_method_owner_for_fundecl(llbc, fd) {
             let mut type_split: Vec<String> =
                 owner_qualified.split("::").map(String::from).collect();
             type_split.push(leaf);
-            if keys.iter().all(|k| k != &type_split) {
-                keys.push(type_split);
-            }
+            push_key(type_split);
         }
         // Prefer the Charon body's declared parameter names
         // (`locals[1..=argc]`, the same source the regular lowering reads
@@ -1298,6 +1309,15 @@ pub(in crate::front::mir) fn collect_fn_stubs_from_llbc_if(
                     .unwrap_or_else(|| format!("arg{i}"))
             })
             .collect();
+        // `rffi.py` `llexternal` `ext_type.ARGS` / `extfunc.py`
+        // `register_external` `args`: declared FuncType args are the
+        // FunDecl input lltypes, not a fabricated Signed-n vector.
+        let arg_lltypes: Vec<crate::translator::rtyper::lltypesystem::lltype::LowLevelType> = fd
+            .signature
+            .inputs
+            .iter()
+            .map(|ty| tyref_to_external_lltype(ty, llbc, struct_fields))
+            .collect();
         for segments in keys {
             out.push((
                 segments,
@@ -1305,8 +1325,66 @@ pub(in crate::front::mir) fn collect_fn_stubs_from_llbc_if(
                 token.clone(),
                 result_lltype.clone(),
                 class_root.clone(),
+                Some(identity.clone()),
+                Some(arg_lltypes.clone()),
             ));
         }
+    }
+    out
+}
+
+/// Identity plus display spellings of every local FunDecl.
+///
+/// Host-name tables register harvest / `name_path()` / Type-split
+/// keys without the FunDecl identity. Call sites stamp
+/// [`registered_path_for_fun_decl`]. After those tables land, alias
+/// each identity onto the display entry of *this* FunDecl
+/// (`Bookkeeper.getdesc`).
+pub(crate) fn collect_fun_decl_identity_aliases(
+    llbc: &Llbc,
+) -> Vec<crate::translator::rtyper::cutover::FunDeclIdentityAlias> {
+    let mut out = Vec::new();
+    for fd in llbc.iter_local_fns() {
+        if fd.is_global_initializer().is_some() {
+            continue;
+        }
+        let identity = registered_path_for_fun_decl(llbc, fd);
+        let harvest = harvest_path_for_fun_decl(llbc, fd);
+        let name_path: Vec<String> = fd
+            .item_meta
+            .name_path_str()
+            .split("::")
+            .map(String::from)
+            .collect();
+        let mut displays = Vec::new();
+        let mut push = |segs: Vec<String>| {
+            if segs.is_empty() || segs == identity.segments {
+                return;
+            }
+            if displays.iter().all(|existing| existing != &segs) {
+                displays.push(segs);
+            }
+        };
+        push(harvest.segments.clone());
+        push(name_path);
+        // Type-split `[owner, leaf]` (`impl_method_owner_for_fundecl`) is
+        // the CallTarget::Method key. Inherent and trait impls of the
+        // same leaf share it (`Vec::into_iter` vs `IntoIterator::into_iter`),
+        // and `lib.rs` may bind it to a different GraphKey than this
+        // FunDecl identity. Collecting it as a display of *this* identity
+        // makes an unambiguous spelling that is already a different
+        // FunctionDesc — `Bookkeeper.getdesc` would panic on the corpus.
+        // Stub collect still emits the Type-split key with this identity
+        // (`collect_fn_stubs_from_llbc_if`); GraphStore method
+        // registration keeps its own share_path.
+        // Crate-stripped identity-with-Ident is not a registered
+        // display. `free_function_alias_paths` registers harvest
+        // (`SemanticFunction.name`) and crate-*prefixed* harvest;
+        // FOREIGN keys are harvest without Ident.
+        // `identity.segments[1..]` would be `mutex::Mutex::<impl…>::lock`,
+        // which no producer registers.
+        let result_ty = tyref_to_value_type(&fd.signature.output, llbc);
+        out.push((identity, displays, Some(result_ty)));
     }
     out
 }

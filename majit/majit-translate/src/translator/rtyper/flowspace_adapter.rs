@@ -5827,8 +5827,8 @@ fn legacy_const_define_hlvalue(
                     segments
                 ))
             })?;
-            let key = crate::translator::rtyper::call_registry::FunctionPathKey::from_segments(
-                resolved.segments.clone(),
+            let key = crate::translator::rtyper::call_registry::FunctionPathKey::for_call_registry(
+                &resolved,
             );
             let entry = call_registry.lookup(&key).ok_or_else(|| {
                 TyperError::message(format!(
@@ -13610,6 +13610,91 @@ mod tests {
         );
     }
 
+    /// Residual-only nested FunDecl: `register_unsafe_fn_stubs` registers
+    /// the identity and aliases the harvest display onto the same
+    /// FunctionDesc (`Bookkeeper.getdesc`). A `__fn_const` that names the
+    /// identity must resolve (`FunctionsPBCRepr.convert_const`).
+    #[test]
+    fn legacy_const_define_hlvalue_resolves_residual_nested_identity() {
+        use crate::flowspace::argument::Signature;
+        use crate::model::CallTarget;
+        use crate::translator::rtyper::call_registry::FunctionPathKey;
+        use crate::translator::rtyper::cutover::register_unsafe_fn_stubs;
+
+        let registry = empty_call_registry();
+        let identity = crate::parse::CallPath::from_segments(["c", "parent#2", "f"]);
+        let harvest = vec!["parent".to_string(), "f".to_string()];
+        let sig = Signature::new(vec!["x".to_string()], None, None);
+        let specs = vec![
+            (
+                identity.segments.clone(),
+                sig.clone(),
+                Some("i64".to_string()),
+                None,
+                None,
+                Some(identity.clone()),
+                Some(vec![LowLevelType::Signed]),
+            ),
+            (
+                harvest,
+                sig,
+                Some("i64".to_string()),
+                None,
+                None,
+                Some(identity.clone()),
+                Some(vec![LowLevelType::Signed]),
+            ),
+        ];
+        register_unsafe_fn_stubs(&registry, &specs, None);
+        let ident_key = FunctionPathKey::from(&identity);
+        let harvest_key = FunctionPathKey::from_segments(["parent", "f"]);
+        let ident_entry = registry
+            .lookup(&ident_key)
+            .expect("identity must be registered");
+        let harvest_entry = registry
+            .lookup(&harvest_key)
+            .expect("harvest display is an alias of the same funcobj");
+        assert!(
+            Rc::ptr_eq(&ident_entry, &harvest_entry),
+            "harvest must alias the identity entry, not mint a second funcobj"
+        );
+
+        let op = SpaceOperation {
+            result: Some(Variable::new()),
+            kind: OpKind::Call {
+                target: CallTarget::FunctionPath {
+                    segments: vec![
+                        crate::model::FN_CONST_HEAD.to_string(),
+                        "parent".to_string(),
+                        "f".to_string(),
+                    ],
+                    resolved_path: Some(identity),
+                    fun_decl_id: None,
+                    specialization: crate::parse::GraphSpecialization::Regular,
+                },
+                args: Vec::new(),
+                result_ty: ValueType::Int,
+            },
+        };
+        match legacy_const_define_hlvalue(&op, Some(&registry))
+            .expect("residual nested fn_const must resolve")
+        {
+            Some(Hlvalue::Constant(c)) => {
+                let ConstValue::HostObject(ref host) = c.value else {
+                    panic!(
+                        "fn const folds to CallRegistry host_object, got {:?}",
+                        c.value
+                    );
+                };
+                assert_eq!(
+                    host, &ident_entry.host_object,
+                    "__fn_const HostObject is the identity-registered pyobj"
+                );
+            }
+            other => panic!("expected Constant(HostObject), got {other:?}"),
+        }
+    }
+
     #[test]
     fn translate_op_call_type_lowers_to_type_spaceop() {
         let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
@@ -15415,7 +15500,7 @@ mod tests {
             let mut graphs = GraphStore::default();
             graphs.insert(CallPath::from_segments(segments.clone()), body);
             let registry = std::rc::Rc::new(empty_call_registry());
-            populate_call_registry_from_call_graphs(&graphs, &[], &[], &[], &registry)
+            populate_call_registry_from_call_graphs(&graphs, &[], &[], &[], &[], &registry)
                 .expect("register ordinary helper body");
             let entry = registry
                 .lookup(&FunctionPathKey::from_segments(segments))
@@ -15495,7 +15580,7 @@ mod tests {
         let mut graphs = GraphStore::default();
         graphs.insert(CallPath::from_segments(segments.clone()), body);
         let registry = std::rc::Rc::new(empty_call_registry());
-        populate_call_registry_from_call_graphs(&graphs, &[], &[], &[], &registry)
+        populate_call_registry_from_call_graphs(&graphs, &[], &[], &[], &[], &registry)
             .expect("populate");
         assert!(
             registry

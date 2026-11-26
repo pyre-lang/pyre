@@ -4013,65 +4013,17 @@ impl StoreCore {
         self.key_for(path).is_some()
     }
 
-    /// Whether `path` is a stored spelling of a built graph. A
-    /// crate-prefixed lookup that is not stored still resolves through
-    /// [`Self::key_for`] / [`Self::get`]; graph identity for BFS
-    /// (`callable_graph_path`) is the stored spelling
-    /// (`call.py graphs_from`).
-    pub(crate) fn contains_key(&self, path: &CallPath) -> bool {
+    /// Whether `path` names a graphless external funcobj
+    /// (`LazyGraph::external` / `rffi.llexternal`). The header is not a
+    /// body; `register_unsafe_fn_stubs` owns its FunctionDesc.
+    pub(crate) fn is_external_funcobj(&self, path: &CallPath) -> bool {
         self.register_declared();
-        if !self.path_to_key.borrow().contains_key(path) {
+        let Some(slot) = self.slot_for(path) else {
             return false;
-        }
-        self.get(path).is_some()
-    }
-
-    /// `funcobj.graph` for a direct-call target (`call.py graphs_from`).
-    fn registered_direct_callee(&self, target: &CallTarget) -> Option<CallPath> {
-        let path = match target {
-            CallTarget::FunctionPath { .. } => {
-                if crate::model::fn_const_segments(target).is_some() {
-                    return None;
-                }
-                target.function_call_path()?
-            }
-            CallTarget::Method {
-                name,
-                receiver_root,
-                resolved_path,
-                ..
-            } => {
-                if let Some(path) = resolved_path {
-                    path.clone()
-                } else if let Some(receiver) = receiver_root.as_deref() {
-                    let qualified = CallPath::for_impl_method(receiver, name.as_str());
-                    if !self.contains_key(&qualified) {
-                        return None;
-                    }
-                    qualified
-                } else {
-                    return None;
-                }
-            }
-            _ => return None,
         };
-        if self.contains_key(&path) {
-            return Some(path);
-        }
-        if let Some(stripped_segs) = crate::local_crates::strip_alias_crate_prefix(&path.segments) {
-            let stripped = path.with_segments(stripped_segs.iter().cloned());
-            if self.contains_key(&stripped) {
-                return Some(stripped);
-            }
-        }
-        None
-    }
-
-    /// Every registered alias spelling (one entry per `CallPath`, not per
-    /// shared graph) — matches the old `HashMap<CallPath, _>::keys()`.
-    #[cfg(test)]
-    pub(crate) fn keys(&self) -> Vec<CallPath> {
-        self.iter().into_iter().map(|(path, _)| path).collect()
+        slot.source
+            .as_ref()
+            .is_some_and(|source| source.graph.is_external())
     }
 
     /// FunctionPath calls whose stamped `resolved_path` is not a graph
@@ -4133,6 +4085,67 @@ impl StoreCore {
         });
         rows.dedup();
         rows
+    }
+
+    /// Whether `path` is a stored spelling of a built graph. A
+    /// crate-prefixed lookup that is not stored still resolves through
+    /// [`Self::key_for`] / [`Self::get`]; graph identity for BFS
+    /// (`callable_graph_path`) is the stored spelling
+    /// (`call.py graphs_from`).
+    pub(crate) fn contains_key(&self, path: &CallPath) -> bool {
+        self.register_declared();
+        if !self.path_to_key.borrow().contains_key(path) {
+            return false;
+        }
+        self.get(path).is_some()
+    }
+
+    /// `funcobj.graph` for a direct-call target (`call.py graphs_from`).
+    fn registered_direct_callee(&self, target: &CallTarget) -> Option<CallPath> {
+        let path = match target {
+            CallTarget::FunctionPath { .. } => {
+                if crate::model::fn_const_segments(target).is_some() {
+                    return None;
+                }
+                target.function_call_path()?
+            }
+            CallTarget::Method {
+                name,
+                receiver_root,
+                resolved_path,
+                ..
+            } => {
+                if let Some(path) = resolved_path {
+                    path.clone()
+                } else if let Some(receiver) = receiver_root.as_deref() {
+                    let qualified = CallPath::for_impl_method(receiver, name.as_str());
+                    if !self.contains_key(&qualified) {
+                        return None;
+                    }
+                    qualified
+                } else {
+                    return None;
+                }
+            }
+            _ => return None,
+        };
+        if self.contains_key(&path) {
+            return Some(path);
+        }
+        if let Some(stripped_segs) = crate::local_crates::strip_alias_crate_prefix(&path.segments) {
+            let stripped = path.with_segments(stripped_segs.iter().cloned());
+            if self.contains_key(&stripped) {
+                return Some(stripped);
+            }
+        }
+        None
+    }
+
+    /// Every registered alias spelling (one entry per `CallPath`, not per
+    /// shared graph) — matches the old `HashMap<CallPath, _>::keys()`.
+    #[cfg(test)]
+    pub(crate) fn keys(&self) -> Vec<CallPath> {
+        self.iter().into_iter().map(|(path, _)| path).collect()
     }
 
     /// `(alias path, shared graph)` for every registered spelling, each
@@ -5592,6 +5605,9 @@ pub struct CallControl {
     /// declarations Charon emits with no body at all; it does not stand in
     /// for a body some gate refused.
     pub unsafe_fn_stubs: Vec<crate::translator::rtyper::cutover::ResidualStubSpec>,
+    /// FunDecl identity plus display spellings. Consumed by
+    /// `cutover::alias_fun_decl_identities_onto_registered_display`.
+    pub fun_decl_identity_aliases: Vec<crate::translator::rtyper::cutover::FunDeclIdentityAlias>,
     /// `(path-segments, Signature, result ValueType)` for every method on
     /// a foreign **opaque** ADT owner (`malachite_bigint::bigint::BigInt`,
     /// …).  `impl_method_owner` declines the `CallTarget::Method` hint for
@@ -6274,6 +6290,7 @@ impl CallControl {
             field0_parents: HashSet::new(),
             immutable_array_types: HashSet::new(),
             unsafe_fn_stubs: Vec::new(),
+            fun_decl_identity_aliases: Vec::new(),
             foreign_opaque_method_externals: Vec::new(),
             atomic_load_decls: Vec::new(),
             bookkeeper: std::cell::RefCell::new(None),
@@ -6289,6 +6306,61 @@ impl CallControl {
         let mut cc = Self::new();
         cc.struct_layouts = handle;
         cc
+    }
+
+    /// Residual FunDecls collected as signature-only stubs. Bind each
+    /// FunDecl identity onto its own harvest spelling when harvest is
+    /// free (`rffi.llexternal` graphless header). A harvest occupant is
+    /// another funcobj (`Bookkeeper.getdesc`); do not bind this identity
+    /// onto it, and do not occupy a later Type-split Method key. Collect
+    /// emits identity then harvest first; the first non-identity spelling
+    /// of this FunDecl is `harvest_path_for_fun_decl`. When harvest is
+    /// occupied, identity still names this residual as its own header.
+    pub(crate) fn publish_residual_fun_decl_identities(&mut self) {
+        let n = self.unsafe_fn_stubs.len();
+        let mut seen = HashSet::new();
+        for i in 0..n {
+            let Some(identity) = self.unsafe_fn_stubs[i].5.clone() else {
+                continue;
+            };
+            if !seen.insert(identity.clone()) {
+                continue;
+            }
+            let harvest = self.unsafe_fn_stubs[i..]
+                .iter()
+                .filter(|spec| spec.5.as_ref() == Some(&identity))
+                .map(|spec| CallPath::from_segments(spec.0.iter().cloned()))
+                .find(|path| path != &identity)
+                .unwrap_or_else(|| identity.clone());
+            self.publish_one_residual_fun_decl_identity(identity, harvest);
+        }
+    }
+
+    fn publish_one_residual_fun_decl_identity(&mut self, identity: CallPath, harvest: CallPath) {
+        let graphs = self.function_graphs_mut();
+        if graphs.names_funcobj(&identity) {
+            return;
+        }
+        let header_path = if identity != harvest && !graphs.names_funcobj(&harvest) {
+            harvest
+        } else {
+            // Free harvest is this residual's `llexternal` spelling.
+            // Occupied harvest is another funcobj; identity is still
+            // this FunDecl (`Bookkeeper.getdesc`). Not a Type-split
+            // Method key.
+            identity.clone()
+        };
+        let leaf = header_path.last_segment().unwrap_or("").to_string();
+        let mut header = FunctionGraph::new(leaf);
+        header.func.jit_look_inside = Some(false);
+        header.push_hint("dont_look_inside");
+        header.funcobj_identity = Some(identity.display_name());
+        let lazy = crate::model::LazyGraph::external(header);
+        graphs.insert_lazy(header_path.clone(), lazy, GraphTransform::default(), None);
+        if identity != header_path {
+            graphs.share_path(identity, &header_path);
+        }
+        graphs.mark_canonical_path(&header_path);
     }
 
     /// Copy `canraise` from `ll_math::llexternal` onto each raw `math_*`
@@ -19497,6 +19569,104 @@ mod tests {
         );
     }
 
+    /// Residual-only nested FunDecl: producer-time GraphStore publish
+    /// (`publish_residual_fun_decl_identities`) aliases the identity onto
+    /// a free harvest spelling. A host fnaddr bound under harvest is the
+    /// canonical address of that funcobj (`getfunctionptr`).
+    #[test]
+    fn fnaddr_binding_for_residual_nested_identity_uses_harvest_display() {
+        let identity = CallPath::from_segments(["c", "parent#2", "f"]);
+        let harvest = CallPath::from_segments(["parent", "f"]);
+        let mut cc = CallControl::new();
+        cc.unsafe_fn_stubs = vec![(
+            harvest.segments.clone(),
+            Signature::new(vec!["x".to_string()], None, None),
+            Some("i64".to_string()),
+            None,
+            None,
+            Some(identity.clone()),
+            None,
+        )];
+        cc.publish_residual_fun_decl_identities();
+        let addr = 0x1234_0000i64;
+        cc.register_function_fnaddr(harvest.clone(), addr);
+        let target = CallTarget::FunctionPath {
+            segments: vec![
+                crate::model::FN_CONST_HEAD.to_string(),
+                "parent".to_string(),
+                "f".to_string(),
+            ],
+            resolved_path: Some(identity.clone()),
+            fun_decl_id: None,
+            specialization: crate::parse::GraphSpecialization::Regular,
+        };
+        let binding = cc.fnaddr_binding_for_target(&target);
+        assert!(
+            !binding.symbolic,
+            "identity must reach the harvest fnaddr through GraphStore aliasing, got {binding:?}"
+        );
+        assert_eq!(binding.addr, addr);
+        assert_eq!(
+            cc.function_graphs().canonical_path(&identity).segments,
+            harvest.segments
+        );
+    }
+
+    /// Harvest occupied, Type-split still free: residual identity must
+    /// not first-writer occupy the Method key.
+    #[test]
+    fn publish_residual_uses_harvest_not_type_split() {
+        let identity = CallPath::from_segments(["c", "parent#2", "into_iter"]);
+        let harvest = CallPath::from_segments(["parent", "into_iter"]);
+        let type_split = CallPath::from_segments(["Vec", "into_iter"]);
+        let mut cc = CallControl::new();
+        cc.register_function_graph(harvest.clone(), FunctionGraph::new("into_iter"));
+        let sig = Signature::new(vec!["self".to_string()], None, None);
+        cc.unsafe_fn_stubs = vec![
+            (
+                identity.segments.clone(),
+                sig.clone(),
+                Some("i64".to_string()),
+                None,
+                None,
+                Some(identity.clone()),
+                None,
+            ),
+            (
+                harvest.segments.clone(),
+                sig.clone(),
+                Some("i64".to_string()),
+                None,
+                None,
+                Some(identity.clone()),
+                None,
+            ),
+            (
+                type_split.segments.clone(),
+                sig,
+                Some("i64".to_string()),
+                None,
+                None,
+                Some(identity.clone()),
+                None,
+            ),
+        ];
+        cc.publish_residual_fun_decl_identities();
+        assert!(
+            cc.function_graphs().names_funcobj(&identity),
+            "occupied harvest: identity still names this residual"
+        );
+        assert_eq!(
+            cc.function_graphs().canonical_path(&identity).segments,
+            identity.segments,
+            "occupied harvest must not alias identity onto the occupant"
+        );
+        assert!(
+            !cc.function_graphs().names_funcobj(&type_split),
+            "must not occupy the Type-split Method key"
+        );
+    }
+
     /// Charon's `{module}::<Impl>::{leaf}` token is a spelling of the
     /// trait-impl funcobj registered at `trait_impl_identity_path`
     /// (`bookkeeper.py Bookkeeper.getdesc`). Production share must bind
@@ -19918,6 +20088,26 @@ mod tests {
             store.key_for(&second),
             "both spellings share one GraphKey"
         );
+    }
+
+    #[test]
+    fn insert_lazy_external_is_an_external_funcobj() {
+        let harvest = CallPath::from_segments(["rffi", "__rffi_fp_c_memcpy"]);
+        let identity = CallPath::from_segments(["majit_rlib", "rffi", "__rffi_fp_c_memcpy"]);
+        let mut header = FunctionGraph::new("__rffi_fp_c_memcpy");
+        header.func.jit_look_inside = Some(false);
+        header.funcobj_identity = Some(identity.display_name());
+        let mut store = GraphStore::new();
+        store.insert_lazy(
+            harvest.clone(),
+            crate::model::LazyGraph::external(header),
+            GraphTransform::default(),
+            None,
+        );
+        store.share_path(identity.clone(), &harvest);
+        assert!(store.is_external_funcobj(&harvest));
+        assert!(store.is_external_funcobj(&identity));
+        assert!(!store.is_external_funcobj(&CallPath::from_segments(["rffi", "c_memcpy"])));
     }
 
     /// Pre-annotator `inherit_split_portal_access_directly` has no origin

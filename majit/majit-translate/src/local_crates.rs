@@ -97,6 +97,21 @@ pub(crate) fn strip_alias_crate_prefix(segments: &[String]) -> Option<Vec<String
     strip_alias_crate_prefix_with(segments, &[])
 }
 
+/// Spellings [`crate::translator::rtyper::call_registry::CallRegistry::lookup`]
+/// accepts for `segments`: the verbatim path and, when a crate / local
+/// root prefixes it, the stripped path. `FunctionDesc::record_funcobj_key`
+/// and `fn_const_registered_host` share this set so a crate-prefixed
+/// identity that hits lookup also matches a stripped `funcobj_keys` row.
+pub(crate) fn call_registry_funcobj_spellings(segments: &[String]) -> Vec<Vec<String>> {
+    let mut out = vec![segments.to_vec()];
+    if let Some(stripped) = strip_alias_crate_prefix(segments)
+        && stripped != segments
+    {
+        out.push(stripped);
+    }
+    out
+}
+
 /// Strip a leading `crate` / local crate, or a harvested foreign callable's
 /// crate root from `callables`. `None` when the path must keep its spelling.
 pub(crate) fn strip_alias_crate_prefix_with(

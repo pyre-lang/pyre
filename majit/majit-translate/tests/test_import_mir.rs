@@ -417,6 +417,8 @@ fn pycode_code_ptr_is_raw_int_kind() {
         Some("i64".into()),
         None,
         None,
+        None,
+        None,
     ));
     for func in &program.functions {
         let path = if func.module_path.is_empty() {
