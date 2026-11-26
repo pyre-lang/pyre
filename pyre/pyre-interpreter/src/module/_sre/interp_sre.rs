@@ -1931,15 +1931,13 @@ impl Drop for HeldBufferExport {
 /// filter never uses the builder (`use_builder == '\x00'`): each non-None
 /// piece is appended to `sublist_w` and the result is the subject's
 /// empty-string `join`. A mismatched-type / non-builder literal goes
-/// through the same join path. A replaced compiler that still returns a
-/// list is decoded into [`TemplateItem`]s.
+/// through the same join path.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SubxFilter {
     Callable,
     Builder,
     JoinLiteral,
     JoinTemplate,
-    ExpandItems,
 }
 
 /// `W_SRE_Pattern.subx` non-callable arm: unicode / bytes / `space.buffer_w`.
@@ -2012,30 +2010,24 @@ fn subx_append_obj(sublist: RootedObject, w_obj: RootedObject) {
 }
 
 /// Non-literal arm: `compile_template`, then `pattern_subx`'s size-0 → LITERAL
-/// of `TemplateObject.literal`, else TEMPLATE, else a replaced compiler's list.
+/// of `TemplateObject.literal`, else TEMPLATE.
 fn subx_compiled_kind(
     pat: PyObjectRef,
     w_source: PyObjectRef,
-    items: &mut Vec<TemplateItem>,
     filter_slot: &mut usize,
     template_slot: &mut usize,
 ) -> Result<SubxFilter, crate::PyError> {
     let w_compiled = compile_template_object(pat, w_source)?;
     let compiled_slot = pyre_object::gc_roots::pin_roots(&[w_compiled]);
     let w_compiled = || pyre_object::gc_roots::shadow_stack_get(compiled_slot);
-    if unsafe { is_sre_template(w_compiled()) } {
-        let indexes = unsafe { (*(w_compiled() as *const W_SRE_Template)).indexes };
-        if unsafe { pyre_object::w_tuple_len(indexes) } == 0 {
-            let lit = unsafe { (*(w_compiled() as *const W_SRE_Template)).literal };
-            *filter_slot = pyre_object::gc_roots::pin_roots(&[lit]);
-            Ok(SubxFilter::JoinLiteral)
-        } else {
-            *template_slot = compiled_slot;
-            Ok(SubxFilter::JoinTemplate)
-        }
+    let indexes = unsafe { (*(w_compiled() as *const W_SRE_Template)).indexes };
+    if unsafe { pyre_object::w_tuple_len(indexes) } == 0 {
+        let lit = unsafe { (*(w_compiled() as *const W_SRE_Template)).literal };
+        *filter_slot = pyre_object::gc_roots::pin_roots(&[lit]);
+        Ok(SubxFilter::JoinLiteral)
     } else {
-        *items = template_items_from_compiled(w_compiled())?;
-        Ok(SubxFilter::ExpandItems)
+        *template_slot = compiled_slot;
+        Ok(SubxFilter::JoinTemplate)
     }
 }
 
@@ -2082,7 +2074,6 @@ fn subx(args: &[PyObjectRef]) -> Result<(PyObjectRef, i64), crate::PyError> {
     // A non-literal is handed to `re._compile_template` (`compile_template`).
     let filter_is_callable = crate::baseobjspace::callable_w(w_repl());
     let mut filter_bytes: Vec<u8> = Vec::new();
-    let mut items: Vec<TemplateItem> = Vec::new();
     let mut filter_slot = base;
     let mut template_slot = base;
     let kind = if filter_is_callable {
@@ -2111,7 +2102,6 @@ fn subx(args: &[PyObjectRef]) -> Result<(PyObjectRef, i64), crate::PyError> {
             subx_compiled_kind(
                 pyre_object::gc_roots::shadow_stack_get(pat_slot),
                 w_source,
-                &mut items,
                 &mut filter_slot,
                 &mut template_slot,
             )?
@@ -2120,7 +2110,6 @@ fn subx(args: &[PyObjectRef]) -> Result<(PyObjectRef, i64), crate::PyError> {
         subx_compiled_kind(
             pyre_object::gc_roots::shadow_stack_get(pat_slot),
             w_repl(),
-            &mut items,
             &mut filter_slot,
             &mut template_slot,
         )?
@@ -2186,23 +2175,6 @@ fn subx(args: &[PyObjectRef]) -> Result<(PyObjectRef, i64), crate::PyError> {
                     out.extend_from_slice(gap);
                 }
                 out.extend_from_slice(&filter_bytes);
-            }
-            SubxFilter::ExpandItems => {
-                if let Some(gap) = subject_span_bytes(subject_now(), (last, mstart)) {
-                    out.extend_from_slice(gap);
-                }
-                let _match_roots = pyre_object::gc_roots::push_roots();
-                let m = RootedObject::pin(crate::runtime_ops::obj_or_memory_error(
-                    make_match_from_snapshot(
-                        pyre_object::gc_roots::shadow_stack_get(pat_slot),
-                        string(),
-                        w_buffer(),
-                        snap,
-                        0,
-                        endpos as i64,
-                    ),
-                )?);
-                expand_into(&mut out, &items, m, &subject_now);
             }
             SubxFilter::Callable => {
                 if let Some(sublist) = sublist {
@@ -2445,52 +2417,6 @@ enum TemplateItem {
     Group(usize),
 }
 
-/// Convert `re._parser.parse_template`'s flat result list — a sequence of
-/// literal `str`/`bytes` runs interleaved with integer group references — into
-/// the [`TemplateItem`] stream `expand_into` consumes.
-fn template_items_from_list(w_result: PyObjectRef) -> Result<Vec<TemplateItem>, crate::PyError> {
-    // `parse_template` is reached by name through `re._parser`, so what comes
-    // back is whatever the program left there. `w_list_len` reads the list
-    // header without checking, which a tuple answers with a wild length.
-    // `_sre.template`'s own argument check is where this is refused upstream,
-    // and its wording is what a program that reaches here sees.
-    if !unsafe { pyre_object::is_list(w_result) } {
-        return Err(crate::PyError::type_error(format!(
-            "template() argument 2 must be list, not {}",
-            crate::type_methods::clinic_arg_type_name(w_result)
-        )));
-    }
-    let n = unsafe { pyre_object::w_list_len(w_result) };
-    let mut items: Vec<TemplateItem> = Vec::with_capacity(n);
-    let _roots = pyre_object::gc_roots::push_roots();
-    let result_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(w_result);
-    for i in 0..n {
-        let Some(elem) = (unsafe {
-            pyre_object::w_list_getitem(
-                pyre_object::gc_roots::shadow_stack_get(result_slot),
-                i as i64,
-            )
-        }) else {
-            continue;
-        };
-        if unsafe { is_int(elem) } {
-            items.push(TemplateItem::Group(
-                unsafe { pyre_object::w_int_get_value(elem) } as usize,
-            ));
-        } else if unsafe { is_str(elem) } {
-            items.push(TemplateItem::Literal(
-                unsafe { w_str_get_wtf8(elem) }.as_bytes().to_vec(),
-            ));
-        } else if unsafe { pyre_object::bytesobject::is_bytes_like(elem) } {
-            items.push(TemplateItem::Literal(
-                unsafe { pyre_object::bytesobject::bytes_like_data(elem) }.to_vec(),
-            ));
-        }
-    }
-    Ok(items)
-}
-
 /// `PyLong_AsSsize_t`: an int (including a subclass and a bool) or a long
 /// that fits in `ssize_t`. Anything else is `TypeError`, and a value that
 /// does not fit is `OverflowError`.
@@ -2615,6 +2541,13 @@ fn sre_template(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 pub struct AppReCache {
     space: crate::baseobjspace::SpaceHandle,
     w_re: crate::baseobjspace::SpaceAttr,
+    // [3.15-spec] v3.15.0 Modules/_sre/sre.c `compile_template` reads
+    // `re._compile_template` once into `module_state->compile_template` and
+    // raises RuntimeError for a result whose type is not `Template_Type`
+    // ↔ PyPy interp_sre.py `W_SRE_Pattern.subx` calls
+    // `space.call_method(w_re, '_subx', ...)` on every call, calls a callable
+    // result, and appends anything else.
+    w_compile_template: crate::baseobjspace::SpaceAttr,
 }
 
 impl AppReCache {
@@ -2622,6 +2555,7 @@ impl AppReCache {
         Self {
             space,
             w_re: crate::baseobjspace::SpaceAttr::new(),
+            w_compile_template: crate::baseobjspace::SpaceAttr::new(),
         }
     }
 
@@ -2651,13 +2585,32 @@ impl AppReCache {
         Ok(shadow_stack_get(re_slot))
     }
 
+    /// `sre.c compile_template` looks up `re._compile_template`, cached in `module_state->compile_template`.
+    pub fn get_compile_template(&self) -> Result<PyObjectRef, crate::PyError> {
+        let existing = self.w_compile_template.get();
+        if !existing.is_null() {
+            return Ok(existing);
+        }
+        use pyre_object::gc_roots::{pin_root, push_roots, shadow_stack_get, shadow_stack_len};
+        let _roots = push_roots();
+        let re_slot = shadow_stack_len();
+        let _ = pin_root(self.get_re()?);
+        let w_compile =
+            crate::baseobjspace::getattr_str(shadow_stack_get(re_slot), "_compile_template")?;
+        let compile_slot = shadow_stack_len();
+        let _ = pin_root(w_compile);
+        self.w_compile_template.set(shadow_stack_get(compile_slot));
+        Ok(shadow_stack_get(compile_slot))
+    }
+
     pub fn walk_roots(&self, forward: &mut dyn FnMut(&mut PyObjectRef)) {
         self.w_re.walk(forward);
+        self.w_compile_template.walk(forward);
     }
 }
 
-/// `import_re` — `space.fromcache(AppReCache).get_re()`.
-fn import_re() -> Result<PyObjectRef, crate::PyError> {
+/// `space.fromcache(AppReCache).get_compile_template()`.
+fn get_compile_template() -> Result<PyObjectRef, crate::PyError> {
     let crate::baseobjspace::SpaceCacheInstance::AppReCache(cache) =
         crate::baseobjspace::object_space()
             .fromcache(crate::baseobjspace::SpaceCacheClass::AppReCache)
@@ -2666,7 +2619,7 @@ fn import_re() -> Result<PyObjectRef, crate::PyError> {
             "fromcache(SpaceCacheClass::AppReCache) always returns SpaceCacheInstance::AppReCache"
         );
     };
-    cache.get_re()
+    cache.get_compile_template()
 }
 
 /// `compile_template` — call `re._compile_template(pattern, template)`.
@@ -2682,25 +2635,27 @@ fn compile_template(
     pat: PyObjectRef,
     w_template: PyObjectRef,
 ) -> Result<Vec<TemplateItem>, crate::PyError> {
-    template_items_from_compiled(compile_template_object(pat, w_template)?)
+    template_items_from_sre_template(compile_template_object(pat, w_template)?)
 }
 
-/// `compile_template` — the `_sre.SRE_Template` (or a replaced compiler's
-/// list) before it is decoded into [`TemplateItem`]s.
+/// `compile_template` — the `_sre.SRE_Template` before it is decoded into
+/// [`TemplateItem`]s.
 fn compile_template_object(
     pat: PyObjectRef,
     w_template: PyObjectRef,
 ) -> Result<PyObjectRef, crate::PyError> {
-    // The import and the `getattr` below collect.
     let _roots = pyre_object::gc_roots::push_roots();
     let w_template = RootedObject::pin(w_template);
     let pat = RootedObject::pin(pat);
-    let w_re = RootedObject::pin(import_re()?);
-    let w_compile = crate::baseobjspace::getattr_str(w_re.get(), "_compile_template")?;
-    match crate::call::call_function_impl_result(w_compile, &[pat.get(), w_template.get()]) {
+    let w_compile = get_compile_template()?;
+    let w_result = match crate::call::call_function_impl_result(
+        w_compile,
+        &[pat.get(), w_template.get()],
+    ) {
         Ok(w_result) => Ok(w_result),
         Err(err) => compile_template_retry(pat.get(), w_template.get(), err),
-    }
+    }?;
+    require_sre_template(w_result)
 }
 
 /// TypeError from `_compile_template`: copy a str subclass to exact str,
@@ -2746,22 +2701,20 @@ fn compile_template_retry(
         }
     };
     let w_converted = RootedObject::pin(w_converted);
-    let w_re = RootedObject::pin(import_re()?);
-    let w_compile = crate::baseobjspace::getattr_str(w_re.get(), "_compile_template")?;
+    let w_compile = get_compile_template()?;
     crate::call::call_function_impl_result(w_compile, &[pat.get(), w_converted.get()])
 }
 
-/// Decode the `_sre.SRE_Template` `_sre.template` returned, or a list left
-/// behind by a replaced compiler. Any other type is the `compile_template`
-/// refusal.
-fn template_items_from_compiled(
-    w_result: PyObjectRef,
-) -> Result<Vec<TemplateItem>, crate::PyError> {
+/// `sre.c compile_template`: a result whose type is not `Template_Type` raises RuntimeError.
+/// [3.15-spec] v3.15.0 Modules/_sre/sre.c `compile_template` reads
+/// `re._compile_template` once into `module_state->compile_template` and
+/// raises RuntimeError for a result whose type is not `Template_Type`
+/// ↔ PyPy interp_sre.py `W_SRE_Pattern.subx` calls
+/// `space.call_method(w_re, '_subx', ...)` on every call, calls a callable
+/// result, and appends anything else.
+fn require_sre_template(w_result: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
     if unsafe { is_sre_template(w_result) } {
-        return template_items_from_sre_template(w_result);
-    }
-    if unsafe { pyre_object::is_list(w_result) } {
-        return template_items_from_list(w_result);
+        return Ok(w_result);
     }
     let name = crate::baseobjspace::object_functionstr_type_name(w_result);
     Err(crate::PyError::runtime_error(format!(

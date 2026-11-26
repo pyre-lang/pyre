@@ -963,23 +963,41 @@ fn memoryview_adjust_fmt(fmt: &str) -> Result<(), crate::PyError> {
 }
 
 /// Box one `itemsize`-wide element at byte offset `base` per the view's
-/// format.  PyPy's `buffer.py value_from_bytes` supplies the numeric decoding
-/// shape; CPython 3.14 `unpack_single` supplies the observable rejection of an
-/// unsupported one-character code.  `c` yields a length-1 bytes and `?` a
-/// bool.
+/// format. PyPy's `BufferView.w_getitem` supplies the item-sized window,
+/// and `buffer.py value_from_bytes` supplies the numeric decoding
+/// shape; an unsupported one-character code is rejected.  `c` yields a
+/// length-1 bytes and `?` a bool.
 unsafe fn memoryview_unpack_element(
     fmt: &str,
     data: &[u8],
     base: usize,
     itemsize: usize,
 ) -> Result<PyObjectRef, crate::PyError> {
-    if memoryview_native_fmtchar(fmt).is_none() {
+    let Some((_, size)) = memoryview_native_fmtchar(fmt) else {
         return Err(crate::PyError::not_implemented(format!(
             "memoryview: format {} not supported",
             fmt.strip_prefix('@').unwrap_or(fmt)
         )));
+    };
+    let size = size as usize;
+    let buf = base
+        .checked_add(itemsize)
+        .and_then(|end| data.get(base..end))
+        .ok_or_else(|| {
+            crate::module::r#struct::struct_error("unpack str size too short for format")
+        })?;
+    // `UnpackFormatIterator.advance` / `finished` require exactly the
+    // native format's size within the exporter's item-sized window.
+    if buf.len() < size {
+        return Err(crate::module::r#struct::struct_error(
+            "unpack str size too short for format",
+        ));
     }
-    let buf = &data[base..base + itemsize];
+    if buf.len() > size {
+        return Err(crate::module::r#struct::struct_error(
+            "unpack str size too long for format",
+        ));
+    }
     Ok(match memoryview_format_code(fmt) {
         b'c' => pyre_object::bytesobject::w_bytes_from_bytes(buf),
         b'?' => w_bool_from(buf.iter().any(|&x| x != 0)),
@@ -1012,7 +1030,7 @@ unsafe fn memoryview_unpack_element(
             if w != pyre_object::PY_NULL {
                 w
             } else if itemsize <= size_of::<i64>() {
-                w_int_new(memoryview_unpack(data, itemsize, base))
+                w_int_new(memoryview_unpack(buf, itemsize, 0))
             } else {
                 // An item wider than the fold above: its bytes, which is all
                 // the one caller still reaching here needs.  `==` compares
@@ -1375,8 +1393,11 @@ unsafe fn memoryview_unpack_at(
     mv: PyObjectRef,
     indices: &[i64],
     fmt: &str,
-    itemsize: usize,
+    itemsize: i64,
 ) -> Result<PyObjectRef, crate::PyError> {
+    let itemsize = usize::try_from(itemsize).map_err(|_| {
+        crate::module::r#struct::struct_error("unpack str size too short for format")
+    })?;
     unsafe {
         let element = pyre_object::memoryview::w_memoryview_view(mv).element_ptr(indices);
         let bytes = std::slice::from_raw_parts(element, itemsize);
@@ -1443,7 +1464,7 @@ fn memoryview_getitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
             // not `length / itemsize`.
             let index = memoryview_check_dimension(mv, 0, i)?;
             let fmt = w_memoryview_format_str(mv);
-            return memoryview_unpack_at(mv, &[index], fmt, itemsize as usize);
+            return memoryview_unpack_at(mv, &[index], fmt, itemsize);
         }
         if pyre_object::is_tuple(index) {
             let (all_index, all_slice) = memoryview_tuple_kind(index);
@@ -1464,7 +1485,7 @@ fn memoryview_getitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
                     pyre_object::with_roots!(mv => memoryview_start_from_tuple(mv, index))?;
                 let itemsize = w_memoryview_itemsize(mv);
                 let fmt = w_memoryview_format_str(mv);
-                return memoryview_unpack_at(mv, &indices, fmt, itemsize as usize);
+                return memoryview_unpack_at(mv, &indices, fmt, itemsize);
             }
             if all_slice {
                 return Err(crate::PyError::not_implemented(

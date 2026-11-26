@@ -171,7 +171,11 @@ unsafe fn shape_and_strides(
         return (Vec::new(), Vec::new());
     }
     if ndim == 1 {
-        let elements = if itemsize > 0 { length / itemsize } else { 0 };
+        let elements = if itemsize == 0 {
+            0
+        } else {
+            crate::objspace::descroperation::ll_int_py_div(length, itemsize)
+        };
         let shape = if shape_ptr.is_null() {
             vec![elements]
         } else {
@@ -305,11 +309,7 @@ fn acquire(
         (
             (*view).buf as usize,
             (*view).len as i64,
-            if (*view).itemsize > 0 {
-                (*view).itemsize as i64
-            } else {
-                1
-            },
+            (*view).itemsize as i64,
             (*view).readonly != 0,
             (*view).ndim as i64,
         )

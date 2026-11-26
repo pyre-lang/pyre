@@ -511,7 +511,20 @@ impl BufferView {
                     if *length == 0 {
                         vec![0]
                     } else {
-                        vec![*length / *itemsize]
+                        vec![if *itemsize == 0 {
+                            0
+                        } else {
+                            // `RawBufferView.getshape`, via rint.py
+                            // `ll_int_py_div`: wrapping machine arithmetic.
+                            let r = length.wrapping_div(*itemsize);
+                            let p = r.wrapping_mul(*itemsize);
+                            let u = if *itemsize < 0 {
+                                p.wrapping_sub(*length)
+                            } else {
+                                length.wrapping_sub(p)
+                            };
+                            r.wrapping_add(u >> 63)
+                        }]
                     }
                 }
                 // Dimension 0 takes the slice's element count; later
@@ -994,6 +1007,30 @@ mod tests {
         let sliced = unsafe { view.new_slice(2, 1, 5) };
 
         assert_eq!(unsafe { sliced.as_contiguous_bytes() }, Some(&b"23456"[..]));
+    }
+
+    #[test]
+    fn raw_shape_floor_division_handles_negative_zero_and_overflow() {
+        for (length, itemsize, expected) in [
+            (5, -2, -3),
+            (-5, 2, -3),
+            (5, 2, 2),
+            (5, 0, 0),
+            (0, 0, 0),
+            (i64::MIN, -1, i64::MIN),
+            (i64::MIN, 1, i64::MIN),
+        ] {
+            let raw = BufferView::Raw {
+                backing: Buffer::Array {
+                    w_obj: fake(0x2000),
+                },
+                w_obj: fake(0x2000),
+                w_fmt: fake(0x2004),
+                itemsize,
+                length,
+            };
+            assert_eq!(unsafe { raw.native_shape() }, vec![expected]);
+        }
     }
 
     #[test]

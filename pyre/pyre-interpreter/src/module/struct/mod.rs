@@ -25,7 +25,7 @@ const fn native_is_bigendian() -> bool {
 ///
 /// `dont_look_inside` so `lookup_exc_class` stays off the wrapper hot graph.
 #[majit_macros::dont_look_inside]
-fn struct_error(msg: impl Into<String>) -> crate::PyError {
+pub(crate) fn struct_error(msg: impl Into<String>) -> crate::PyError {
     let msg = msg.into();
     let cls = crate::builtins::lookup_exc_class("struct.error")
         .or_else(|| crate::builtins::lookup_exc_class("Exception"))
