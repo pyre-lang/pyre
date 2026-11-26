@@ -7398,6 +7398,7 @@ impl<'a> Lowering<'a> {
             self.tombstoned_leaves,
             self.gc_struct_ids,
             &self.raw_alloc_flavor_structs,
+            self.struct_fields,
         )
         .or_else(|| {
             tyref_by_value_struct_decl(
@@ -7406,6 +7407,7 @@ impl<'a> Lowering<'a> {
                 self.tombstoned_leaves,
                 self.gc_struct_ids,
                 &self.raw_alloc_flavor_structs,
+                self.struct_fields,
             )
         })?;
         if type_decl_is_by_value_integer_newtype(parent_td, self.llbc) {
