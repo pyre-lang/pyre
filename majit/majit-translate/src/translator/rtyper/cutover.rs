@@ -83,9 +83,10 @@ pub(crate) const GCREF_RETURN_TYPE: &str = "gcref";
 /// the LLBC signature supplies `ext_type.RESULT` (`rffi.py`
 /// `llexternal` / `extfunc.py` `register_external`),
 /// `dont_look_inside_return_class_root` of that result, and the FunDecl
-/// identity (`registered_path_for_fun_decl`) when the producer had one.
+/// identity plus harvest (`registered_path_for_fun_decl` /
+/// `harvest_path_for_fun_decl`) when the producer had one.
 /// Display `segments` are aliases of that identity's CallRegistry entry.
-/// `identity` is `None` for pure host-name stubs that never saw a FunDecl.
+/// Identity is `None` for pure host-name stubs that never saw a FunDecl.
 ///
 /// A skipped look-inside / bodyless callee must intern no more precisely
 /// than the declared type (`extfunc.py` `ExtFuncEntry.compute_result_annotation`
@@ -97,16 +98,19 @@ pub(crate) type ResidualStubSpec = (
     Option<String>,
     Option<LowLevelType>,
     Option<String>,
-    Option<crate::parse::CallPath>,
+    Option<(crate::parse::CallPath, crate::parse::CallPath)>,
     Option<Vec<LowLevelType>>,
 );
 
-/// FunDecl identity plus display spellings of the same callable
-/// (`bookkeeper.py Bookkeeper.getdesc`). After host-name tables
+/// FunDecl identity, harvest, and other display spellings of the same
+/// callable (`bookkeeper.py Bookkeeper.getdesc`). After host-name tables
 /// register harvest keys, alias the identity onto those entries.
 /// A display spelling is an alias iff exactly one FunDecl in this
 /// collection claims it; an ambiguous display is never aliased.
+/// Harvest is `harvest_path_for_fun_decl`; when it equals identity the
+/// residual publish occupies identity and not a later Type-split.
 pub(crate) type FunDeclIdentityAlias = (
+    crate::parse::CallPath,
     crate::parse::CallPath,
     Vec<Vec<String>>,
     Option<crate::model::ValueType>,
@@ -3241,7 +3245,12 @@ pub(crate) fn populate_call_registry_from_call_graphs(
     // `getfunctionptr`); aliasing them onto the template unique graph
     // would `mergeinputargs` List ∪ RustVec.
     alias_opaque_stub_keys_onto_graphstore(function_graphs, registry, unsafe_fn_stubs);
-    register_unsafe_fn_stubs(registry, unsafe_fn_stubs, Some(function_graphs));
+    register_unsafe_fn_stubs(
+        registry,
+        unsafe_fn_stubs,
+        Some(function_graphs),
+        fun_decl_identity_aliases,
+    );
     // `__deref_write(ptr, value)` is the MIR front end's opaque store
     // marker.  Give the annotator the same declared-external carrier as the
     // Rust-stdlib leaves below so one unfollowable store does not stop the
@@ -3448,7 +3457,8 @@ fn try_alias_key_onto_entry(
 /// Point every GraphStore spelling of `key`'s funcobj at `entry`.
 /// A `FunctionPathKey` aliases an existing FunctionEntry only when
 /// GraphStore resolves that key to the same `GraphKey` as the entry's
-/// graph (`bookkeeper.py Bookkeeper.getdesc`).
+/// graph (`bookkeeper.py Bookkeeper.getdesc`). Spellings of a different
+/// GraphKey are another funcobj.
 fn alias_graphstore_spellings(
     store: Option<&crate::codewriter::call::GraphStore>,
     registry: &CallRegistry,
@@ -3461,6 +3471,13 @@ fn alias_graphstore_spellings(
     let Some(path) = graphstore_path_for_lookup_key(store, key) else {
         return;
     };
+    let Some(key_gk) = store.key_for(&path) else {
+        return;
+    };
+    match graph_key_of_registry_entry(store, registry, entry) {
+        Some(entry_gk) if entry_gk == key_gk => {}
+        _ => return,
+    }
     try_alias_key_onto_entry(registry, key, entry);
     for alias in store.alias_paths(&path) {
         // An `access_directly` spelling is its own specialization
@@ -3470,6 +3487,15 @@ fn alias_graphstore_spellings(
         }
         try_alias_key_onto_entry(registry, &FunctionPathKey::from(&alias), entry);
     }
+}
+
+fn graph_key_of_registry_entry(
+    store: &crate::codewriter::call::GraphStore,
+    registry: &CallRegistry,
+    entry: &Rc<FunctionEntry>,
+) -> Option<crate::model::GraphKey> {
+    let canonical = registry.canonical_key_of(entry)?;
+    store.key_for(&canonical.to_call_path())
 }
 
 /// Display keys this FunDecl claims: harvest / `name_path()`, plus the
@@ -3578,20 +3604,43 @@ fn entry_records_other_callable(
     })
 }
 
-/// True when identity and a unique display are both stored graphs and
-/// they are different GraphKeys (`Bookkeeper.getdesc`).
+/// True when identity and a unique display name different GraphKeys
+/// (`Bookkeeper.getdesc`). A display that GraphStore holds while identity
+/// has no graph is that other funcobj.
 fn store_graph_disagrees(
     store: &crate::codewriter::call::GraphStore,
     identity: &crate::parse::CallPath,
     displays: &[FunctionPathKey],
 ) -> bool {
-    let Some(ident_gk) = store.key_for(identity) else {
-        return false;
-    };
+    let ident_gk = store.key_for(identity);
     displays.iter().any(|display| {
         let path = display.to_call_path();
-        store.key_for(&path).is_some_and(|gk| gk != ident_gk)
+        match (ident_gk.as_ref(), store.key_for(&path)) {
+            (Some(igk), Some(dgk)) => igk != &dgk,
+            (None, Some(_)) => true,
+            _ => false,
+        }
     })
+}
+
+/// Uniqueness of display spellings over every local FunDecl
+/// (`collect_fun_decl_identity_aliases`). Shared by the stub pass and
+/// the later FunDecl-alias pass (`Bookkeeper.getdesc`).
+fn fun_decl_display_owners(
+    aliases: &[FunDeclIdentityAlias],
+) -> HashMap<FunctionPathKey, HashSet<FunctionPathKey>> {
+    let mut owners: HashMap<FunctionPathKey, HashSet<FunctionPathKey>> = HashMap::new();
+    for (identity, _harvest, displays, result_ty) in aliases {
+        let ident_key = FunctionPathKey::from(identity);
+        owners
+            .entry(ident_key.clone())
+            .or_default()
+            .insert(ident_key.clone());
+        for display in claimed_display_keys(identity, displays, result_ty.as_ref()) {
+            owners.entry(display).or_default().insert(ident_key.clone());
+        }
+    }
+    owners
 }
 
 /// Point each FunDecl identity at a CallRegistry entry already
@@ -3608,20 +3657,12 @@ fn alias_fun_decl_identities_onto_registered_display(
     registry: &CallRegistry,
     aliases: &[FunDeclIdentityAlias],
 ) {
-    let mut owners: HashMap<FunctionPathKey, HashSet<FunctionPathKey>> = HashMap::new();
+    let owners = fun_decl_display_owners(aliases);
     let mut identities: HashSet<FunctionPathKey> = HashSet::new();
-    for (identity, displays, result_ty) in aliases {
-        let ident_key = FunctionPathKey::from(identity);
-        identities.insert(ident_key.clone());
-        owners
-            .entry(ident_key.clone())
-            .or_default()
-            .insert(ident_key.clone());
-        for display in claimed_display_keys(identity, displays, result_ty.as_ref()) {
-            owners.entry(display).or_default().insert(ident_key.clone());
-        }
+    for (identity, _harvest, _displays, _result_ty) in aliases {
+        identities.insert(FunctionPathKey::from(identity));
     }
-    for (identity, displays, result_ty) in aliases {
+    for (identity, _harvest, displays, result_ty) in aliases {
         if registration_decline(&identity.segments).is_some() {
             continue;
         }
@@ -3657,6 +3698,16 @@ fn alias_fun_decl_identities_onto_registered_display(
             }
             continue;
         }
+        // Host-name / FOREIGN / knowntype tables key the funcobj by
+        // spelling (`extfunc.py register_external`). The table can
+        // only name that function object by the spelling it registered.
+        // When exactly one local FunDecl claims that spelling
+        // (`fun_decl_display_owners`, the same uniqueness both passes
+        // use), the occupant is this FunDecl (`Bookkeeper.getdesc`).
+        // Fail closed only when a recorded key is another FunDecl
+        // identity, is claimed by another FunDecl, or is a spelling
+        // this FunDecl does not claim (`entry_records_other_callable`),
+        // or GraphStore GraphKeys disagree.
         let Some(entry) = registered.first() else {
             continue;
         };
@@ -4979,26 +5030,13 @@ pub(crate) fn register_unsafe_fn_stubs(
     registry: &CallRegistry,
     specs: &[ResidualStubSpec],
     function_graphs: Option<&crate::codewriter::call::GraphStore>,
+    fun_decl_identity_aliases: &[FunDeclIdentityAlias],
 ) {
     use crate::decline::gate::CALL_REGISTRY as REGISTRY_GATE;
     let foreign_callables = registry_foreign_callables(registry);
-    let mut stub_display_owners: HashMap<FunctionPathKey, HashSet<FunctionPathKey>> =
-        HashMap::new();
-    for (segments, _, _, _, _, identity, _) in specs {
-        let Some(identity) = identity else {
-            continue;
-        };
-        let ident_key = FunctionPathKey::from(identity);
-        let display_key = FunctionPathKey::from_segments(segments.iter().cloned());
-        if ident_key != display_key {
-            stub_display_owners
-                .entry(display_key)
-                .or_default()
-                .insert(ident_key);
-        }
-    }
+    let display_owners = fun_decl_display_owners(fun_decl_identity_aliases);
     let stub_display_unique = |display: &FunctionPathKey, ident: &FunctionPathKey| {
-        stub_display_owners
+        display_owners
             .get(display)
             .is_some_and(|set| set.len() == 1 && set.contains(ident))
     };
@@ -5015,12 +5053,23 @@ pub(crate) fn register_unsafe_fn_stubs(
         // A display spelling aliases onto identity only when exactly
         // one FunDecl claims it (`Bookkeeper.getdesc`). Shared harvest
         // / `name_path()` / Type-split is another funcobj's occupant.
-        if let Some(identity) = identity {
+        // Uniqueness is the same relation `collect_fun_decl_identity_aliases`
+        // feeds the later FunDecl-alias pass: every local FunDecl, not
+        // residual stubs alone.
+        if let Some((identity, _harvest)) = identity {
             let ident_key = FunctionPathKey::from(identity);
             let display_key = FunctionPathKey::from_segments(segments.iter().cloned());
             if ident_key != display_key {
                 if let Some(entry) = registry.lookup_registered(&ident_key) {
-                    if stub_display_unique(&display_key, &ident_key) {
+                    if stub_display_unique(&display_key, &ident_key)
+                        && function_graphs.is_none_or(|store| {
+                            !store_graph_disagrees(
+                                store,
+                                identity,
+                                std::slice::from_ref(&display_key),
+                            )
+                        })
+                    {
                         try_alias_key_onto_entry(registry, &display_key, &entry);
                         alias_graphstore_spellings(function_graphs, registry, &display_key, &entry);
                     }
@@ -5226,9 +5275,18 @@ pub(crate) fn register_unsafe_fn_stubs(
             );
         }
         alias_graphstore_spellings(function_graphs, registry, &key, &entry);
-        if let Some(identity) = identity {
+        if let Some((identity, _harvest)) = identity {
             let ident_key = FunctionPathKey::from(identity);
-            if ident_key != key && stub_display_unique(&key, &ident_key) {
+            entry
+                .function_desc
+                .borrow_mut()
+                .record_funcobj_key(ident_key.segments());
+            if ident_key != key
+                && stub_display_unique(&key, &ident_key)
+                && function_graphs.is_none_or(|store| {
+                    !store_graph_disagrees(store, identity, std::slice::from_ref(&key))
+                })
+            {
                 try_alias_key_onto_entry(registry, &ident_key, &entry);
             }
         }
@@ -10509,7 +10567,7 @@ mod tests {
                 None,
             ));
         }
-        register_unsafe_fn_stubs(&stub_registry, &specs, None);
+        register_unsafe_fn_stubs(&stub_registry, &specs, None, &[]);
         assert_eq!(
             stub_registry.len(),
             1,
@@ -10641,7 +10699,7 @@ mod tests {
                 None,
             ));
         }
-        register_unsafe_fn_stubs(&stub_registry, &specs, None);
+        register_unsafe_fn_stubs(&stub_registry, &specs, None, &[]);
         assert_eq!(
             stub_registry.len(),
             1,
@@ -10816,7 +10874,7 @@ mod tests {
                 None,
             ));
         }
-        register_unsafe_fn_stubs(&stub_registry, &specs, None);
+        register_unsafe_fn_stubs(&stub_registry, &specs, None, &[]);
         assert_eq!(
             stub_registry.len(),
             1,
@@ -10975,7 +11033,7 @@ mod tests {
                 None,
             ));
         }
-        register_unsafe_fn_stubs(&stub_registry, &specs, None);
+        register_unsafe_fn_stubs(&stub_registry, &specs, None, &[]);
         assert_eq!(
             stub_registry.len(),
             1,
@@ -11097,7 +11155,7 @@ mod tests {
                 None,
             ),
         ];
-        register_unsafe_fn_stubs(&stub_registry, &specs, None);
+        register_unsafe_fn_stubs(&stub_registry, &specs, None, &[]);
         assert_eq!(
             stub_registry.len(),
             1,
@@ -13683,7 +13741,7 @@ mod tests {
             None,
             None,
         )];
-        register_unsafe_fn_stubs(&registry, &specs, Some(&graphs));
+        register_unsafe_fn_stubs(&registry, &specs, Some(&graphs), &[]);
         assert_eq!(
             entry.function_desc.borrow().signature.argnames.len(),
             2,
@@ -22712,7 +22770,7 @@ mod tests {
             None,
             None,
         )];
-        register_unsafe_fn_stubs(&registry, &specs, None);
+        register_unsafe_fn_stubs(&registry, &specs, None, &[]);
         let entry = registry
             .lookup(&FunctionPathKey::from_segments(["nongc_raw_ptr_session"]))
             .expect("stub registered");
@@ -22755,7 +22813,7 @@ mod tests {
             None,
             None,
         )];
-        register_unsafe_fn_stubs(&registry, &specs, None);
+        register_unsafe_fn_stubs(&registry, &specs, None, &[]);
 
         let mut graph = LegacyGraph::new("look_inside_is_null_nongc_raw_ptr");
         let conn = graph
@@ -23531,7 +23589,7 @@ mod tests {
                 None,
                 None,
             )];
-            register_unsafe_fn_stubs(&registry, &specs, None);
+            register_unsafe_fn_stubs(&registry, &specs, None, &[]);
             let (graph, result) = bodyless_extern_wrapper_call_graph(&[name], result_ty);
             let (value_to_var, _) =
                 specialize_legacy_graph_with_registry_returning_value_to_var(&graph, &registry)
@@ -23584,7 +23642,7 @@ mod tests {
                 None,
                 None,
             )];
-            register_unsafe_fn_stubs(&registry, &specs, None);
+            register_unsafe_fn_stubs(&registry, &specs, None, &[]);
             let mut graph = LegacyGraph::new("wrapper_void_then_ext");
             let vars = mint_vars(&mut graph, 4);
             let discarded = vars[2].clone();
@@ -23700,7 +23758,7 @@ mod tests {
                 None,
                 None,
             )];
-            register_unsafe_fn_stubs(&registry, &specs, Some(&graphs));
+            register_unsafe_fn_stubs(&registry, &specs, Some(&graphs), &[]);
             let crate_entry = registry
                 .lookup(&FunctionPathKey::from(&crate_path))
                 .expect("crate-prefixed stub");
@@ -23783,7 +23841,7 @@ mod tests {
                 Some(vec![LowLevelType::Signed]),
             ),
         ];
-        register_unsafe_fn_stubs(&registry, &specs, Some(&graphs));
+        register_unsafe_fn_stubs(&registry, &specs, Some(&graphs), &[]);
         let entry_a = registry
             .lookup(&FunctionPathKey::from(&path_a))
             .expect("a::m::f stub");
@@ -23843,7 +23901,7 @@ mod tests {
                 None,
             ),
         ];
-        register_unsafe_fn_stubs(&registry, &specs, None);
+        register_unsafe_fn_stubs(&registry, &specs, None, &[]);
         assert_eq!(
             registry.len(),
             3,
@@ -23885,7 +23943,7 @@ mod tests {
             None,
             None,
         )];
-        register_unsafe_fn_stubs(&registry, &specs, None);
+        register_unsafe_fn_stubs(&registry, &specs, None, &[]);
         let entry = registry
             .lookup(&FunctionPathKey::from_segments([
                 "pyobject".to_string(),
@@ -23952,7 +24010,7 @@ mod tests {
             None,
             None,
         )];
-        register_unsafe_fn_stubs(&registry, &specs, Some(&graphs));
+        register_unsafe_fn_stubs(&registry, &specs, Some(&graphs), &[]);
         let entry = registry
             .lookup(&FunctionPathKey::from_segments([
                 "pyobject".to_string(),
@@ -25481,7 +25539,7 @@ mod tests {
         )];
         let bk = std::rc::Rc::new(Bookkeeper::new());
         let registry = CallRegistry::new(bk);
-        register_unsafe_fn_stubs(&registry, &callcontrol.unsafe_fn_stubs, None);
+        register_unsafe_fn_stubs(&registry, &callcontrol.unsafe_fn_stubs, None, &[]);
         // Registry side: the stub is present for `cachedgraph` lookups.
         let key = FunctionPathKey::from_segments(["pyobject".to_string(), "is_none".to_string()]);
         assert!(
@@ -25524,7 +25582,7 @@ mod tests {
             None,
             None,
         )];
-        register_unsafe_fn_stubs(&registry, &specs, None);
+        register_unsafe_fn_stubs(&registry, &specs, None, &[]);
         assert_eq!(registry.len(), 1, "no new entry expected");
         let after = registry.lookup(&key).expect("entry still present");
         assert_eq!(
@@ -25556,7 +25614,12 @@ mod tests {
         alias_fun_decl_identities_onto_registered_display(
             &crate::codewriter::call::GraphStore::default(),
             &registry,
-            &[(identity.clone(), vec![harvest.clone()], None)],
+            &[(
+                identity.clone(),
+                crate::parse::CallPath::from_segments(harvest.clone()),
+                vec![harvest.clone()],
+                None,
+            )],
         );
         let ident_entry = registry
             .lookup_registered(&FunctionPathKey::from(&identity))
@@ -25587,8 +25650,18 @@ mod tests {
             &store,
             &registry,
             &[
-                (parent2.clone(), vec![harvest.segments.clone()], None),
-                (parent3.clone(), vec![harvest.segments.clone()], None),
+                (
+                    parent2.clone(),
+                    harvest.clone(),
+                    vec![harvest.segments.clone()],
+                    None,
+                ),
+                (
+                    parent3.clone(),
+                    harvest.clone(),
+                    vec![harvest.segments.clone()],
+                    None,
+                ),
             ],
         );
         assert!(
@@ -25618,8 +25691,18 @@ mod tests {
             &crate::codewriter::call::GraphStore::default(),
             &registry,
             &[
-                (parent2.clone(), vec![harvest.clone()], None),
-                (parent3.clone(), vec![harvest.clone()], None),
+                (
+                    parent2.clone(),
+                    crate::parse::CallPath::from_segments(harvest.clone()),
+                    vec![harvest.clone()],
+                    None,
+                ),
+                (
+                    parent3.clone(),
+                    crate::parse::CallPath::from_segments(harvest.clone()),
+                    vec![harvest.clone()],
+                    None,
+                ),
             ],
         );
         assert!(
@@ -25674,6 +25757,11 @@ mod tests {
             &[
                 (
                     pypy.clone(),
+                    crate::parse::CallPath::from_segments([
+                        "module",
+                        "__pypy__",
+                        "add_memory_pressure",
+                    ]),
                     vec![vec![
                         "module".to_string(),
                         "__pypy__".to_string(),
@@ -25681,7 +25769,12 @@ mod tests {
                     ]],
                     None,
                 ),
-                (gc.clone(), vec![leaf.clone()], None),
+                (
+                    gc.clone(),
+                    crate::parse::CallPath::from_segments(leaf.clone()),
+                    vec![leaf.clone()],
+                    None,
+                ),
             ],
         );
         assert!(
@@ -25713,13 +25806,168 @@ mod tests {
         alias_fun_decl_identities_onto_registered_display(
             &crate::codewriter::call::GraphStore::default(),
             &registry,
-            &[(local.clone(), vec![vec!["f".to_string()]], None)],
+            &[(
+                local.clone(),
+                crate::parse::CallPath::from_segments(["f"]),
+                vec![vec!["f".to_string()]],
+                None,
+            )],
         );
         assert!(
             registry
                 .lookup_registered(&FunctionPathKey::from(&local))
                 .is_none(),
             "must not bind a unique harvest leaf onto a host-name FunctionDesc registered for a different callable"
+        );
+    }
+
+    /// Occupant at a unique harvest leaf that also records another
+    /// FunDecl's identity is that other callable (`Bookkeeper.getdesc`).
+    #[test]
+    fn alias_fun_decl_identity_skips_host_name_leaf_subset_of_claimed() {
+        use crate::annotator::bookkeeper::Bookkeeper;
+        use crate::translator::rtyper::call_registry::CallRegistry;
+        let registry = CallRegistry::new(std::rc::Rc::new(Bookkeeper::new()));
+        register_opaque_external(&registry, &["f"], &["x"], LowLevelType::Signed);
+        let other = crate::parse::CallPath::from_segments(["c", "parent#2", "g"]);
+        registry
+            .lookup_registered(&FunctionPathKey::from_segments(["f"]))
+            .expect("host-name occupant")
+            .function_desc
+            .borrow_mut()
+            .record_funcobj_key(&other.segments);
+        let local = crate::parse::CallPath::from_segments(["local_mod", "f"]);
+        let harvest = vec!["local_mod".to_string(), "f".to_string()];
+        alias_fun_decl_identities_onto_registered_display(
+            &crate::codewriter::call::GraphStore::default(),
+            &registry,
+            &[
+                (
+                    local.clone(),
+                    crate::parse::CallPath::from_segments(harvest.clone()),
+                    vec![harvest, vec!["f".to_string()]],
+                    None,
+                ),
+                (
+                    other.clone(),
+                    other.clone(),
+                    vec![other.segments.clone()],
+                    None,
+                ),
+            ],
+        );
+        assert!(
+            registry
+                .lookup_registered(&FunctionPathKey::from(&local))
+                .is_none(),
+            "must not bind identity onto an occupant that records another FunDecl's identity"
+        );
+        assert!(
+            registry
+                .lookup_registered(&FunctionPathKey::from_segments(["f"]))
+                .is_some(),
+            "host-name occupant stays its own FunctionDesc"
+        );
+    }
+
+    /// Host-name / FOREIGN occupant whose keys are all uniquely claimed
+    /// by this FunDecl is this funcobj (`extfunc.py register_external`
+    /// names the function object by spelling).
+    #[test]
+    fn alias_fun_decl_identity_onto_host_name_leaf_subset_of_claimed() {
+        use crate::annotator::bookkeeper::Bookkeeper;
+        use crate::translator::rtyper::call_registry::CallRegistry;
+        let registry = CallRegistry::new(std::rc::Rc::new(Bookkeeper::new()));
+        register_opaque_external(&registry, &["f"], &["x"], LowLevelType::Signed);
+        let local = crate::parse::CallPath::from_segments(["local_mod", "f"]);
+        let harvest = vec!["local_mod".to_string(), "f".to_string()];
+        alias_fun_decl_identities_onto_registered_display(
+            &crate::codewriter::call::GraphStore::default(),
+            &registry,
+            &[(
+                local.clone(),
+                crate::parse::CallPath::from_segments(harvest.clone()),
+                vec![harvest, vec!["f".to_string()]],
+                None,
+            )],
+        );
+        let ident_entry = registry
+            .lookup_registered(&FunctionPathKey::from(&local))
+            .expect("unique host-name leaf aliases onto this FunDecl");
+        let leaf_entry = registry
+            .lookup_registered(&FunctionPathKey::from_segments(["f"]))
+            .expect("host-name occupant");
+        assert!(std::rc::Rc::ptr_eq(&ident_entry, &leaf_entry));
+    }
+
+    /// Residual stub A whose harvest is already a look-inside GraphStore
+    /// funcobj B must not alias B's GraphKey spellings onto A's
+    /// FunctionDesc (`Bookkeeper.getdesc`: two FunDecls are two pyobjs).
+    #[test]
+    fn register_unsafe_fn_stubs_skips_graphstore_look_inside_shared_harvest() {
+        use crate::annotator::bookkeeper::Bookkeeper;
+        use crate::codewriter::call::GraphStore;
+        use crate::translator::rtyper::call_registry::CallRegistry;
+        let harvest = crate::parse::CallPath::from_segments(["parent", "f"]);
+        let parent2 = crate::parse::CallPath::from_segments(["c", "parent#2", "f"]);
+        let parent3 = crate::parse::CallPath::from_segments(["c", "parent#3", "f"]);
+        let mut look_inside = crate::model::FunctionGraph::new("f");
+        look_inside.funcobj_identity = Some(parent2.display_name());
+        let mut store = GraphStore::default();
+        store.insert(harvest.clone(), look_inside);
+        store.share_path(parent2.clone(), &harvest);
+        let registry = std::rc::Rc::new(CallRegistry::new(std::rc::Rc::new(Bookkeeper::new())));
+        let sig = Signature::new(vec!["x".to_string()], None, None);
+        let specs = vec![
+            (
+                parent3.segments.clone(),
+                sig.clone(),
+                Some("i64".to_string()),
+                None,
+                None,
+                Some((parent3.clone(), harvest.clone())),
+                None,
+            ),
+            (
+                harvest.segments.clone(),
+                sig,
+                Some("i64".to_string()),
+                None,
+                None,
+                Some((parent3.clone(), harvest.clone())),
+                None,
+            ),
+        ];
+        let aliases = [
+            (
+                parent2.clone(),
+                harvest.clone(),
+                vec![harvest.segments.clone()],
+                None,
+            ),
+            (
+                parent3.clone(),
+                harvest.clone(),
+                vec![harvest.segments.clone()],
+                None,
+            ),
+        ];
+        alias_opaque_stub_keys_onto_graphstore(&store, &registry, &specs);
+        register_unsafe_fn_stubs(&registry, &specs, Some(&store), &aliases);
+        let parent3_entry = registry
+            .lookup_registered(&FunctionPathKey::from(&parent3))
+            .expect("residual identity stub");
+        assert!(
+            registry
+                .lookup_registered(&FunctionPathKey::from(&parent2))
+                .is_none_or(|entry| !Rc::ptr_eq(&entry, &parent3_entry)),
+            "look-inside GraphStore identity must not bind onto the residual FunctionDesc"
+        );
+        assert!(
+            registry
+                .lookup_registered(&FunctionPathKey::from(&harvest))
+                .is_none_or(|entry| !Rc::ptr_eq(&entry, &parent3_entry)),
+            "shared harvest of a look-inside GraphStore funcobj must not alias onto the residual"
         );
     }
 
@@ -25739,6 +25987,7 @@ mod tests {
             "<Impl>".to_string(),
             "checked_add".to_string(),
         ];
+        let harvest_path = crate::parse::CallPath::from_segments(harvest.clone());
         let sig = Signature::new(vec!["self".to_string(), "rhs".to_string()], None, None);
         let specs = vec![
             (
@@ -25747,7 +25996,7 @@ mod tests {
                 Some("u64".to_string()),
                 None,
                 None,
-                Some(ident_a.clone()),
+                Some((ident_a.clone(), harvest_path.clone())),
                 None,
             ),
             (
@@ -25756,7 +26005,7 @@ mod tests {
                 Some("u64".to_string()),
                 None,
                 None,
-                Some(ident_a.clone()),
+                Some((ident_a.clone(), harvest_path.clone())),
                 None,
             ),
             (
@@ -25765,7 +26014,7 @@ mod tests {
                 Some("i64".to_string()),
                 None,
                 None,
-                Some(ident_b.clone()),
+                Some((ident_b.clone(), harvest_path.clone())),
                 None,
             ),
             (
@@ -25774,11 +26023,20 @@ mod tests {
                 Some("i64".to_string()),
                 None,
                 None,
-                Some(ident_b.clone()),
+                Some((ident_b.clone(), harvest_path.clone())),
                 None,
             ),
         ];
-        register_unsafe_fn_stubs(&registry, &specs, None);
+        let aliases = [
+            (
+                ident_a.clone(),
+                harvest_path.clone(),
+                vec![harvest.clone()],
+                None,
+            ),
+            (ident_b.clone(), harvest_path, vec![harvest.clone()], None),
+        ];
+        register_unsafe_fn_stubs(&registry, &specs, None, &aliases);
         assert!(
             registry
                 .lookup_registered(&FunctionPathKey::from_segments(harvest))
@@ -25816,7 +26074,7 @@ mod tests {
                 Some("i64".to_string()),
                 None,
                 None,
-                Some(ident_a.clone()),
+                Some((ident_a.clone(), ident_a.clone())),
                 None,
             ),
             (
@@ -25825,7 +26083,7 @@ mod tests {
                 Some("i64".to_string()),
                 None,
                 None,
-                Some(ident_a.clone()),
+                Some((ident_a.clone(), ident_a.clone())),
                 None,
             ),
             (
@@ -25834,7 +26092,7 @@ mod tests {
                 Some("i64".to_string()),
                 None,
                 None,
-                Some(ident_b.clone()),
+                Some((ident_b.clone(), ident_b.clone())),
                 None,
             ),
             (
@@ -25843,11 +26101,25 @@ mod tests {
                 Some("i64".to_string()),
                 None,
                 None,
-                Some(ident_b.clone()),
+                Some((ident_b.clone(), ident_b.clone())),
                 None,
             ),
         ];
-        register_unsafe_fn_stubs(&registry, &specs, None);
+        let aliases = [
+            (
+                ident_a.clone(),
+                ident_a.clone(),
+                vec![type_split.clone()],
+                None,
+            ),
+            (
+                ident_b.clone(),
+                ident_b.clone(),
+                vec![type_split.clone()],
+                None,
+            ),
+        ];
+        register_unsafe_fn_stubs(&registry, &specs, None, &aliases);
         assert!(
             registry
                 .lookup_registered(&FunctionPathKey::from_segments(type_split))
@@ -25874,6 +26146,7 @@ mod tests {
         let registry = CallRegistry::new(std::rc::Rc::new(Bookkeeper::new()));
         let ident = crate::parse::CallPath::from_segments(["mod_a", "<impl Owner>", "meth"]);
         let type_split = vec!["Owner".to_string(), "meth".to_string()];
+        let harvest_path = crate::parse::CallPath::from_segments(type_split.clone());
         let sig = Signature::new(vec!["self".to_string()], None, None);
         let specs = vec![
             (
@@ -25882,7 +26155,7 @@ mod tests {
                 Some("i64".to_string()),
                 None,
                 None,
-                Some(ident.clone()),
+                Some((ident.clone(), harvest_path.clone())),
                 None,
             ),
             (
@@ -25891,11 +26164,16 @@ mod tests {
                 Some("i64".to_string()),
                 None,
                 None,
-                Some(ident.clone()),
+                Some((ident.clone(), harvest_path.clone())),
                 None,
             ),
         ];
-        register_unsafe_fn_stubs(&registry, &specs, None);
+        register_unsafe_fn_stubs(
+            &registry,
+            &specs,
+            None,
+            &[(ident.clone(), harvest_path, vec![type_split.clone()], None)],
+        );
         let ident_entry = registry
             .lookup_registered(&FunctionPathKey::from(&ident))
             .expect("identity stub");
@@ -25928,6 +26206,7 @@ mod tests {
             &[],
             &[(
                 identity.clone(),
+                crate::parse::CallPath::from_segments(harvest.clone()),
                 vec![harvest],
                 Some(crate::model::ValueType::Int),
             )],
@@ -25978,7 +26257,7 @@ mod tests {
             Some("i64".to_string()),
             None,
             None,
-            Some(identity.clone()),
+            Some((identity.clone(), harvest.clone())),
             None,
         )];
         alias_opaque_stub_keys_onto_graphstore(&store, &registry, &specs);
@@ -25988,7 +26267,7 @@ mod tests {
                 .is_none(),
             "empty external header must not mint a 0-arg FunctionDesc"
         );
-        register_unsafe_fn_stubs(&registry, &specs, Some(&store));
+        register_unsafe_fn_stubs(&registry, &specs, Some(&store), &[]);
         let entry = registry
             .lookup_registered(&FunctionPathKey::from(&identity))
             .expect("FunDecl signature stub");

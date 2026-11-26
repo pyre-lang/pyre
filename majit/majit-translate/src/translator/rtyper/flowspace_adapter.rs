@@ -13623,7 +13623,8 @@ mod tests {
 
         let registry = empty_call_registry();
         let identity = crate::parse::CallPath::from_segments(["c", "parent#2", "f"]);
-        let harvest = vec!["parent".to_string(), "f".to_string()];
+        let harvest_path = crate::parse::CallPath::from_segments(["parent", "f"]);
+        let harvest = harvest_path.segments.clone();
         let sig = Signature::new(vec!["x".to_string()], None, None);
         let specs = vec![
             (
@@ -13632,20 +13633,25 @@ mod tests {
                 Some("i64".to_string()),
                 None,
                 None,
-                Some(identity.clone()),
+                Some((identity.clone(), harvest_path.clone())),
                 Some(vec![LowLevelType::Signed]),
             ),
             (
-                harvest,
+                harvest.clone(),
                 sig,
                 Some("i64".to_string()),
                 None,
                 None,
-                Some(identity.clone()),
+                Some((identity.clone(), harvest_path.clone())),
                 Some(vec![LowLevelType::Signed]),
             ),
         ];
-        register_unsafe_fn_stubs(&registry, &specs, None);
+        register_unsafe_fn_stubs(
+            &registry,
+            &specs,
+            None,
+            &[(identity.clone(), harvest_path, vec![harvest], None)],
+        );
         let ident_key = FunctionPathKey::from(&identity);
         let harvest_key = FunctionPathKey::from_segments(["parent", "f"]);
         let ident_entry = registry

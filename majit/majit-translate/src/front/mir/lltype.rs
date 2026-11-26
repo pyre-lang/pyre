@@ -1325,7 +1325,7 @@ pub(in crate::front::mir) fn collect_fn_stubs_from_llbc_if(
                 token.clone(),
                 result_lltype.clone(),
                 class_root.clone(),
-                Some(identity.clone()),
+                Some((identity.clone(), harvest.clone())),
                 Some(arg_lltypes.clone()),
             ));
         }
@@ -1384,7 +1384,7 @@ pub(crate) fn collect_fun_decl_identity_aliases(
         // `identity.segments[1..]` would be `mutex::Mutex::<impl…>::lock`,
         // which no producer registers.
         let result_ty = tyref_to_value_type(&fd.signature.output, llbc);
-        out.push((identity, displays, Some(result_ty)));
+        out.push((identity, harvest, displays, Some(result_ty)));
     }
     out
 }
