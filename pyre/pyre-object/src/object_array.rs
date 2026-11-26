@@ -2164,8 +2164,10 @@ unsafe fn alloc_mro_block_gc_kind(values: &[PyObjectRef], young: bool) -> *mut F
         }
         return block;
     }
+    let _roots = crate::gc_roots::push_roots();
+    let save = crate::gc_roots::pin_roots(values);
     let raw = crate::gc_hook::try_gc_alloc_stable_raw(PY_OBJECT_ARRAY_GC_TYPE_ID, payload);
-    unsafe { fill_mro_block(values, raw) }
+    unsafe { fill_mro_block_from_slot(save, len, raw) }
 }
 
 /// [`alloc_mro_block_gc`] for a heap type's `mro_w`.
@@ -2178,11 +2180,11 @@ pub unsafe fn alloc_mro_block_gc_young(values: &[PyObjectRef]) -> *mut FixedObje
     unsafe { alloc_mro_block_young_gc(values) }
 }
 
-unsafe fn fill_mro_block(
-    values: &[PyObjectRef],
+unsafe fn fill_mro_block_from_slot(
+    save: usize,
+    len: usize,
     raw: crate::gc_hook::GCREF,
 ) -> *mut FixedObjectArray {
-    let len = values.len();
     let block = if !raw.is_null() {
         raw as *mut FixedObjectArray
     } else if crate::gc_hook::gc_alloc_failed_pending() {
@@ -2198,7 +2200,9 @@ unsafe fn fill_mro_block(
     // The ownership question runs before the elements are written rather than
     // between them and the barrier — see `alloc_list_items_block_gc`.  This
     // block is raw-malloced and never moves, so no re-read is owed for the
-    // address.
+    // address. Items are copied from the shadow-stack pin taken before the
+    // malloc (`framework.py pop_roots`): a collecting stable request
+    // forwards those slots, not the caller's slice.
     let owns_block = crate::gc_hook::try_gc_owns_object(block as crate::gc_hook::GCREF);
     unsafe {
         (*block).len = len;
@@ -2209,12 +2213,8 @@ unsafe fn fill_mro_block(
             crate::gc_hook::try_gc_write_barrier(block as crate::gc_hook::GCREF);
         }
         let items = (*block).items_mut_ptr();
-        let src = values.as_ptr();
-        let mut i = 0usize;
-        while i < len {
-            items.add(i).write(*src.add(i));
-            i += 1;
-        }
+        let dst = std::slice::from_raw_parts_mut(items, len);
+        crate::gc_roots::shadow_stack_copy_range(save, dst);
     }
     block
 }

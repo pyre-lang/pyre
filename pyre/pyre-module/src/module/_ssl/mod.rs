@@ -1676,9 +1676,6 @@ mod memory_bio_methods {
         #[staticmethod]
         fn __new__(cls: PyObjectRef) -> Result<PyObjectRef, pyre_interpreter::PyError> {
             pyre_interpreter::typedef::check_user_subclass(type_object(), cls)?;
-            let _roots = pyre_object::gc_roots::push_roots();
-            let _ = pyre_object::gc_roots::pin_root(cls);
-            let cls_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
             let obj = W_MemoryBIO::allocate_stable(W_MemoryBIO {
                 ob: PyObject {
                     ob_type: std::ptr::null(),
@@ -1686,10 +1683,7 @@ mod memory_bio_methods {
                 },
                 backend: pyre_native::ssl::memory_bio_new(),
             });
-            Ok(pyre_interpreter::typedef::tag_subclass_instance(
-                obj,
-                pyre_object::gc_roots::shadow_stack_get(cls_slot),
-            ))
+            Ok(pyre_interpreter::typedef::tag_subclass_instance(obj, cls))
         }
 
         fn read(

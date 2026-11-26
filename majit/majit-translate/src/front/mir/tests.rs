@@ -24664,6 +24664,144 @@ fn option_u8_window_discriminant_is_pointer_null_test() {
     }
 }
 
+/// `Rvalue::Discriminant` of an `Option<Cow<str>>` field is `is None`
+/// of the getattr (`signature.py` `has_kwarg`). Integer tag-decode of a
+/// `SomeString` is a blocked block; jtransform loads the first word.
+#[test]
+fn option_cow_str_field_discriminant_is_none_test() {
+    use crate::model::{OpKind, ValueType, VecFieldPart};
+
+    let w = crate::layout::target_word_size() as u64;
+    let empty = window_empty_generics();
+    let str_adt = serde_json::json!({"Adt": {"id": 3, "generics": empty.clone()}});
+    let string_adt = serde_json::json!({"Adt": {"id": 2, "generics": empty.clone()}});
+    let cow_ty = named_adt(1, vec![str_adt.clone()]);
+    let option_ty = option_adt_node(0, cow_ty);
+    let holder_ty = serde_json::json!({"Adt": {"id": 4, "generics": empty.clone()}});
+    let disc_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "Isize"}}});
+    let cow = serde_json::json!({
+        "def_id": 1,
+        "item_meta": fixture_item_meta(ident_path(&["alloc", "borrow", "Cow"])),
+        "kind": {"Enum": [
+            {
+                "name": "Borrowed",
+                "fields": [{
+                    "name": null,
+                    "is_positional": true,
+                    "ty": {"Ref": ["Erased", str_adt, "Shared"]}
+                }],
+                "discriminant": {"Scalar": {"Signed": ["Isize", "0"]}}
+            },
+            {
+                "name": "Owned",
+                "fields": [{
+                    "name": null,
+                    "is_positional": true,
+                    "ty": string_adt
+                }],
+                "discriminant": {"Scalar": {"Signed": ["Isize", "1"]}}
+            }
+        ]}
+    });
+    let string_decl = serde_json::json!({
+        "def_id": 2,
+        "item_meta": fixture_item_meta(ident_path(&["alloc", "string", "String"])),
+        "kind": "Opaque",
+        "layout": [{
+            "key": "host",
+            "value": {
+                "size": w * 3,
+                "align": w,
+                "discriminator": {"Known": 0},
+                "variant_layouts": [{"field_offsets": [0]}],
+                "repr": {"transparent": false}
+            }
+        }]
+    });
+    let str_decl = serde_json::json!({
+        "def_id": 3,
+        "item_meta": fixture_item_meta(ident_path(&["core", "str", "str"])),
+        "kind": "Opaque",
+        "ptr_metadata": "Length"
+    });
+    let holder = interior_struct(
+        4,
+        &["fixture", "Holder"],
+        &[("name", option_ty.clone())],
+        w * 3,
+        &[0],
+        false,
+    );
+    let field_place = window_place(
+        serde_json::json!({
+            "Projection": [
+                window_place(serde_json::json!({"Local": 1}), &holder_ty),
+                {"Field": [null, 0]}
+            ]
+        }),
+        &option_ty,
+    );
+    let caller = serde_json::json!({
+        "def_id": 0,
+        "item_meta": window_meta(&["fixture", "holder_disc"], true),
+        "signature": {
+            "is_unsafe": false,
+            "inputs": [holder_ty.clone()],
+            "output": disc_ty.clone()
+        },
+        "body": {"Unstructured": {
+            "span": window_span(),
+            "locals": {"arg_count": 1, "locals": [
+                window_local(0, &disc_ty),
+                window_local(1, &holder_ty)
+            ]},
+            "body": [{
+                "statements": [{
+                    "span": window_span(),
+                    "kind": {"Assign": [
+                        window_place(serde_json::json!({"Local": 0}), &disc_ty),
+                        {"Discriminant": field_place}
+                    ]}
+                }],
+                "kind": "Regular",
+                "terminator": {"span": window_span(), "kind": "Return"}
+            }]
+        }}
+    });
+    let llbc = window_llbc(
+        vec![option_enum(0), cow, string_decl, str_decl, holder],
+        vec![caller],
+    );
+    let graph = crate::test_support::lower_function(&llbc, "holder_disc")
+        .unwrap_or_else(|err| panic!("lower Option<Cow<str>> field Discriminant: {err}"));
+    let ops: Vec<&crate::model::SpaceOperation> = graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .collect();
+    assert!(
+        ops.iter().any(|op| matches!(
+            &op.kind,
+            OpKind::FieldRead { field, ty: ValueType::Str, .. }
+                if field.vec_part == Some(VecFieldPart::HostNicheWord)
+        )),
+        "host-niche string-option Discriminant is getattr Str + HostNicheWord; graph={}",
+        graph.dump()
+    );
+    assert!(
+        ops.iter()
+            .any(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "is_")),
+        "host-niche string-option Discriminant is is None; graph={}",
+        graph.dump()
+    );
+    assert!(
+        !ops.iter()
+            .any(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "sub")),
+        "annotator must not see integer sub of a SomeString getattr; graph={}",
+        graph.dump()
+    );
+}
+
 /// `Rvalue::Discriminant` of `Option<*mut GCREFOpaque>` is
 /// `bool(self)` (`lltype.py` `SomePtr.bool` / `ptr_nonzero`).
 /// `is_(SomePtr, ConstNone)` folds because `SomePtr.can_be_none` is
@@ -38413,6 +38551,94 @@ fn interior_point() -> serde_json::Value {
 fn lower_interior(llbc: &Llbc, name: &str) -> FunctionGraph {
     crate::test_support::lower_function(llbc, name)
         .unwrap_or_else(|err| panic!("lower {name}: {err:?}"))
+}
+
+/// A translated GC enum is an `InstanceRepr` sum shell whose
+/// `__discriminant` field already contains the logical variant index.  Its
+/// Rust layout may still be niche encoded; that host layout must not decode
+/// the shell field a second time.
+#[test]
+fn gc_sum_shell_discriminant_uses_logical_tag() {
+    let enum_ty = interior_adt(0);
+    let usize_ty = interior_usize();
+    let disc_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "Isize"}}});
+    let field =
+        |ty: serde_json::Value| serde_json::json!({"name": null, "ty": ty, "attr_info": null});
+    let outcome = serde_json::json!({
+        "def_id": 0,
+        "item_meta": interior_meta(&["fixture", "Outcome"], true),
+        "kind": {"Enum": [
+            {
+                "name": "Remaining",
+                "fields": [field(usize_ty.clone())],
+                "discriminant": {"Scalar": {"Unsigned": ["U8", "0"]}}
+            },
+            {
+                "name": "Shape",
+                "fields": [field(usize_ty.clone())],
+                "discriminant": {"Scalar": {"Unsigned": ["U8", "1"]}}
+            }
+        ]},
+        "layout": [{
+            "key": "fixture-target",
+            "value": {
+                "size": 8,
+                "align": 8,
+                "discriminator": {"Branch": {
+                    "offset": {"chosen": 0},
+                    "int_ty": {"Unsigned": "U8"},
+                    "children": [[
+                        {
+                            "start": {"Unsigned": ["U8", "6"]},
+                            "end": {"Unsigned": ["U8", "6"]}
+                        },
+                        {"Known": 0}
+                    ]],
+                    "fallback": {"Known": 1}
+                }},
+                "variant_layouts": [
+                    {"field_offsets": [0]},
+                    {"field_offsets": [0]}
+                ],
+                "repr": {"transparent": false}
+            }
+        }]
+    });
+    let caller = interior_caller(
+        "outcome_discriminant",
+        1,
+        vec![enum_ty.clone()],
+        disc_ty.clone(),
+        vec![
+            interior_local(0, None, &disc_ty),
+            interior_local(1, Some("outcome"), &enum_ty),
+        ],
+        vec![interior_bb(
+            vec![interior_assign(
+                interior_place(0, &disc_ty),
+                serde_json::json!({"Discriminant": interior_place(1, &enum_ty)}),
+            )],
+            interior_return(),
+        )],
+    );
+    let llbc = llbc_with_declared_gc("fixture", vec![outcome], vec![caller], &[0]);
+    let graph = lower_interior(&llbc, "outcome_discriminant");
+    let ops = graph_ops(&graph);
+    assert_eq!(
+        ops.iter()
+            .filter(|op| matches!(
+                &op.kind,
+                OpKind::FieldRead { field, .. } if field.name == "__discriminant"
+            ))
+            .count(),
+        1,
+        "GC sum-shell discriminant is a direct instance field read; ops={ops:?}"
+    );
+    assert!(
+        !ops.iter()
+            .any(|op| matches!(&op.kind, OpKind::BinOp { .. })),
+        "GC sum-shell discriminant must not pass through the host niche decoder; ops={ops:?}"
+    );
 }
 
 /// `*self = fresh` through `&mut Self` of type `types[0]` (`def_id` 0).

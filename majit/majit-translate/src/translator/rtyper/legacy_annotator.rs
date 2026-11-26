@@ -27,8 +27,8 @@ use crate::annotator::annrpython::apply_renaming;
 use crate::annotator::bookkeeper::Bookkeeper;
 use crate::annotator::description::DescEntry;
 use crate::annotator::model::{
-    SomeInstance, SomeInteger, SomeNone, SomeObjectTrait, SomePtr, SomeTypeOf, SomeValue, s_uint,
-    r#typeof,
+    SomeInstance, SomeInteger, SomeNone, SomeObjectTrait, SomePtr, SomeString, SomeTypeOf,
+    SomeValue, s_uint, r#typeof,
 };
 use crate::codewriter::annotation_state::{somevalue_to_valuetype, valuetype_to_someshell};
 use crate::flowspace::model::{ConstValue, HostObject, Variable};
@@ -191,6 +191,7 @@ fn complete_pending_blocks(
                         .or_else(|| option_payload_const_none_incoming(result, &op.kind))
                         .or_else(|| integer_annotation_incoming(&op.kind, bookkeeper))
                         .or_else(|| binop_integer_incoming(&op.kind))
+                        .or_else(|| host_niche_string_field_incoming(&op.kind))
                         .unwrap_or(Incoming::Flat(inferred)),
                 };
                 if let Incoming::Annotation(sv) = &incoming
@@ -709,6 +710,22 @@ fn is_container_len_field(field: &crate::model::FieldDescriptor) -> bool {
         Some(VecFieldPart::Len | VecFieldPart::FatLen)
     ) || (field.name == "len"
         && matches!(field.owner_root.as_deref(), Some("IntArray" | "FloatArray")))
+}
+
+/// Host-niche `Option<Cow<str>>` FieldRead is a nullable SomeString.
+/// `binaryop.py` `is__default` folds `is_(SomeString(can_be_None=False),
+/// None)` to False, which made `has_kwarg` / `has_vararg` constant True.
+fn host_niche_string_field_incoming(kind: &OpKind) -> Option<Incoming> {
+    match kind {
+        OpKind::FieldRead {
+            field,
+            ty: ValueType::Str,
+            ..
+        } if field.vec_part == Some(VecFieldPart::HostNicheWord) => Some(Incoming::Annotation(
+            Rc::new(SomeValue::String(SomeString::new(true, false))),
+        )),
+        _ => None,
+    }
 }
 
 /// `binaryop.py` `pairtype(SomeInteger, SomeInteger)`: `or_ = xor =
@@ -2705,6 +2722,37 @@ mod tests {
 
         annotate(&graph);
         assert_eq!(read_binding(&v_var), ValueType::Int);
+    }
+
+    #[test]
+    fn host_niche_string_fieldread_is_nullable_somestring() {
+        let mut graph = FunctionGraph::new("host_niche_field");
+        let entry = graph.startblock;
+        let base_var = graph.alloc_value_var();
+        let v_var = graph
+            .push_op_var(
+                entry,
+                OpKind::FieldRead {
+                    base: base_var,
+                    field: FieldDescriptor::new("kwargname", Some("Signature".into()))
+                        .with_vec_part(VecFieldPart::HostNicheWord),
+                    ty: ValueType::Str,
+                    pure: true,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(entry, Some(v_var.clone()));
+
+        annotate(&graph);
+        assert_eq!(read_binding(&v_var), ValueType::Str);
+        match read_binding_some(&v_var).as_deref() {
+            Some(SomeValue::String(s)) => assert!(
+                s.inner.can_be_none,
+                "HostNicheWord FieldRead is SomeString(can_be_None=True), got {s:?}"
+            ),
+            other => panic!("expected nullable SomeString, got {other:?}"),
+        }
     }
 
     #[test]

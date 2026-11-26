@@ -6340,6 +6340,7 @@ impl<'a> AssemblerARM64<'a> {
         }
     }
 
+    /// aarch64/callbuilder.py `_ensure_result_bit_extension`.
     fn ensure_call_result_bit_extension(&mut self, arglocs: &[Loc]) {
         let size = Self::argloc_imm(arglocs, 1) as usize;
         let signed = Self::argloc_imm(arglocs, 2) != 0;
@@ -6356,10 +6357,12 @@ impl<'a> AssemblerARM64<'a> {
                 }
             }
             2 => {
+                // aarch64/callbuilder.py `_ensure_result_bit_extension`:
+                // unsigned size 2 is LSL+LSR, not AND.
                 if signed {
                     dynasm!(self.mc ; .arch aarch64 ; lsl x0, x0, 48 ; asr x0, x0, 48);
                 } else {
-                    dynasm!(self.mc ; .arch aarch64 ; and x0, x0, 0xFFFF);
+                    dynasm!(self.mc ; .arch aarch64 ; lsl x0, x0, 48 ; lsr x0, x0, 48);
                 }
             }
             1 => {

@@ -1896,12 +1896,15 @@ fn blackhole_level_starts(
     frame: &majit_metainterp::MIFrame,
     in_flight_callee_may_raise: bool,
 ) -> Option<Vec<usize>> {
-    let code = &frame.jitcode.code;
     blackhole_scan_root_pcs(frame)
         .into_iter()
         .map(|start| {
             let follow_callee = in_flight_callee_may_raise && start == frame.pc;
-            crate::jitcode_runtime::blackhole_resume_reachable_starts(code, start, follow_callee)
+            crate::jitcode_runtime::blackhole_resume_reachable_starts_on(
+                frame.jitcode.as_ref(),
+                start,
+                follow_callee,
+            )
         })
         .try_fold(Vec::new(), |mut all, starts| {
             all.extend(starts?);
@@ -4543,6 +4546,19 @@ fn residual_operands_are_not_all_objects<Sym: WalkSym>(
         || BIGINT_FNADDRS.contains(&addr)
 }
 
+/// A residual the walk must not invoke: the residual ABI cannot describe its
+/// signature.
+///
+/// [`pyre_interpreter::is_abi_unsound_argument_residual`] and
+/// [`pyre_interpreter::is_abi_unsound_result_residual`] name helpers published
+/// through the unsound hatches. Runtime helpers (`CallKw`, `BinaryOp`, the
+/// portal shim, `bh_*`) stay executable; their addresses are bound by the
+/// helper registry, not the unsound lists.
+fn residual_fnaddr_is_not_executable(addr: usize) -> bool {
+    pyre_interpreter::is_abi_unsound_argument_residual(addr)
+        || pyre_interpreter::is_abi_unsound_result_residual(addr)
+}
+
 /// Write the traced frame's locals region out before a residual that reads it
 /// through a live `FrameLocalsProxy`.
 ///
@@ -5483,6 +5499,40 @@ fn may_force_needs_helper_frame_resume<Sym: WalkSym>(
         && call_descr.get_extra_info().oopspecindex != majit_ir::OopSpecIndex::LibffiCall
 }
 
+/// `_match_signature` (and nested finditem) records `CALL_MAY_FORCE` in its
+/// numbered CallResult section (`pyjitpl.py` `perform_call` / `newframe`).
+fn allow_numbered_may_force_record<Sym: WalkSym>(ctx: &WalkContext<'_, '_, Sym>) -> bool {
+    ctx.session.borrow().helper_chain() == super::HelperChain::Numbered
+        && ctx.fbw_mode.allow_numbered_may_force
+}
+
+/// Whether a force of an enclosing inlined frame by this residual could not
+/// be recorded.
+///
+/// `do_residual_call` step 3 (`vrefs_after_residual_call` /
+/// `stop_tracking_virtualref`) writes a forced inline frame's folded locals
+/// before `direct_call_may_force`. Each store goes through
+/// `_nonstandard_virtualizable`, whose `implement_guard_value` resumes at the
+/// residual's own pc. A transparent helper has no such coordinate at a pc
+/// with no `-live-`. The call has run by then, so the walk refuses before it.
+fn forced_inline_callee_retire_is_unresumable<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+) -> bool {
+    if !ctx.fbw_mode.transparent_helper_subwalk {
+        return false;
+    }
+    let standard = ctx.trace_ctx.standard_virtualizable_box();
+    let folded_ancestor = inline_callee_shadow_states(ctx).iter().any(|state| {
+        state.borrow().callee_shadow.as_ref().is_some_and(|shadow| {
+            shadow.fold_frame_reg != u16::MAX
+                && shadow.frame_box != OpRef::NONE
+                && standard != Some(shadow.frame_box)
+        })
+    });
+    folded_ancestor && !super::resume_snapshot::helper_plain_guard_resumes_in_frame(ctx, op_pc)
+}
+
 /// `executor.execute_varargs` for one residual, then the caller's
 /// `record_after_execute` hook.
 ///
@@ -5541,9 +5591,10 @@ pub(crate) fn residual_call_refused_up_front<Sym: WalkSym>(
     // second half from whichever register the caller last wrote, and reading
     // that as a length dereferences an address nothing chose --- a fault
     // inside the callee, past every check this walk makes.
-    // `is_abi_unsound_argument_residual` names exactly the helpers published
-    // with such a parameter, so the descent declines before running one and
-    // the interpreter makes the call with the argument whole.
+    // `is_abi_unsound_argument_residual` / `is_abi_unsound_result_residual`
+    // name exactly the helpers published with such a parameter or result, so
+    // the descent declines before running one and the interpreter makes the
+    // call with the value whole.
     //
     // A may-force residual inside a transparent helper is recorded when its
     // post-call GUARD_NOT_FORCED / GUARD_NO_EXCEPTION number the helper
@@ -5562,6 +5613,9 @@ pub(crate) fn residual_call_refused_up_front<Sym: WalkSym>(
     // `post_call_pc` is the residual's next jitcode pc, the `-live-` the later
     // `ctx.live_after_jit_pc = op.next_pc` assigns before those guards are
     // captured; `usize::MAX` when there is none.
+    // `_match_signature` (and nested finditem) sets `allow_numbered_may_force`
+    // so a numbered CallResult section records even when the blocker-free
+    // pre-check has not yet seen the post-call `-live-`.
     if ctx.fbw_mode.inline_subwalk
         && allboxes.first().is_some_and(|b| b.is_constant())
         && let Some(majit_ir::Value::Int(addr)) = ctx.trace_ctx.box_value(allboxes[0])
@@ -5570,11 +5624,12 @@ pub(crate) fn residual_call_refused_up_front<Sym: WalkSym>(
             // `symbolic` resolves against `symbolic_fnaddr_paths` in the
             // build's jit metadata, so carry the hash for the report.
             Some(("symbolic", addr, addr))
-        } else if pyre_interpreter::is_abi_unsound_argument_residual(addr as usize) {
+        } else if residual_fnaddr_is_not_executable(addr as usize) {
             // A real funcptr reached here, so there is no hash to carry, and
             // zero is what this variant spells for that.
             Some(("abi-unsound-arg", addr, 0))
         } else if may_force_needs_helper_frame_resume(ctx, call_opcode, call_descr, addr)
+            && !allow_numbered_may_force_record(ctx)
             && !super::resume_snapshot::helper_may_force_resumes_in_frame(
                 ctx,
                 op_pc,
@@ -5583,6 +5638,10 @@ pub(crate) fn residual_call_refused_up_front<Sym: WalkSym>(
             )
         {
             Some(("may-force-in-transparent-helper", addr, 0))
+        } else if may_force_needs_helper_frame_resume(ctx, call_opcode, call_descr, addr)
+            && forced_inline_callee_retire_is_unresumable(ctx, op_pc)
+        {
+            Some(("may-force-under-folded-inline-callee", addr, 0))
         } else {
             None
         }
@@ -5771,14 +5830,14 @@ pub(crate) fn try_execute_residual_call_via_executor_inner<Sym: WalkSym>(
     // a fat-pointer parameter then reads the next register as a length and
     // memmoves from a wild address (`exception_reused_object_tb_not_doubled`
     // cranelift SIGSEGV in `try_execute_residual_call_via_executor_inner`).
-    if pyre_interpreter::is_abi_unsound_argument_residual(func_ptr as usize) {
+    if residual_fnaddr_is_not_executable(func_ptr as usize) {
         // `declined_symbolic` skips only the tracing-time invocation and
         // leaves the residual CALL in the trace. The backend then supplies
         // one word per `arg_types()` entry to a helper that expects a
-        // multiword parameter. Abort the enclosing walk the same way the
-        // inline-subwalk gate above does.
+        // multiword parameter or result. Abort the enclosing walk the same
+        // way the inline-subwalk gate above does.
         if fbw_debug_abort_enabled() {
-            eprintln!("[subwalk-unsupported] pc={op_pc} abi-unsound-arg={func_ptr:#x}");
+            eprintln!("[subwalk-unsupported] pc={op_pc} abi-unsound={func_ptr:#x}");
         }
         // A cannot-raise pure call used to return before this gate. An `Err`
         // here would abort the walk with no recorded call; keep the decline.
@@ -6846,18 +6905,41 @@ pub(crate) fn try_execute_residual_call_via_executor_inner<Sym: WalkSym>(
         // `materialize_published_callee_locals` writes).
         let vrefs_before = ctx.trace_ctx.snapshot_virtualref_boxes();
         ctx.trace_ctx.vrefs_after_residual_call();
-        record_forced_inline_locals_before_call(ctx, op_pc, &vrefs_before)?;
-        if let Some(record_call) = record_after_execute.as_mut() {
-            let rooted_ref = if call_descr.result_type() == majit_ir::Type::Ref {
-                match (residual_result_scope.as_ref(), residual_result_index) {
-                    (Some(scope), Some(index)) => Some(scope.get(index) as i64),
-                    _ => None,
+        let after_call = 'record: {
+            if let Err(err) = record_forced_inline_locals_before_call(ctx, op_pc, &vrefs_before) {
+                break 'record Err(err);
+            }
+            if let Some(record_call) = record_after_execute.as_mut() {
+                let rooted_ref = if call_descr.result_type() == majit_ir::Type::Ref {
+                    match (residual_result_scope.as_ref(), residual_result_index) {
+                        (Some(scope), Some(index)) => Some(scope.get(index) as i64),
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                let value = may_force_call_value(call_descr, exec_result, rooted_ref);
+                match record_call(ctx, value) {
+                    Ok(result) => recorded = result,
+                    Err(err) => break 'record Err(err),
                 }
-            } else {
-                None
-            };
-            let value = may_force_call_value(call_descr, exec_result, rooted_ref);
-            recorded = record_call(ctx, value)?;
+            }
+            Ok(())
+        };
+        if let Err(err) = after_call {
+            // The call has run, so `vable_after_residual_call` pairs with the
+            // stamp whatever the recording did (`pyjitpl.py do_residual_call`
+            // has no exit between the two). Leaving here with the token set
+            // fails `tracing_before_residual_call`'s TOKEN_NONE assert at the
+            // next residual.
+            if let Some(obj) = vable_obj_root.as_ref() {
+                let _ = vable_after_residual_call(**obj as usize);
+            }
+            if let Some(depth) = vable_root_depth {
+                majit_gc::shadow_stack::pop_resume_ref_roots_to(depth);
+            }
+            saved_vable_root.take();
+            return Err(err);
         }
     }
     // `vinfo.tracing_after_residual_call(virtualizable)`
@@ -9861,11 +9943,14 @@ fn try_do_residual_or_indirect_call<Sym: WalkSym>(
         // of a funcptr is `'int'`).
         return Ok(None);
     };
-    if addr == 0 || majit_jitcode::codewriter::call::is_symbolic_fnaddr(addr) {
-        // Translator-time symbolic addresses have no runtime jitcode.
-        // Same `bytecode_for_address` miss as a null key.
+    if addr == 0 {
+        // Null funcbox. Same `bytecode_for_address` miss as a null key.
         return Ok(None);
     }
+    // `pyjitpl.py do_residual_or_indirect_call`: Const funcbox →
+    // `bytecode_for_address` (ICT only). A translator symbolic hash is
+    // that graph's `getfunctionptr` when the graph is an indirect-call
+    // target; skipping it residualizes a body PyPy would `perform_call`.
     let Some(jitcode) = crate::state::bytecode_for_address(addr as usize) else {
         return Ok(None);
     };
@@ -13777,10 +13862,12 @@ fn dispatch_conditional_call_value_ir<Sym: WalkSym>(
         {
             let (result, concrete) = match dst_bank {
                 'i' => {
-                    let n = majit_metainterp::call_int_function_typed(
-                        func_addr as *const (),
+                    let n = majit_metainterp::executor::do_call_positional(
+                        descr_for_pure
+                            .as_call_descr()
+                            .expect("conditional_call_value descr is a CallDescr"),
+                        func_addr,
                         &concrete_args,
-                        &arg_types,
                     );
                     (recorded, ConcreteValue::Int(n))
                 }

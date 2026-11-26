@@ -4028,9 +4028,11 @@ pub fn make_builtin_type_with_metatype(
 /// machine Signed takes `float.__int__` (`floatobject.py descr_trunc`,
 /// `newint_from_float`).  An exact `str` takes the unicode arm
 /// (`unicode_to_decimal_w` then `_string_to_int_or_long`).  No argument, a
-/// base, a subclass `cls`, and every other argument stay on [`int_descr_new`],
-/// which is `dont_look_inside` so the `__int__` / `__index__` / `__repr__`
-/// arms are not graphs inside this one.
+/// base, a subclass `cls`, and every other argument fall through to
+/// [`int_descr_new`] (`_new_int`).  That graph is look-inside: conversion
+/// (`__int__` / `__index__` / string) is residual in
+/// [`crate::builtins::new_baseint`]'s `_new_baseint` convert helper; the
+/// subclass tail is `_as_subint`.
 pub fn __majit_wrap_int_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if args.len() == 2 && !args[1].is_null() {
         let int_type = gettypeobject(&pyre_object::INT_TYPE);
@@ -4070,30 +4072,45 @@ crate::builtin_wrapper_descriptor!(
     __majit_wrap_int_descr_new
 );
 
-/// int.__new__(cls, *args) — PyPy: intobject.py descr__new__
+/// `intobject.py` `W_IntObject.descr_new` → `_new_int`.
 ///
-/// If cls is the builtin int type, returns a plain W_IntObject.
-/// If cls is a subclass of int, returns a W_ObjectObject with the
-/// int value stored internally (for int subclasses like IntFlag).
-#[majit_macros::dont_look_inside]
+/// Look-inside like upstream `_new_int`. Conversion is
+/// [`crate::builtins::new_baseint`] (`_new_baseint`); the exact-int identity
+/// arm of that graph is traced, and `__int__` / `__index__` / string stay
+/// residual in its convert helper. The subclass tail is `_as_subint` —
+/// `space.allocate_instance(W_IntObject, w_inttype)` + `W_IntObject.__init__`
+/// (`w_int_subclass_new` + [`tag_subclass_instance`]).
 fn int_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let mut cls = new_descr_class(args, "int")?;
     // intobject.py _new_int → check_user_subclass
     let w_int = gettypeobject(&pyre_object::INT_TYPE);
     check_user_subclass(w_int, cls)?;
-    let value = pyre_object::with_roots!(cls => crate::builtins::builtin_int(&args[1..]))?;
+    if args.len() > 3 {
+        return Err(crate::PyError::type_error(format!(
+            "int expected at most 2 arguments, got {}",
+            args.len() - 1
+        )));
+    }
+    // `_new_int` calls `_new_baseint(space, w_x, w_base)` with the value
+    // objects, not a slice of the gateway args array.
+    let mut w_x = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+    let mut w_base = args.get(2).copied().unwrap_or(pyre_object::PY_NULL);
+    let value = pyre_object::with_roots!(
+        cls, w_x, w_base => crate::builtins::new_baseint(w_x, w_base)
+    )?;
     // If cls is int itself, return a plain int.
     let int_typeobj = gettypefor(&pyre_object::INT_TYPE);
     if int_typeobj.is_some_and(|t| std::ptr::eq(cls, t.as_ptr())) {
         return Ok(value);
     }
-    // cls is a subclass of int. Create a unique instance (bypassing the
+    // `_as_subint`: `space.allocate_instance(W_IntObject, w_inttype)` then
+    // `W_IntObject.__init__`. Create a unique instance (bypassing the
     // small-int cache so each has its own identity). Set w_class = cls so
     // type()/isinstance() see the subclass while preserving the underlying
     // int/long storage layout for arithmetic. A magnitude that overflows
     // i64 is a `W_LongObjectUser` (`typedef.py` `_getusercls`); like PyPy's
-    // `space.allocate_instance(W_LongObject, w_inttype)` in `intobject.py`
-    // `_new_int`, the subtype wrapper shares the immutable rbigint payload.
+    // `space.allocate_instance(W_LongObject, w_inttype)` in `_as_subint`,
+    // the subtype wrapper shares the immutable rbigint payload.
     let obj = if unsafe { pyre_object::is_long(value) } {
         unsafe {
             pyre_object::longobject::w_long_subclass_from_raw(
@@ -5793,20 +5810,26 @@ pub fn tag_subclass_instance(obj: PyObjectRef, sub: PyObjectRef) -> PyObjectRef 
     // Leaving map at zero until first attribute access makes
     // `jit.promote(self.map)` see a different word on the next iteration's
     // fresh instance (`objectobject.rs` `alloc_instance_object`).
-    let _roots = pyre_object::gc_roots::push_roots();
-    let base = _roots.pin_roots(&[obj, sub]);
-    let obj = _roots.get(base);
-    let sub = _roots.get(base + 1);
     unsafe { store_subclass_tag(obj, sub) };
-    let obj = _roots.get(base);
     if unsafe { crate::objspace::std::mapdict::has_mapdict_layout(obj) } {
         unsafe { crate::objspace::std::mapdict::ensure_mapdict_initialized(obj) };
-        let obj = _roots.get(base);
-        unsafe { crate::objspace::std::mapdict::stamp_mapdict_layout_header(obj) };
+        // Construction restamp of `W_Root.getclass`: `gettypefor(typeptr)`.
+        // `stamp_mapdict_layout_header` publishes through
+        // `notify_w_class_mutated_then` because `instance_setclass` mutates
+        // a live object's class. A fresh `allocate_instance` has no folded
+        // `w_class` read to invalidate; residualising that publish with a
+        // raw mutate-word leaves the wrap walk a null field pointer.
+        unsafe {
+            let map = crate::objspace::std::mapdict::instance_map_word(obj);
+            let current = (*obj).w_class;
+            let header = pyre_object::layout_header_class((*obj).ob_type, current, map);
+            if !std::ptr::eq(current, header) {
+                store_subclass_tag(obj, header);
+            }
+        }
     }
-    let obj = _roots.get(base);
     pyre_object::gc_hook::maybe_register_finalizer(obj);
-    _roots.get(base)
+    obj
 }
 
 /// Store `sub` into a builtin-layout instance's class slot, through the write
@@ -7095,9 +7118,11 @@ pub(crate) fn check_new_subtype(
     if std::ptr::eq(w_subtype, w_self) {
         return Ok(());
     }
-    let mro_ptr = unsafe { pyre_object::w_type_get_mro(w_subtype) };
-    let is_sub = !mro_ptr.is_null()
-        && unsafe { crate::baseobjspace::mro_contains((*mro_ptr).as_slice(), w_self) };
+    // typeobject.py `check_user_subclass`: `w_subtype.issubtype(self)`.
+    // `_pure_issubtype` residualizes the MRO scan (`w_type_issubtype`); a
+    // look-inside `in` on `mro_w` is an un-lowered slice helper and the wrap
+    // descent scan declines `__majit_wrap_int_descr_new` on it.
+    let is_sub = unsafe { crate::baseobjspace::issubtype_w(w_subtype, w_self) };
     if !is_sub {
         let self_name = unsafe { pyre_object::w_type_get_name(w_self) };
         let sub_name = unsafe { pyre_object::w_type_get_name(w_subtype) };
@@ -7599,15 +7624,15 @@ fn set_descr_init_from_peel(
         .collect();
     let signature = crate::gateway::Signature::new(vec!["self", "iterable"], None, None, 0, 2);
     let arguments =
-        crate::argument::Arguments::with_kw(&positional_w, &keyword_names_w, &keywords_w);
+        crate::argument::Arguments::with_kw(&positional_w, &keyword_names_w, &keywords_w)?;
     let defaults = [pyre_object::w_none()];
     let mut scope_w = vec![pyre_object::PY_NULL; signature.scope_length()];
     arguments.parse_into_scope(
         pyre_object::gc_roots::shadow_stack_get(set_obj_slot),
         &mut scope_w,
-        "set.__init__",
+        Wtf8::new("set.__init__"),
         &signature,
-        Some(&defaults),
+        &defaults,
         pyre_object::PY_NULL,
     )?;
     let iterable_slot = pyre_object::gc_roots::shadow_stack_len();
@@ -7654,15 +7679,15 @@ fn set_descr_init_bind(
         .collect();
     let signature = crate::gateway::Signature::new(vec!["self", "iterable"], None, None, 0, 2);
     let arguments =
-        crate::argument::Arguments::with_kw(&positional_w, &keyword_names_w, &keywords_w);
+        crate::argument::Arguments::with_kw(&positional_w, &keyword_names_w, &keywords_w)?;
     let defaults = [pyre_object::w_none()];
     let mut scope_w = vec![pyre_object::PY_NULL; signature.scope_length()];
     arguments.parse_into_scope(
         pyre_object::gc_roots::shadow_stack_get(set_obj_slot),
         &mut scope_w,
-        "set.__init__",
+        Wtf8::new("set.__init__"),
         &signature,
-        Some(&defaults),
+        &defaults,
         pyre_object::PY_NULL,
     )?;
     let iterable_slot = pyre_object::gc_roots::shadow_stack_len();
@@ -36459,7 +36484,7 @@ fn itertools_constructor_scope_from_args_kwonly(
     };
     let signature = crate::gateway::Signature::new(names, None, None, kwonlyargcount, 0);
     let arguments =
-        crate::argument::Arguments::with_kw(&positional_w, &keyword_names_w, &keywords_w);
+        crate::argument::Arguments::with_kw(&positional_w, &keyword_names_w, &keywords_w)?;
     let mut scope_w = vec![PY_NULL; signature.scope_length()];
     let mut defaults_w = vec![PY_NULL; positional_default_count];
     pyre_object::gc_roots::shadow_stack_copy_range(defaults_base, &mut defaults_w);
@@ -36470,9 +36495,9 @@ fn itertools_constructor_scope_from_args_kwonly(
     arguments.parse_into_scope(
         PY_NULL,
         &mut scope_w,
-        fn_name,
+        Wtf8::new(fn_name),
         &signature,
-        Some(&defaults_w),
+        &defaults_w,
         w_kw_defs,
     )?;
     Ok((pyre_object::gc_roots::shadow_stack_get(cls_slot), scope_w))
@@ -36543,7 +36568,7 @@ fn itertools_constructor_scope_kwonly(
         .map(|index| pyre_object::gc_roots::shadow_stack_get(positional_base + index))
         .collect();
     let arguments =
-        crate::argument::Arguments::with_kw(&positional_w, &keyword_names_w, &keywords_w);
+        crate::argument::Arguments::with_kw(&positional_w, &keyword_names_w, &keywords_w)?;
     let mut scope_w = vec![PY_NULL; signature.scope_length()];
     let mut defaults_w = vec![PY_NULL; positional_default_count];
     pyre_object::gc_roots::shadow_stack_copy_range(defaults_base, &mut defaults_w);
@@ -36554,9 +36579,9 @@ fn itertools_constructor_scope_kwonly(
     arguments.parse_into_scope(
         PY_NULL,
         &mut scope_w,
-        fn_name,
+        Wtf8::new(fn_name),
         &signature,
-        Some(&defaults_w),
+        &defaults_w,
         w_kw_defs,
     )?;
     Ok((pyre_object::gc_roots::shadow_stack_get(cls_slot), scope_w))
@@ -37699,6 +37724,7 @@ fn batched_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
     let exact_slot = pyre_object::gc_roots::publish_roots(&[exact]);
     let values_base = pyre_object::gc_roots::publish_roots(&[iterable, n_obj, strict_obj]);
     pyre_object::gc_roots::normalize_roots(cls_slot, 1 + 1 + 3);
+
     let value =
         |index: usize| unsafe { pyre_object::gc_roots::shadow_stack_get(values_base + index) };
     let n = crate::builtins::space_index_w(value(1))?;

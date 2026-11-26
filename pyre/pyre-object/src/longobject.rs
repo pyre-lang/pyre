@@ -239,10 +239,13 @@ pub fn w_long_from_raw(value: *mut BigInt) -> PyObjectRef {
 /// Subclass wrapper for a big `int` (`intobject.py` `_new_int` →
 /// `space.allocate_instance(W_LongObject, w_inttype)`). The layout is
 /// `typedef.py` `_getusercls`: `W_LongObjectUser` shares the immutable
-/// rbigint pointer and adds mapdict storage. The instance is nursery-managed
-/// so a subtype `__del__` can run; exact big ints stay on [`w_long_from_raw`].
+/// rbigint pointer and adds mapdict storage. Same
+/// `malloc_typed_managed` / `NewWithVtable` shape as
+/// [`crate::intobject::w_int_subclass_new`]. Exact big ints stay on
+/// [`w_long_from_raw`].
+#[inline(never)]
 pub fn w_long_subclass_from_raw(value: *mut BigInt) -> PyObjectRef {
-    let obj = W_LongObjectUser {
+    crate::lltype::malloc_typed_managed(W_LongObjectUser {
         base: W_LongObject {
             ob_header: PyObject {
                 ob_type: &LONG_USER_TYPE as *const PyType,
@@ -252,24 +255,7 @@ pub fn w_long_subclass_from_raw(value: *mut BigInt) -> PyObjectRef {
         },
         map: std::ptr::null(),
         storage: std::ptr::null_mut(),
-    };
-    let raw = crate::gc_hook::try_gc_alloc_nursery_raw(
-        W_LONG_USER_GC_TYPE_ID,
-        std::mem::size_of::<W_LongObjectUser>(),
-    );
-    if raw.is_null() {
-        if crate::gc_hook::gc_alloc_failed_pending() {
-            crate::PY_NULL
-        } else {
-            crate::lltype::malloc_typed(obj) as PyObjectRef
-        }
-    } else {
-        unsafe {
-            std::ptr::write(raw as *mut W_LongObjectUser, obj);
-        }
-        crate::gc_hook::try_gc_write_barrier_managed(raw);
-        raw as PyObjectRef
-    }
+    }) as PyObjectRef
 }
 
 /// Allocate a new W_LongObject on the heap from a `BigInt` value. The bigint

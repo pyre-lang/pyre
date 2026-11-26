@@ -1781,8 +1781,10 @@ impl ExecutionContext {
                     && let Some(w_firstarg) = args.firstarg()
                     && !w_firstarg.is_null()
                 {
-                    let w_type = crate::typedef::r#type(w_firstarg)
-                        .map_or(pyre_object::PY_NULL, |p| p.as_ptr());
+                    let w_type = match crate::typedef::r#type(w_firstarg) {
+                        Some(p) => p.as_ptr(),
+                        None => pyre_object::PY_NULL,
+                    };
                     w_func = crate::descr_function_get(w_func, w_firstarg, w_type);
                 }
             }
@@ -2411,8 +2413,10 @@ impl ExecutionContext {
                     operr.reload(&_callback_roots, slot);
                 }
                 let w_value = operr.normalize_exception(space)?;
-                let w_type = crate::typedef::r#type(w_value)
-                    .map_or_else(pyre_object::w_none, |p| p.as_ptr());
+                let w_type = match crate::typedef::r#type(w_value) {
+                    Some(p) => p.as_ptr(),
+                    None => pyre_object::w_none(),
+                };
                 // `operr.get_w_traceback(space)` — the slot read, its escape
                 // mark, and the `w_None` for an empty chain.  The normalization
                 // above put the same instance on the carrier, so the carrier
@@ -2432,6 +2436,7 @@ impl ExecutionContext {
 
             let frame = frame_anchor.live();
             let lineno = unsafe { (*frame).get_last_lineno() };
+            let frame = frame_anchor.live();
             let init_lineno = if unsafe { (*frame).last_instr } >= 1 {
                 lineno
             } else {
@@ -2441,6 +2446,7 @@ impl ExecutionContext {
                 let d = (*frame).getorcreatedebug(init_lineno)?;
                 !d.w_locals.is_null()
             };
+            let frame = frame_anchor.live();
             if had_locals {
                 unsafe { (*frame).fast2locals()? };
             }
@@ -2452,14 +2458,21 @@ impl ExecutionContext {
 
             // executioncontext.py:376 self.is_tracing += 1
             self.is_tracing += 1;
-            let mut call_result = (|| {
+            // A `getorcreatedebug` failure inside the call region lands in
+            // `call_result`, so it reaches the `settrace(None)` arm below.
+            let mut call_result = 'call: {
+                let frame = frame_anchor.live();
                 unsafe {
-                    let d = (*frame).getorcreatedebug(init_lineno)?;
+                    let d = match (*frame).getorcreatedebug(init_lineno) {
+                        Ok(d) => d,
+                        Err(err) => break 'call Err(err),
+                    };
                     if event == "line" {
                         d.is_in_line_tracing = true;
                     }
                     d.f_lineno = lineno;
                 }
+                let frame = frame_anchor.live();
                 // executioncontext.py — `frame = jit.hint(frame,
                 // access_directly=False)`: from here on, frame is just a
                 // normal w_object. `pin_root` of the callback is a safepoint,
@@ -2480,29 +2493,33 @@ impl ExecutionContext {
                 let _ = pyre_object::gc_roots::pin_root(pyre_object::gc_roots::shadow_stack_get(
                     arg_live_slot,
                 ));
-                let call_result = crate::call::call_function_impl_result(
+                match crate::call::call_function_impl_result(
                     pyre_object::gc_roots::shadow_stack_get(callback_slot),
                     &[
                         pyre_object::gc_roots::shadow_stack_get(frame_slot),
                         pyre_object::gc_roots::shadow_stack_get(event_slot),
                         pyre_object::gc_roots::shadow_stack_get(arg_slot),
                     ],
-                );
-                // The callback received the live frame, so its
-                // `frame.f_trace = local` / `frame.f_lineno = N` setattrs
-                // already landed on the frame's getsets — no writeback pass.
-                let w_result = call_result?;
-                let result_slot = pyre_object::gc_roots::shadow_stack_len();
-                let _ = pyre_object::gc_roots::pin_root(w_result);
-                let frame = frame_anchor.live();
-                let w_result = pyre_object::gc_roots::shadow_stack_get(result_slot);
-                if w_result != pyre_object::w_none() {
-                    unsafe {
-                        (*frame).getorcreatedebug(init_lineno)?.w_f_trace = w_result;
+                ) {
+                    Err(err) => Err(err),
+                    Ok(w_result) => {
+                        // The callback received the live frame, so its
+                        // `frame.f_trace = local` / `frame.f_lineno = N` setattrs
+                        // already landed on the frame's getsets — no writeback pass.
+                        let result_slot = pyre_object::gc_roots::shadow_stack_len();
+                        let _ = pyre_object::gc_roots::pin_root(w_result);
+                        let frame = frame_anchor.live();
+                        let w_result = pyre_object::gc_roots::shadow_stack_get(result_slot);
+                        if w_result != pyre_object::w_none() {
+                            match unsafe { (*frame).getorcreatedebug(init_lineno) } {
+                                Ok(d) => d.w_f_trace = w_result,
+                                Err(err) => break 'call Err(err),
+                            }
+                        }
+                        Ok(())
                     }
                 }
-                Ok::<(), crate::PyError>(())
-            })();
+            };
 
             if call_result.is_err() {
                 self.settrace(pyre_object::w_none());
@@ -2523,7 +2540,7 @@ impl ExecutionContext {
                     // right after `YIELD_VALUE` (still on the same source
                     // line) does not fire a spurious line event; skip the
                     // restore in that case.
-                    if event != "call" || (*frame).last_instr < 0 {
+                    if event != "call" || (*frame_anchor.live()).last_instr < 0 {
                         d.f_lineno = old_lineno;
                     }
                 }
@@ -2534,10 +2551,12 @@ impl ExecutionContext {
             // again inside finally — the callback may have installed or
             // cleared w_locals.  Re-read here instead of caching
             // `had_locals` from before the call.
+            let frame = frame_anchor.live();
             let post_had_locals = unsafe {
                 let d = (*frame).getorcreatedebug(init_lineno)?;
                 !d.w_locals.is_null()
             };
+            let frame = frame_anchor.live();
             if post_had_locals {
                 call_result = match call_result {
                     Ok(()) => {
@@ -2548,7 +2567,7 @@ impl ExecutionContext {
                         let mut error = error;
                         let held = pyre_object::gc_roots::push_roots();
                         let error_slot = error.pin(&held);
-                        unsafe { (*frame).locals2fast(false)? };
+                        unsafe { (*frame_anchor.live()).locals2fast(false)? };
                         error.reload(&held, error_slot);
                         Err(error)
                     }

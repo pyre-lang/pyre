@@ -1442,8 +1442,10 @@ struct EraseWalk<'a> {
     /// shared-suffix delta (`current_depth - max snapshot`).
     arm_exit: &'a mut HashMap<(usize, u64), (usize, usize, usize, usize)>,
     slice_set_sites: &'a mut Vec<SliceSetSite>,
-    /// Published slices whose `CopyRange` restore was dropped.
-    copy_range_slices: &'a mut Vec<usize>,
+    /// Edges after which a slice has been published.
+    published_slice_sites: &'a mut Vec<PublishedSliceSite>,
+    /// `CopyRange` restores dropped by this rewrite.
+    copy_range_sites: &'a mut Vec<CopyRangeSite>,
 }
 
 impl<'a> EraseWalk<'a> {
@@ -2711,6 +2713,10 @@ fn run_erase_walk(cx: &mut EraseWalk<'_>) -> Result<(), Refusal> {
                                 cx.bind(dest, Special::SliceBase { slice_local })?;
                             }
                             if cx.emit() {
+                                cx.published_slice_sites.push(PublishedSliceSite {
+                                    slice: slice_local,
+                                    succ: *target as usize,
+                                });
                                 stmts.push(assign_json(
                                     dest_json.clone(),
                                     json!({ "Use": [{ "Const": [{ "Integer": { "Unsigned": ["Usize", "0"] } }, dest_json["ty"].clone()] }, "Yes"] }),
@@ -2727,6 +2733,10 @@ fn run_erase_walk(cx: &mut EraseWalk<'_>) -> Result<(), Refusal> {
                                 cx.bind(dest, Special::SliceBase { slice_local })?;
                             }
                             if cx.emit() {
+                                cx.published_slice_sites.push(PublishedSliceSite {
+                                    slice: slice_local,
+                                    succ: *target as usize,
+                                });
                                 stmts.push(assign_json(
                                     dest_json.clone(),
                                     json!({ "Use": [{ "Const": [{ "Integer": { "Unsigned": ["Usize", "0"] } }, dest_json["ty"].clone()] }, "Yes"] }),
@@ -2742,6 +2752,10 @@ fn run_erase_walk(cx: &mut EraseWalk<'_>) -> Result<(), Refusal> {
                                 cx.bind(dest, Special::SliceBase { slice_local })?;
                             }
                             if cx.emit() {
+                                cx.published_slice_sites.push(PublishedSliceSite {
+                                    slice: slice_local,
+                                    succ: *target as usize,
+                                });
                                 stmts.push(assign_json(
                                     dest_json.clone(),
                                     json!({ "Use": [{ "Const": [{ "Integer": { "Unsigned": ["Usize", "0"] } }, dest_json["ty"].clone()] }, "Yes"] }),
@@ -2999,8 +3013,11 @@ fn run_erase_walk(cx: &mut EraseWalk<'_>) -> Result<(), Refusal> {
                         if !dest_is_published {
                             return Err("copy-range-dest-not-published-slice");
                         }
-                        if !cx.copy_range_slices.contains(&src.slice) {
-                            cx.copy_range_slices.push(src.slice);
+                        if cx.emit() {
+                            cx.copy_range_sites.push(CopyRangeSite {
+                                slice: src.slice,
+                                bb,
+                            });
                         }
                     }
                     Leaf::ReloadTop => {
@@ -3154,7 +3171,8 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
     let assign_counts = forward_assign_counts(body, &forward_blocks);
     let index_assign_counts = local_assign_or_call_dest_counts(body, llbc, &forward_blocks);
     let mut slice_set_sites: Vec<SliceSetSite> = Vec::new();
-    let mut copy_range_slices: Vec<usize> = Vec::new();
+    let mut published_slice_sites: Vec<PublishedSliceSite> = Vec::new();
+    let mut copy_range_sites: Vec<CopyRangeSite> = Vec::new();
     let mut stmt_assigned: HashMap<usize, usize> = HashMap::new();
     let mut call_dests = bit_set::BitSet::new();
     for (bb, block) in body.body().iter().enumerate() {
@@ -3250,7 +3268,8 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
             split_key_in: &mut split_key_in,
             arm_exit: &mut arm_exit,
             slice_set_sites: &mut slice_set_sites,
-            copy_range_slices: &mut copy_range_slices,
+            published_slice_sites: &mut published_slice_sites,
+            copy_range_sites: &mut copy_range_sites,
         };
         run_erase_walk(&mut cx)?;
     }
@@ -3322,7 +3341,8 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
             split_key_in: &mut split_key_in,
             arm_exit: &mut arm_exit,
             slice_set_sites: &mut slice_set_sites,
-            copy_range_slices: &mut copy_range_slices,
+            published_slice_sites: &mut published_slice_sites,
+            copy_range_sites: &mut copy_range_sites,
         };
         run_erase_walk(&mut cx)?;
     }
@@ -3408,9 +3428,10 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
 
     // `expand_one_pop_roots` (`shadowcolor.py`) restores livevars from the
     // saved slots. Dropping that restore leaves the same words only when
-    // every element store into the published slice is the mirror of a
-    // `shadow_stack_set`: any other store is undone by the restore.
-    if !copy_range_slices.is_empty() {
+    // every element store that can run between publication and restore is
+    // the mirror of a `shadow_stack_set`: any other such store is undone by
+    // the restore. A store before publication is already in both copies.
+    if !copy_range_sites.is_empty() {
         let (copy_src, const_of) = unique_use_origins(body, llbc, &forward_blocks);
         let mirrors: HashSet<(usize, usize)> = slice_set_sites
             .iter()
@@ -3439,10 +3460,17 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
                 };
                 let root =
                     incoming_slice_root(body, slice, arg_count, &assign_counts, &forward_blocks);
-                let published = copy_range_slices
-                    .iter()
-                    .any(|published| *published == slice || Some(*published) == root);
-                if published && !mirrors.contains(&(bb, si)) {
+                let restored_after_store = copy_range_sites.iter().any(|copy| {
+                    if copy.slice != slice && Some(copy.slice) != root {
+                        return false;
+                    }
+                    published_slice_sites.iter().any(|publish| {
+                        (publish.slice == copy.slice || Some(publish.slice) == root)
+                            && reachable_avoiding(&succs, n_blocks, publish.succ, bb, n_blocks)
+                            && reachable_avoiding(&succs, n_blocks, bb, copy.bb, n_blocks)
+                    })
+                });
+                if restored_after_store && !mirrors.contains(&(bb, si)) {
                     return Err("copy-range-after-unmirrored-store");
                 }
             }
@@ -4228,6 +4256,20 @@ struct SliceSetSite {
     slice: usize,
     offset: SliceOff,
     value_local: Option<usize>,
+}
+
+/// A published slice becomes shadow-stack-backed only after the publish
+/// call returns to `succ`. Stores that ran before that edge cannot be undone
+/// by a later `CopyRange` restore.
+struct PublishedSliceSite {
+    slice: usize,
+    succ: usize,
+}
+
+/// One `CopyRange` restore of a published slice.
+struct CopyRangeSite {
+    slice: usize,
+    bb: usize,
 }
 
 /// Unique `Use(Copy/Move(src))` and `Use(Const k)` origins of each local.
@@ -11065,6 +11107,77 @@ mod tests {
             Ok(Some(_)) => panic!("expected set-slice-unmirrored, got accepted"),
             Ok(None) => panic!("expected set-slice-unmirrored, got no bracket"),
             Err(reason) => panic!("expected set-slice-unmirrored, got {reason}"),
+        }
+    }
+
+    /// `expand_one_pop_roots` restores only writes that ran after
+    /// `push_roots` published the slice. An earlier store already belongs to
+    /// both the live slice and the later shadow-stack snapshot.
+    #[test]
+    fn erase_copy_range_ignores_stores_before_slice_publish() {
+        let file = json!({
+            "charon_version": "t",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "c",
+                "fun_decls": [
+                    null,
+                    opaque_fun(1, &["pyre_object", "gc_roots", "push_roots"], json!("Opaque")),
+                    opaque_fun(2, &["pyre_object", "gc_roots", "pin_roots"], json!("Opaque")),
+                    null,
+                    null,
+                    opaque_fun(5, &["pyre_object", "gc_roots", "shadow_stack_copy_range"], json!("Opaque"))
+                ]
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc");
+        llbc.mark_stack_sensitive_fns_complete();
+        let copy = copy_local;
+        let before_publish = body_of_args(
+            1,
+            8,
+            vec![
+                bb(call_fun(1, vec![], 2, 1)),
+                bb_stmts(
+                    vec![assign_place(
+                        index_place(1, usize_lit(0)),
+                        json!({"Use": [copy(5), "Yes"]}),
+                    )],
+                    call_fun(2, vec![copy(1)], 3, 2),
+                ),
+                bb(call_fun(5, vec![copy(3), copy(1)], 7, 3)),
+                bb(drop_local(2, 4)),
+                bb(json!("Return")),
+            ],
+        );
+        match analyze(&before_publish, &llbc) {
+            Ok(Some(_)) => {}
+            Ok(None) => panic!("expected accepted erase, got no bracket"),
+            Err(reason) => panic!("expected pre-publish store to be accepted, got {reason}"),
+        }
+
+        let after_publish = body_of_args(
+            1,
+            8,
+            vec![
+                bb(call_fun(1, vec![], 2, 1)),
+                bb(call_fun(2, vec![copy(1)], 3, 2)),
+                bb_stmts(
+                    vec![assign_place(
+                        index_place(1, usize_lit(0)),
+                        json!({"Use": [copy(5), "Yes"]}),
+                    )],
+                    call_fun(5, vec![copy(3), copy(1)], 7, 3),
+                ),
+                bb(drop_local(2, 4)),
+                bb(json!("Return")),
+            ],
+        );
+        match analyze(&after_publish, &llbc) {
+            Err("copy-range-after-unmirrored-store") => {}
+            Ok(Some(_)) => panic!("expected post-publish store refusal, got accepted"),
+            Ok(None) => panic!("expected post-publish store refusal, got no bracket"),
+            Err(reason) => panic!("expected post-publish store refusal, got {reason}"),
         }
     }
 }

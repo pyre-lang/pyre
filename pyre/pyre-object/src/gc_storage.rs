@@ -100,6 +100,31 @@ pub fn gc_alloc_young_storage_box<T: 'static>(value: T, tid: u32) -> *mut T {
     crate::lltype::malloc_raw(value)
 }
 
+/// Host fallback matching [`crate::lltype::malloc_raw`] ownership
+/// (`Box::from_raw` of `Layout::new::<T>()`). The payload is zeroed in
+/// place; `T` is not an argument.
+#[inline(always)]
+pub fn malloc_raw_zeroed<T>() -> *mut T {
+    let layout = std::alloc::Layout::new::<T>();
+    let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
+    if ptr.is_null() {
+        std::alloc::handle_alloc_error(layout);
+    }
+    ptr as *mut T
+}
+
+/// Host fallback for a managed birth that returned null. A refused
+/// managed request (`gc_alloc_failed_pending`) is not a licence for the
+/// host allocator: it aborts through `gc_alloc_failed`, like
+/// [`gc_alloc_young_storage_box`].
+#[inline(always)]
+pub fn malloc_raw_zeroed_unless_gc_failed<T>() -> *mut T {
+    if crate::gc_hook::gc_alloc_failed_pending() {
+        crate::gc_hook::gc_alloc_failed(std::mem::size_of::<T>());
+    }
+    malloc_raw_zeroed::<T>()
+}
+
 /// GC-sweep destructor for a storage box built by
 /// [`gc_alloc_storage_box::<T>`].
 ///
@@ -150,5 +175,17 @@ mod tests {
         }
 
         DROP_COUNT.with(|count| assert_eq!(count.get(), 1));
+    }
+
+    #[test]
+    fn malloc_raw_zeroed_is_box_from_raw_compatible() {
+        let storage = malloc_raw_zeroed::<u64>();
+        assert!(!storage.is_null());
+        unsafe {
+            assert_eq!(*storage, 0);
+            *storage = 7;
+            assert_eq!(*storage, 7);
+            drop(Box::from_raw(storage));
+        }
     }
 }

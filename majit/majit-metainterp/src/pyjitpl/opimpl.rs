@@ -6246,16 +6246,16 @@ where
             } else {
                 None
             };
-            // Concrete execute via `bh_call_i_dispatch` (i64
-            // return) — RPython `executor.execute_varargs` →
-            // `cpu.bh_call_i`. The null target already returned.
+            // Concrete execute via `bh_call_i_with_descr` — RPython
+            // `executor.execute_varargs` → `cpu.bh_call_i(..., descr)`.
+            // The null target already returned.
             let concrete = unsafe {
-                majit_backend::call_stub::bh_call_i_by_classes(
+                majit_backend::call_stub::bh_call_i_with_descr(
                     concrete_ptr as usize,
-                    &calldescr.arg_classes,
                     Some(&raw_i),
                     Some(&raw_r),
                     Some(&raw_f),
+                    calldescr,
                 )
             };
             if let Some(action) =
@@ -7321,12 +7321,12 @@ where
                             0
                         } else {
                             unsafe {
-                                majit_backend::call_stub::bh_call_i_by_classes(
+                                majit_backend::call_stub::bh_call_i_with_descr(
                                     concrete_ptr as usize,
-                                    &calldescr.arg_classes,
                                     Some(&raw_i),
                                     Some(&raw_r),
                                     Some(&raw_f),
+                                    calldescr,
                                 )
                             }
                         };

@@ -6365,7 +6365,8 @@ pub fn arguments_pos_and_kwargs(
 pub fn arguments_has_keywords(args: &crate::argument::Arguments) -> bool {
     args.keyword_names_w
         .as_ref()
-        .is_some_and(|names| !names.is_empty())
+        .map(|s| !s.is_empty())
+        .unwrap_or(false)
 }
 
 /// `[w_obj, ...arguments_w]` for a `PassThroughArguments1` constructor that
@@ -6470,7 +6471,9 @@ pub(crate) fn builtin_kwarg_entries(kwargs: Option<PyObjectRef>) -> Vec<(Wtf8Buf
 /// Wrap is positional. Keywords stay on `Arguments` for the `*_args`
 /// path, so `_jit_few_keywords` stays true and `unpack`'s
 /// `look_inside_iff` looks inside.
-fn arguments_from_builtin_rest(rest: &[PyObjectRef]) -> crate::argument::Arguments {
+fn arguments_from_builtin_rest(
+    rest: &[PyObjectRef],
+) -> Result<crate::argument::Arguments, crate::PyError> {
     crate::argument::Arguments::positional_only(rest)
 }
 
@@ -6745,9 +6748,16 @@ fn parse_single_required(
         .map(|index| pyre_object::gc_roots::shadow_stack_get(pos_base + index))
         .collect();
     let signature = crate::gateway::Signature::new(vec![name], None, None, 0, 0);
-    let arguments = crate::argument::Arguments::positional_only(&refreshed_pos);
+    let arguments = crate::argument::Arguments::positional_only(&refreshed_pos)?;
     let mut scope_w = vec![PY_NULL; signature.scope_length()];
-    arguments.parse_into_scope(PY_NULL, &mut scope_w, fn_name, &signature, None, PY_NULL)?;
+    arguments.parse_into_scope(
+        PY_NULL,
+        &mut scope_w,
+        Wtf8::new(fn_name),
+        &signature,
+        &[],
+        PY_NULL,
+    )?;
     Ok(scope_w[0])
 }
 
@@ -9540,7 +9550,7 @@ fn exc_os_error_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
             .map(|i| pyre_object::gc_roots::shadow_stack_get(base + i))
             .collect()
     };
-    let (positional, kwds_w) = arguments_from_builtin_rest(&rest).unpack()?;
+    let (positional, kwds_w) = arguments_from_builtin_rest(&rest)?.unpack()?;
     let w_self = pyre_object::gc_roots::shadow_stack_get(base);
     if !kwds_w.is_empty() {
         return Err(os_error_no_keywords_error(
@@ -11220,7 +11230,7 @@ macro_rules! exc_new_wrapper {
                     .map(|i| pyre_object::gc_roots::shadow_stack_get(base + i))
                     .collect()
             };
-            let (positional, _kwds_w) = arguments_from_builtin_rest(&rest).unpack()?;
+            let (positional, _kwds_w) = arguments_from_builtin_rest(&rest)?.unpack()?;
             let pn = positional.len();
             let pos_base = pyre_object::gc_roots::pin_roots(&positional);
             let cls = if n == 0 {
@@ -14174,59 +14184,82 @@ pub fn call_and_check(
     Ok(result)
 }
 
-/// intobject.py _new_baseint
+/// Gateway slice adapter for [`new_baseint`] (`intobject.py` `_new_baseint`).
+///
+/// Bound scope from `parse_obj` on `int.__new__`: `x`, `base`
+/// (`PY_NULL` omitted). intobject.py `descr_new`.
 pub fn builtin_int(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    // Bound scope from `parse_obj` on `int.__new__`: `x`, `base`
-    // (`PY_NULL` omitted). intobject.py `descr_new`.
     if args.len() > 2 {
         return Err(crate::PyError::type_error(format!(
             "int expected at most 2 arguments, got {}",
             args.len()
         )));
     }
-    let w_base = if args.len() > 1 && !args[1].is_null() {
-        Some(args[1])
-    } else {
-        None
-    };
-    let mut obj = if args.is_empty() || args[0].is_null() {
+    let w_value = args.first().copied().unwrap_or(PY_NULL);
+    let w_base = args.get(1).copied().unwrap_or(PY_NULL);
+    new_baseint(w_value, w_base)
+}
+
+/// `intobject.py` `_new_baseint(space, w_value, w_base=None)`.
+///
+/// Look-inside like upstream `_new_baseint`. The exact-int identity arm
+/// (`space.is_w(space.type(w_value), space.w_int)`) is this graph; `__int__` /
+/// `__index__` / string / buffer conversion is residual in
+/// [`_new_baseint_from_non_int`] so those Python-reaching arms stay out of
+/// `_new_int` / `_as_subint` and the wrapper that inlines them.
+pub(crate) fn new_baseint(
+    w_value: PyObjectRef,
+    w_base: PyObjectRef,
+) -> Result<PyObjectRef, crate::PyError> {
+    if w_value.is_null() {
         // intobject.py descr_new — a base without a value is a missing source.
-        if w_base.is_some() {
+        if !w_base.is_null() {
             return Err(crate::PyError::type_error("int() missing string argument"));
         }
         return Ok(w_int_new(0));
-    } else {
-        args[0]
-    };
-
-    if w_base.is_none() {
-        // intobject.py: space.is_w(space.type(w_value), space.w_int)
-        let w_type = crate::typedef::r#type(obj);
+    }
+    if w_base.is_null() {
+        // intobject.py `_new_baseint`: `space.is_w(space.type(w_value), space.w_int)`
+        let w_type = crate::typedef::r#type(w_value);
         let w_int = crate::typedef::gettypefor(&INT_TYPE);
         if w_type.is_some() && w_type == w_int {
-            return Ok(obj);
+            return Ok(w_value);
         }
-        // intobject.py:994: space.lookup(w_value, '__int__')
+    }
+    _new_baseint_from_non_int(w_value, w_base)
+}
+
+/// `__int__` / `__index__` / string / buffer arms of `_new_baseint`.
+///
+/// Moved here from `int_descr_new` (`_new_int`): that graph and `_as_subint`
+/// are look-inside; only this conversion may reach arbitrary Python.
+#[majit_macros::dont_look_inside]
+fn _new_baseint_from_non_int(
+    mut obj: PyObjectRef,
+    w_base: PyObjectRef,
+) -> Result<PyObjectRef, crate::PyError> {
+    if w_base.is_null() {
+        // intobject.py `_new_baseint`: `space.lookup(w_value, '__int__')`
         if unsafe { crate::baseobjspace::lookup(obj, "__int__") }.is_some() {
-            // intobject.py: w_intvalue = space.int(w_value)
+            // intobject.py: `w_intvalue = space.int(w_value)`
             let w_intvalue = crate::baseobjspace::space_int(obj)?;
             return ensure_baseint_result(w_intvalue);
         }
         // Python 3.14 difference: the deprecated `__trunc__` delegation in
         // this PyPy source was removed from `int()` after Python 3.11.  Our
         // language target is 3.14, so proceed directly to `__index__`.
-        // intobject.py: space.lookup(w_value, '__index__')
+        // intobject.py `_new_baseint`: `space.lookup(w_value, '__index__')`
         if unsafe { crate::baseobjspace::lookup(obj, "__index__") }.is_some() {
-            // intobject.py:1016: w_obj = space.index(w_value)
+            // intobject.py: `w_obj = space.index(w_value)`
             let w_obj = crate::baseobjspace::space_index(obj)?;
             return ensure_baseint_result(w_obj);
         }
-        // intobject.py:1047 — unicode is normalized through
+        // intobject.py `_new_baseint` unicode arm — normalized through
         // `unicode_to_decimal_w` so non-ASCII decimal digits parse.
         if unsafe { is_str(obj) } {
             return _string_to_int_or_long_unicode(obj);
         }
-        // intobject.py:1056-1070 — bytes / bytearray, then any object
+        // intobject.py `_new_baseint` bytes / bytearray, then any object
         // exposing a readable buffer (`space.charbuf_w`).
         if let Some(src) = crate::typedef::buffer_as_bytes_like(obj)? {
             let data = unsafe { pyre_object::bytesobject::bytes_like_data(src) }.to_vec();
@@ -14239,10 +14272,11 @@ pub fn builtin_int(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
         )));
     }
 
-    // intobject.py:1051-1072: w_base is not None — parse with base
-    let base = pyre_object::with_roots!(obj => getindex_w_for_base(w_base.unwrap()))?;
+    // intobject.py `_new_baseint`: `w_base` is not None — parse with base
+    let base = pyre_object::with_roots!(obj => getindex_w_for_base(w_base))?;
     unsafe {
-        // intobject.py:1079 — unicode normalized through `unicode_to_decimal_w`.
+        // intobject.py `_new_baseint` — unicode normalized through
+        // `unicode_to_decimal_w`.
         if is_str(obj) {
             let normalized = pyre_object::with_roots!(obj => unicode_to_decimal_w(obj))
                 .map_err(|_| invalid_int_literal(obj, base))?;
@@ -29779,7 +29813,7 @@ fn builtin_breakpoint_args(
     let pos_now: Vec<PyObjectRef> = (0..npos).map(|i| roots.get(pos_base + i)).collect();
     let names_now: Vec<PyObjectRef> = (0..nnames).map(|i| roots.get(names_base + i)).collect();
     let values_now: Vec<PyObjectRef> = (0..nnames).map(|i| roots.get(values_base + i)).collect();
-    let forwarded = crate::argument::Arguments::with_kw(&pos_now, &names_now, &values_now);
+    let forwarded = crate::argument::Arguments::with_kw(&pos_now, &names_now, &values_now)?;
     crate::call::call_args(roots.get(hook_slot), &forwarded)
 }
 

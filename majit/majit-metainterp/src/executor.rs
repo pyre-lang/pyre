@@ -280,10 +280,12 @@ pub fn do_getfield_raw_f(
 }
 
 /// Walker leftover of `_do_call` when there is no `MetaInterp`/`cpu`:
-/// split positional `args` by `descr.arg_types()` into I/R/F and call
-/// `bh_call_*_by_classes`. Float results use the real f64 ABI
+/// split positional `args` by `descr.arg_types()` into I/R/F. Int results
+/// go through `bh_call_i_with_descr` (`executor.py` `cpu.bh_call_i(..., descr)`
+/// / `create_call_stub` `rffi.cast(lltype.Signed, res)`). Other result
+/// classes keep `bh_call_*_by_classes`. Float results use the real f64 ABI
 /// (`executor.py` `cpu.bh_call_f`) and return packed bits.
-pub(crate) fn do_call_positional(
+pub fn do_call_positional(
     descr: &dyn majit_ir::descr::CallDescr,
     func_ptr: i64,
     args: &[i64],
@@ -314,12 +316,13 @@ pub(crate) fn do_call_positional(
     let func = func_ptr as usize;
     match descr.result_type() {
         majit_ir::Type::Int => unsafe {
-            majit_backend::call_stub::bh_call_i_by_classes(
+            let calldescr = majit_jitcode::jitcode::BhCallDescr::from_call_descr(descr);
+            majit_backend::call_stub::bh_call_i_with_descr(
                 func,
-                &arg_classes,
                 leftover_bh_args(&args_i),
                 leftover_bh_args(&args_r),
                 leftover_bh_args(&args_f),
+                &calldescr,
             )
         },
         majit_ir::Type::Ref => unsafe {
@@ -1317,6 +1320,12 @@ mod execute_pure_call_tests {
 
     extern "C" fn void_no_op(_x: i64) {}
 
+    /// Native `call_i` returns the raw register; a 1-byte unsigned descr
+    /// then zero-extends (`create_call_stub` `rffi.cast(lltype.Signed, res)`).
+    extern "C" fn dirty_u8_bits() -> i64 {
+        0xFFFFFFFFFFFFFF04u64 as i64
+    }
+
     /// An Int result with a Float parameter — the direction the Float-result
     /// work did not cover.  The return encodes BOTH arguments: a callee taking
     /// a single `f64` cannot tell a correct call from a wrong-register one,
@@ -1347,6 +1356,20 @@ mod execute_pure_call_tests {
         let descr = make_descr(vec![Type::Int], Type::Int);
         let result = execute_pure_call(&descr, double_i64 as *const () as i64, &[21]);
         assert_eq!(result, 42, "double_i64(21) must return 42");
+    }
+
+    /// `executor.py _do_call` → `cpu.bh_call_i(..., descr)` then
+    /// `create_call_stub` `rffi.cast(lltype.Signed, res)`: a 1-byte
+    /// unsigned Int descr zero-extends dirty upper bits.
+    #[test]
+    fn do_call_positional_zero_extends_one_byte_unsigned_int_result() {
+        let effect = EffectInfo {
+            extraeffect: ExtraEffect::ElidableCannotRaise,
+            ..EffectInfo::default()
+        };
+        let descr = SimpleCallDescr::new(0, Vec::new(), Type::Int, false, 1, effect);
+        let result = do_call_positional(&descr, dirty_u8_bits as *const () as i64, &[]);
+        assert_eq!(result, 4);
     }
 
     #[test]

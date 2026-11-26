@@ -6877,6 +6877,9 @@ fn class_identity_spelling_of_string_family_and_object_roots() {
         super::class_identity_spelling("pyre_object::dictmultiobject::ObjectKey", &empty),
         super::OBJECT_KEY_CLASS_ROOT
     );
+    assert!(super::is_w_root_class_root("pyobject::PyObject"));
+    assert!(super::is_w_root_class_root("PyObject"));
+    assert!(!super::is_w_root_class_root("PyObjectRef"));
     assert_eq!(
         super::class_identity_spelling("pyre_object::unicodeobject::Utf8Str", &empty),
         "unicodeobject::Utf8Str"

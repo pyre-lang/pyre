@@ -79,4 +79,8 @@ for i in range(400):
     if len(junk) > 8:
         junk.pop(0)
 
+class S(str): pass
+C = type('C', (), {S('x'): 42})
+print(C.x)
+
 print("OK")

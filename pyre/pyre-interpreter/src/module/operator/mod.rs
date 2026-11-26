@@ -214,7 +214,7 @@ fn op_call_args(args: &crate::argument::Arguments) -> Result<PyObjectRef, crate:
     let values_now: Vec<PyObjectRef> = (0..nnames)
         .map(|i| pyre_object::gc_roots::shadow_stack_get(values_base + i))
         .collect();
-    let forwarded = crate::argument::Arguments::with_kw(&rest_now, &names_now, &values_now);
+    let forwarded = crate::argument::Arguments::with_kw(&rest_now, &names_now, &values_now)?;
     crate::call::call_args(
         pyre_object::gc_roots::shadow_stack_get(call_slot),
         &forwarded,

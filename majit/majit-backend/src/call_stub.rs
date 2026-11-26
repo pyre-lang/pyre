@@ -868,6 +868,30 @@ fn reflected_result(calldescr: &BhCallDescr) -> (char, bool, usize) {
     }
 }
 
+/// `descr.py CallDescr.create_call_stub` `rffi.cast(lltype.Signed, res)`:
+/// a narrow integer result is sign- or zero-extended to a word. The native
+/// stub returns the raw 64-bit register (`mov $N, %al` leaves the upper
+/// bits dirty on x86-64).
+pub fn extend_call_i_result(
+    value: i64,
+    result_type: char,
+    result_size: usize,
+    result_signed: bool,
+) -> i64 {
+    if result_type != 'i' {
+        return value;
+    }
+    match (result_size, result_signed) {
+        (1, true) => value as i8 as i64,
+        (1, false) => value as u8 as i64,
+        (2, true) => value as i16 as i64,
+        (2, false) => value as u16 as i64,
+        (4, true) => value as i32 as i64,
+        (4, false) => value as u32 as i64,
+        _ => value,
+    }
+}
+
 fn call_stub_for(calldescr: &BhCallDescr) -> &BhCallStub {
     calldescr
         .call_stub
@@ -897,10 +921,12 @@ pub unsafe fn bh_call_i_with_descr(
             result_signed,
             result_size,
         ) {
-            return result;
+            return extend_call_i_result(result, result_type, result_size, result_signed);
         }
     }
-    unsafe { call_stub_for(calldescr).call_i(func, args_i, args_r, args_f) }
+    let raw = unsafe { call_stub_for(calldescr).call_i(func, args_i, args_r, args_f) };
+    let (result_type, result_signed, result_size) = reflected_result(calldescr);
+    extend_call_i_result(raw, result_type, result_size, result_signed)
 }
 
 /// `llmodel.py AbstractLLCPU.bh_call_f` parallel of [`bh_call_i_with_descr`].
@@ -1489,6 +1515,51 @@ mod tests {
         assert!(!call_stub_arm_exists(
             &[ArgClass::Int; MAX_HOST_CALL_ARITY + 1]
         ));
+    }
+
+    /// `descr.py create_call_stub` `rffi.cast(lltype.Signed, res)`: a
+    /// dirty 64-bit register is sign- or zero-extended to the descr width.
+    #[test]
+    fn extend_call_i_result_masks_dirty_upper_bits() {
+        let dirty_u8 = 0xFFFFFFFFFFFFFF04u64 as i64;
+        assert_eq!(extend_call_i_result(dirty_u8, 'i', 1, false), 4);
+        assert_eq!(extend_call_i_result(0xFF, 'i', 1, true), -1);
+        assert_eq!(extend_call_i_result(0xFFFFFFFE, 'i', 4, false), 0xFFFFFFFE);
+        assert_eq!(extend_call_i_result(0xFFFFFFFE, 'i', 4, true), -2);
+        assert_eq!(extend_call_i_result(dirty_u8, 'r', 1, false), dirty_u8);
+        assert_eq!(extend_call_i_result(dirty_u8, 'i', 8, false), dirty_u8);
+    }
+
+    /// Native `call_i` returns the raw register; the stub then zero-extends
+    /// a 1-byte unsigned descr (`create_call_stub`).
+    #[test]
+    fn call_stub_zero_extends_narrow_unsigned_result() {
+        let _hook_test = hold_hook_test_lock();
+        extern "C" fn dirty_u8_bits() -> i64 {
+            0xFFFFFFFFFFFFFF04u64 as i64
+        }
+        let mut descr = BhCallDescr::from_signature(
+            String::new(),
+            majit_ir::value::Type::Int,
+            majit_ir::descr::EffectInfo::MOST_GENERAL,
+        );
+        descr.result_size = 1;
+        descr.result_signed = false;
+        descr.result_erased = majit_jitcode::jitcode::CallResultErasedKey::from_ir_layout(
+            majit_ir::value::Type::Int,
+            false,
+            1,
+        );
+        let got = unsafe {
+            bh_call_i_with_descr(
+                dirty_u8_bits as *const () as usize,
+                None,
+                None,
+                None,
+                &descr,
+            )
+        };
+        assert_eq!(got, 4);
     }
 
     /// The installed hook runs before stub lookup and its `Some` result is the call's result.
