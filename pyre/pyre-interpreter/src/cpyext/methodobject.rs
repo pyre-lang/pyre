@@ -818,7 +818,7 @@ pub(super) fn forget_block(raw: *mut CPyObject) {
     // type decides it rather than the size, as it does for a slice mirror: a
     // C-defined type whose own storage reaches this far fills and frees these
     // words itself.
-    let carrier = |cell| pyobject::as_pyobj(built_carrier_type(cell)) as usize;
+    let carrier = |cell| pyobject::as_pyobj_existing(built_carrier_type(cell)) as usize;
     let function = carrier(&PYCFUNCTION_TYPE_OBJ);
     let method = carrier(&PYCMETHOD_TYPE_OBJ);
     if tp == 0 || (tp != function && tp != method) {
@@ -850,7 +850,11 @@ pub(super) fn forget_block(raw: *mut CPyObject) {
 /// `m_self` as an outside reference keeps its receiver alive for an extra
 /// collection, which is observable for `_cffi_backend.FFI` and its type cache.
 pub(super) fn mirror_edges(edges: &mut Vec<(usize, Vec<usize>)>) {
-    let carrier = |cell| pyobject::as_pyobj(built_carrier_type(cell)) as usize;
+    // `c_edges` holds the collector. `as_pyobj` would `create_ref` the
+    // carrier types and allocate their `tp_mro` tuples
+    // (`describe_interpreter_type`). incminimark.py
+    // `rrc_minor_collection_trace` only walks mirrors that already exist.
+    let carrier = |cell| pyobject::as_pyobj_existing(built_carrier_type(cell)) as usize;
     let function = carrier(&PYCFUNCTION_TYPE_OBJ);
     let method = carrier(&PYCMETHOD_TYPE_OBJ);
     if function == 0 && method == 0 {

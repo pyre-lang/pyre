@@ -2519,7 +2519,11 @@ pub(crate) fn declared_type_layout(
         // The mirror as it stands, never a synthesized one: a type that has
         // not crossed into C declares nothing, and minting a block for it
         // here would answer with the very numbers being asked for.
-        let tp = pyobject::as_pyobj(w_current) as *mut CPyTypeObject;
+        // pyobject.py `create_ref` allocates; incminimark.py
+        // `rrc_minor_collection_trace` walks existing P-list mirrors only.
+        // `as_pyobj` would `create_ref` a miss and mint `tp_mro` tuples
+        // (`describe_interpreter_type`) while `c_edges` holds the collector.
+        let tp = pyobject::as_pyobj_existing(w_current) as *mut CPyTypeObject;
         // A mirror this layer filled describes a type pyre defines, so its
         // fields are what [`describe_interpreter_type`] synthesized rather
         // than a declaration. `TYPE_NAMES` holds the finished ones. A block

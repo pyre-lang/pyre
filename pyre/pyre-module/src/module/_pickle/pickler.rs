@@ -114,7 +114,7 @@ pub struct W_Pickler {
 /// objects, so the memo cannot key on a raw address: the memoized objects
 /// live in a pinned Python `list` (`memo_slot`) which the GC walks, so the
 /// stored references follow every move, and `index` maps the move-stable
-/// `gc_identity_hash` to the list positions sharing that hash, resolved by
+/// `gc_id` to the list positions sharing that hash, resolved by
 /// pointer identity against a freshly-read list element.  The memo index
 /// (the PUT/GET argument) is the object's position in that list.
 ///
@@ -131,7 +131,7 @@ struct PickleCtx {
     /// Shadow-stack slot of the memo `list`; re-read on every access so a
     /// relocation of the list itself is observed.
     memo_slot: usize,
-    /// `gc_identity_hash(obj)` → memo indices sharing that hash.
+    /// `gc_id(obj)` → memo indices sharing that hash.
     index: HashMap<usize, Vec<usize>>,
     /// `str_memo` / `bytes_memo` (interp_pickle.py): value-keyed memos for the
     /// exact `str` and `bytes` types, consulted before the identity memo.  An
@@ -152,7 +152,7 @@ struct PickleCtx {
     fast: bool,
     /// Nested-container depth, for the fast-mode cyclic guard.
     fast_nesting: i64,
-    /// `gc_identity_hash` → shadow-stack slots of the containers on the active
+    /// `gc_id` → shadow-stack slots of the containers on the active
     /// save path sharing that hash, populated only past `FAST_NESTING_LIMIT`.
     /// A repeat — resolved by pointer identity against the pinned ancestors,
     /// like `memo_get`, since a shared hash is not move-stable-unique — means a
@@ -212,9 +212,8 @@ impl PickleCtx {
         let _roots = pyre_object::gc_roots::push_roots();
         let obj_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(w_obj);
-        let h = pyre_object::gc_hook::gc_identity_hash(pyre_object::gc_roots::shadow_stack_get(
-            obj_slot,
-        ) as usize);
+        let h =
+            pyre_object::gc_hook::gc_id(pyre_object::gc_roots::shadow_stack_get(obj_slot) as usize);
         let list = self.memo_list();
         let list_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(list);
@@ -1184,7 +1183,7 @@ fn pickle_core_impl(
         }
         pyre_object::gc_roots::shadow_stack_set(o_slot, o);
         index
-            .entry(pyre_object::gc_hook::gc_identity_hash(
+            .entry(pyre_object::gc_hook::gc_id(
                 pyre_object::gc_roots::shadow_stack_get(o_slot) as usize,
             ))
             .or_default()
@@ -1256,7 +1255,7 @@ const FAST_NESTING_LIMIT: i64 = 50;
 /// / `save_set`) call this, so a reducer that re-enters the same custom object
 /// keeps the normal recursion behaviour (a `RecursionError`) rather than being
 /// misreported as a fast-mode container cycle. `obj_slot` is the container's
-/// pinned shadow-stack slot; a shared `gc_identity_hash` is disambiguated by
+/// pinned shadow-stack slot; a shared `gc_id` is disambiguated by
 /// pointer identity against the pinned ancestors, like `memo_get`. Returns the
 /// bucket key to hand back to `fast_save_leave`, or `None` when nothing was
 /// tracked.
@@ -1268,9 +1267,7 @@ fn fast_save_enter(ctx: &mut PickleCtx, obj_slot: usize) -> Result<Option<usize>
     if ctx.fast_nesting < FAST_NESTING_LIMIT {
         return Ok(None);
     }
-    let h = pyre_object::gc_hook::gc_identity_hash(
-        pyre_object::gc_roots::shadow_stack_get(obj_slot) as usize,
-    );
+    let h = pyre_object::gc_hook::gc_id(pyre_object::gc_roots::shadow_stack_get(obj_slot) as usize);
     let is_cycle = ctx.fast_memo.get(&h).is_some_and(|slots| {
         slots.iter().any(|&anc| {
             pyre_object::gc_roots::shadow_stack_get(anc)
@@ -2847,9 +2844,7 @@ fn memoize(ctx: &mut PickleCtx, buf: &mut Framer, w_obj: PyObjectRef) {
     };
     // Compute the move-stable hash before the append, whose growth could
     // relocate `w_obj` and leave the local stale.
-    let h = pyre_object::gc_hook::gc_identity_hash(
-        pyre_object::gc_roots::shadow_stack_get(obj_slot) as usize,
-    );
+    let h = pyre_object::gc_hook::gc_id(pyre_object::gc_roots::shadow_stack_get(obj_slot) as usize);
     let value_key = PickleCtx::value_memo_key(pyre_object::gc_roots::shadow_stack_get(obj_slot));
     unsafe {
         pyre_object::listobject::w_list_append(

@@ -56,7 +56,7 @@ pub(crate) extern "C" fn normalize_raise_varargs_jit(
         pyre_interpreter::call::set_last_exec_ctx(frame_ctx);
     }
 
-    let cause = if raw_cause.is_null() {
+    let mut cause = if raw_cause.is_null() {
         None
     } else {
         // pyopcode.py:706-707 — cause class-call must mirror the exc
@@ -89,10 +89,18 @@ pub(crate) extern "C" fn normalize_raise_varargs_jit(
                 raise_exception_jit(err as i64);
                 return err;
             }
+            let roots = pyre_object::gc_roots::push_roots();
+            let exc_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = roots.pin_root(exc);
+            let cause_pins = cause.as_mut().map(|c| c.pin(&roots));
             let result = {
                 let _plain_guard = pyre_interpreter::call::force_plain_eval();
-                pyre_interpreter::call::call_function_impl_result(exc, &[])
+                pyre_interpreter::call::call_function_impl_result(roots.get(exc_slot), &[])
             };
+            let exc = roots.get(exc_slot);
+            if let (Some(c), Some(pins)) = (cause.as_mut(), cause_pins) {
+                c.reload(&roots, pins);
+            }
             match result {
                 Ok(obj) if pyre_object::is_exception(obj) => obj,
                 Ok(obj) => pyre_interpreter::error::exception_from_call_type_error(exc, obj)

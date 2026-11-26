@@ -19088,6 +19088,7 @@ fn effect_transduce_op(
             );
         }
         name @ ("gc_id"
+        | "gc_identityhash"
         | "gc_fq_register"
         | "debug_assert"
         | "gc_writebarrier"
@@ -19100,8 +19101,8 @@ fn effect_transduce_op(
             // `canraise.py RaiseAnalyzer.analyze_simple_operation` /
             // `collectanalyze.py CollectAnalyzer.analyze_simple_operation`
             // consult `LL_OPERATIONS[op.opname]`.
-            // `gc_id`: `LLOp(sideeffects=False, canmallocgc=True)` so
-            // `canraise=(MemoryError,)`.
+            // `gc_id` / `gc_identityhash`: `LLOp(sideeffects=False, canmallocgc=True)`
+            // so `canraise=(MemoryError,)`.
             // `gc_fq_register`: `LLOp()` so `canraise=()`.
             // `debug_assert`: `LLOp(tryfold=True)` so `canraise=()`.
             // `gc_writebarrier`: `LLOp(canrun=True)` so `canraise=()`.
@@ -34700,6 +34701,57 @@ mod tests {
         assert_eq!(
             cc._canraise(
                 &CallTarget::function_path(["gid"]),
+                &mut AnalysisCache::default()
+            ),
+            CanRaise::MemoryErrorOnly
+        );
+        assert!(cc.analyze_can_raise_impl(
+            &path,
+            &mut CallTracker::new(),
+            &mut new_analyzed_calls(),
+            false
+        ));
+        assert!(!cc.analyze_can_raise_impl(
+            &path,
+            &mut CallTracker::new(),
+            &mut new_analyzed_calls(),
+            true
+        ));
+    }
+
+    /// `canraise.py analyze_simple_operation`: `gc_identityhash` is
+    /// `canmallocgc` so `canraise=(MemoryError,)`; `do_ignore_memory_error`
+    /// suppresses it.
+    #[test]
+    fn effect_graph_gc_identityhash_raises_only_memoryerror() {
+        use crate::translator::rtyper::lltypesystem::lltype::{GCREF, LowLevelType};
+        use crate::translator::rtyper::rtyper::variable_with_lltype;
+        let ptr = variable_with_lltype("p", GCREF.clone());
+        let result = variable_with_lltype("h", LowLevelType::Signed);
+        let graph = rtyped_one_op(
+            "gih",
+            "gc_identityhash",
+            vec![crate::flowspace::model::Hlvalue::Variable(ptr)],
+            result,
+        );
+        let converted = effect_graph_from_rtyped_helper(&graph);
+        assert!(
+            converted.iter_block_ops().any(|(_, op)| matches!(
+                &op.kind,
+                OpKind::LoweredBlackholeOp { opname, .. } if opname == "gc_identityhash"
+            )),
+            "gc_identityhash stays a simple llop: {:?}",
+            converted
+                .iter_block_ops()
+                .map(|(_, op)| format!("{:?}", op.kind))
+                .collect::<Vec<_>>()
+        );
+        let mut cc = CallControl::new();
+        let path = CallPath::from_segments(["gih"]);
+        cc.register_function_graph(path.clone(), converted);
+        assert_eq!(
+            cc._canraise(
+                &CallTarget::function_path(["gih"]),
                 &mut AnalysisCache::default()
             ),
             CanRaise::MemoryErrorOnly

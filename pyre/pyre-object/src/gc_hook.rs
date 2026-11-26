@@ -1062,7 +1062,7 @@ pub fn try_gc_current_object_address(addr: GCREF) -> GCREF {
     majit_gc::gc_current_object_address(addr as usize) as GCREF
 }
 
-/// minimark.py `identityhash` hook.
+/// MiniMark `id_or_identityhash` hook.
 /// Returns a GC-move-stable address for the given object.
 pub type GcIdentityHashHookFn = fn(obj_addr: usize) -> usize;
 
@@ -1076,19 +1076,47 @@ pub fn clear_gc_identity_hash_hook() {
     GC_IDENTITY_HASH_HOOK.set(None);
 }
 
-/// Return a stable identity hash for `obj_addr`.  When the hook is
-/// installed, nursery objects get a shadow-based stable address;
-/// old-gen objects return their own address.  When no hook is
-/// installed, returns `obj_addr` unchanged (pre-GC fallback).
-// `dont_look_inside`: host hook dispatch (a process-global
-// atomic fn-pointer cell) stays opaque to the JIT — the `try_gc_add_root` twin;
-// calls residualize via the registered fnaddr (`rlib/jit.py`).
-#[majit_macros::dont_look_inside]
-pub fn gc_identity_hash(obj_addr: usize) -> usize {
+/// MiniMark `id_or_identityhash`. When the hook is installed, nursery
+/// objects get a shadow-based stable address; old-gen objects return
+/// their own address. When no hook is installed, returns `obj_addr`
+/// unchanged (pre-GC fallback).
+#[inline(always)]
+fn id_or_identityhash(obj_addr: usize) -> usize {
     match GC_IDENTITY_HASH_HOOK.get() {
         Some(f) => f(obj_addr),
         None => obj_addr,
     }
+}
+
+/// MiniMark `id`. `objectmodel.compute_unique_id` / `llop.gc_id`.
+// `dont_look_inside`: host hook dispatch (a process-global
+// atomic fn-pointer cell) stays opaque to the JIT — the `try_gc_add_root` twin;
+// calls residualize via the registered fnaddr (`rlib/jit.py`).
+#[inline]
+#[majit_macros::dont_look_inside]
+pub fn gc_id(obj_addr: usize) -> usize {
+    id_or_identityhash(obj_addr)
+}
+
+/// MiniMark `identityhash`. `objectmodel.compute_identity_hash` /
+/// `lltype.identityhash`.
+// `dont_look_inside`: host hook dispatch, as for [`gc_id`].
+#[inline]
+#[majit_macros::dont_look_inside]
+pub fn gc_identityhash(obj_addr: usize) -> usize {
+    majit_gc::mangle_hash(id_or_identityhash(obj_addr) as isize) as usize
+}
+
+/// `support.py` `_ll_1_gc_identityhash`. `@elidable`; body is
+/// `lltype.identityhash`, MiniMark `identityhash`.
+pub extern "C" fn _ll_1_gc_identityhash(x: i64) -> i64 {
+    gc_identityhash(x as usize) as i64
+}
+
+/// `support.py` `_ll_1_gc_id`. Not `@elidable` (`id(const)` must not
+/// fold). Body is `llop.gc_id`, MiniMark `id`.
+pub extern "C" fn _ll_1_gc_id(ptr: i64) -> i64 {
+    gc_id(ptr as usize) as i64
 }
 
 /// Signature of the host-side write barrier callback. `obj` is the
@@ -1537,11 +1565,15 @@ mod tests {
         use std::sync::atomic::{AtomicBool, Ordering};
         let _hook_lock = hook_test_guard();
         static PENDING: AtomicBool = AtomicBool::new(false);
+        // `exc_data` belongs to the thread that raised: a parallel test's
+        // allocation must not read this test's pending MemoryError.
         fn raise() {
-            PENDING.store(true, Ordering::SeqCst);
+            if hook_test_owner::hook_test_effects_visible() {
+                PENDING.store(true, Ordering::SeqCst);
+            }
         }
         fn occurred() -> bool {
-            PENDING.load(Ordering::SeqCst)
+            hook_test_owner::hook_test_effects_visible() && PENDING.load(Ordering::SeqCst)
         }
         PENDING.store(false, Ordering::SeqCst);
         majit_gc::set_active_raise_memory_error(Some(raise));
@@ -1778,5 +1810,20 @@ mod tests {
         clear_gc_write_barrier_hook();
         clear_gc_owns_object_hook();
         assert!(!try_gc_write_barrier_from_array(obj, 3));
+    }
+
+    #[test]
+    fn gc_identityhash_is_mangle_of_gc_id() {
+        let addr = 0x1234_0000i64;
+        assert_eq!(_ll_1_gc_id(addr), gc_id(addr as usize) as i64);
+        assert_eq!(
+            _ll_1_gc_identityhash(addr),
+            gc_identityhash(addr as usize) as i64
+        );
+        assert_eq!(
+            _ll_1_gc_identityhash(addr),
+            majit_gc::mangle_hash(_ll_1_gc_id(addr) as isize) as i64
+        );
+        assert_ne!(_ll_1_gc_identityhash(addr), _ll_1_gc_id(addr));
     }
 }

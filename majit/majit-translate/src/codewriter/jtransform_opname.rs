@@ -1037,23 +1037,23 @@ fn transduce_op(
                 out.push_op_with_result_var(block, OpKind::New { owner }, result);
             }
         }
-        // `jtransform.py rewrite_op_gc_identityhash = _do_builtin_call`:
-        // hand the one-reference `UnaryOp` to the shared `Transformer`,
-        // which emits `direct_call(_ll_1_gc_identityhash, x)` (`support.py`).
+        // `jtransform.py rewrite_op_gc_identityhash = _do_builtin_call`.
+        // `Transformer._do_builtin_call` matches this `LoweredBlackholeOp`
+        // and emits `direct_call(_ll_1_gc_identityhash, x)` (`support.py`).
         "gc_identityhash" => {
             assert_eq!(
                 op.args.len(),
                 1,
                 "jtransform_opname::lower_graph: gc_identityhash takes one argument"
             );
-            let operand = materialize(out, block, &op.args[0]);
+            let args =
+                crate::model::call_args(op.args.iter().map(|arg| materialize(out, block, arg)));
             let result = expect_var(&op.result);
             out.push_op_with_result_var(
                 block,
-                OpKind::UnaryOp {
-                    op: "gc_identityhash".to_string(),
-                    operand,
-                    result_ty: value_type_of(&result),
+                OpKind::LoweredBlackholeOp {
+                    opname: "gc_identityhash".to_string(),
+                    args,
                 },
                 result,
             );
@@ -8060,10 +8060,11 @@ mod tests {
         ));
         close_return(&start, &graph, h);
         match startblock_kinds(&graph).as_slice() {
-            [OpKind::UnaryOp { op, .. }] => {
-                assert_eq!(op, "gc_identityhash");
+            [OpKind::LoweredBlackholeOp { opname, args }] => {
+                assert_eq!(opname, "gc_identityhash");
+                assert_eq!(args.len(), 1);
             }
-            other => panic!("gc_identityhash → UnaryOp, got {other:?}"),
+            other => panic!("gc_identityhash → LoweredBlackholeOp, got {other:?}"),
         }
     }
 

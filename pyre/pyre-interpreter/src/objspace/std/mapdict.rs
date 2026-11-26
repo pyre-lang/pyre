@@ -100,16 +100,17 @@ fn instance_lock(obj: PyObjectRef) -> (MapDictGuard, PyObjectRef) {
         let w_class = unsafe { instance_getclass(obj) };
         pyre_object::gc_roots::shadow_stack_set(class_slot, w_class);
         // Hash before the wait: the pre-wait pointer may be stale afterwards.
-        let class_key = pyre_object::objlock::stripes_taken().then(|| {
-            pyre_object::gc_hook::gc_identity_hash(pyre_object::gc_roots::shadow_stack_get(
-                class_slot,
-            ) as usize)
-        });
+        let class_key =
+            pyre_object::objlock::stripes_taken().then(|| {
+                pyre_object::gc_hook::gc_id(
+                    pyre_object::gc_roots::shadow_stack_get(class_slot) as usize
+                )
+            });
         let guard = lock_class_stripe(pyre_object::gc_roots::shadow_stack_get(class_slot));
         obj = pyre_object::gc_roots::shadow_stack_get(slot);
         let w_class_now = unsafe { instance_getclass(obj) };
         let same_class = match class_key {
-            Some(k) => pyre_object::gc_hook::gc_identity_hash(w_class_now as usize) == k,
+            Some(k) => pyre_object::gc_hook::gc_id(w_class_now as usize) == k,
             None => w_class_now == pyre_object::gc_roots::shadow_stack_get(class_slot),
         };
         if same_class {

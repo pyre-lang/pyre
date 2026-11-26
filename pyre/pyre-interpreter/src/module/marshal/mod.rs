@@ -151,7 +151,7 @@ fn marshal_buffer_bytes(obj: PyObjectRef) -> Result<Option<Vec<u8>>, PyError> {
 /// forwards; `by_identity` reproduces the O(1) lookup of the RPython dict.
 struct WriterRefs {
     entries: Vec<WriterRefEntry>,
-    /// `gc_identity_hash` survives a move while a raw address does not, so it
+    /// `gc_id` survives a move while a raw address does not, so it
     /// keys the buckets; the entry inside a bucket is confirmed against the
     /// forwarded shadow-stack address.
     by_identity: std::collections::HashMap<usize, Vec<u32>>,
@@ -179,11 +179,9 @@ impl WriterRefs {
             pyre_object::gc_roots::shadow_stack_get(obj_slot) as pyre_object::gc_hook::GCREF,
         ) as PyObjectRef;
         pyre_object::gc_roots::shadow_stack_set(obj_slot, obj);
-        let bucket = self
-            .by_identity
-            .get(&pyre_object::gc_hook::gc_identity_hash(
-                pyre_object::gc_roots::shadow_stack_get(obj_slot) as usize,
-            ))?;
+        let bucket = self.by_identity.get(&pyre_object::gc_hook::gc_id(
+            pyre_object::gc_roots::shadow_stack_get(obj_slot) as usize,
+        ))?;
         bucket
             .iter()
             .copied()
@@ -203,9 +201,8 @@ impl WriterRefs {
         let index = self.entries.len() as u32;
         let slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(obj);
-        let identity = pyre_object::gc_hook::gc_identity_hash(
-            pyre_object::gc_roots::shadow_stack_get(slot) as usize,
-        );
+        let identity =
+            pyre_object::gc_hook::gc_id(pyre_object::gc_roots::shadow_stack_get(slot) as usize);
         self.entries.push(WriterRefEntry { slot, incomplete });
         self.by_identity.entry(identity).or_default().push(index);
         Ok(index)

@@ -19269,16 +19269,32 @@ pub(crate) fn try_walker_lower_exc_info_residual<Sym: WalkSym>(
         Some(ConcreteValue::Null) | None => std::ptr::null_mut(),
         _ => return Ok(None),
     };
-    let (store_op, store_concrete) =
-        if runtime_helper == majit_ir::RuntimeHelperKind::RestoreExcInfo {
-            // `pyframe.py _restore_exc_info` → `set_sys_exc_info3`: the saved
-            // prev goes back verbatim; `None` clears.
-            walker_restore_exc_info_operand(ctx, op.pc, r_args[0], exc_concrete)?
-        } else {
-            // `pyopcode.py PUSH_EXC_INFO` publishes the exception it popped
-            // (`ec.set_sys_exc_info`).
-            (r_args[0], exc_concrete)
-        };
+    // `walker_restore_exc_info_operand` records PtrEq and a fold guard
+    // (`walker_emit_fold_guard_with_snapshot`); `record_guard` appends to
+    // `Trace._ops` and `_double_ops` can minor-collect (`history.py`).
+    // `exc_concrete` is a native copy of `concrete_registers_r`, so pin it
+    // and reload after those calls, as `framework.py` `push_roots` /
+    // `pop_roots` reloads the livevar. Using the pre-guard copy wrote a
+    // forwarded nursery object into the live `sys_exc_value` and
+    // `try_walker_specialize_sys_exc_info` then declined "direct EC
+    // exception slot is not an exception".
+    let _exc_roots = pyre_object::gc_roots::push_roots();
+    let exc_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(exc_concrete);
+    let (store_op, _) = if runtime_helper == majit_ir::RuntimeHelperKind::RestoreExcInfo {
+        // `pyframe.py _restore_exc_info` → `set_sys_exc_info3`: the saved
+        // prev goes back verbatim; `None` clears.
+        walker_restore_exc_info_operand(
+            ctx,
+            op.pc,
+            r_args[0],
+            pyre_object::gc_roots::shadow_stack_get(exc_slot),
+        )?
+    } else {
+        // `pyopcode.py PUSH_EXC_INFO` publishes the exception it popped
+        // (`ec.set_sys_exc_info`).
+        (r_args[0], pyre_object::gc_roots::shadow_stack_get(exc_slot))
+    };
     ctx.trace_ctx.record_op_with_descr(
         OpCode::SetfieldGc,
         &[ec, store_op],
@@ -19294,6 +19310,15 @@ pub(crate) fn try_walker_lower_exc_info_residual<Sym: WalkSym>(
     // aborts the walk before its POP_EXCEPT restore, leaking the caught
     // exception into the next frame's `sys_exc_value`.
     fbw_sys_exc_journal_push(pyre_interpreter::eval::get_current_exception());
+    let live = pyre_object::gc_roots::shadow_stack_get(exc_slot);
+    let store_concrete = if runtime_helper == majit_ir::RuntimeHelperKind::RestoreExcInfo
+        && !live.is_null()
+        && unsafe { pyre_object::is_none(live) }
+    {
+        pyre_object::PY_NULL
+    } else {
+        live
+    };
     pyre_interpreter::eval::set_current_exception(store_concrete);
     ctx.frame_state.borrow_mut().current_exception_seed = Some(store_op);
     ctx.frame_state.borrow_mut().current_exception_seed_concrete = store_concrete;
@@ -19502,7 +19527,7 @@ fn try_walker_orthodox_list_setitem<Sym: WalkSym>(
         }
     }
 
-    let (Some(list_obj), Some(value_obj)) = (
+    let (Some(_), Some(_)) = (
         walker_concrete_ref_object(ctx, list_op),
         walker_concrete_ref_object(ctx, value_op),
     ) else {
@@ -19512,10 +19537,11 @@ fn try_walker_orthodox_list_setitem<Sym: WalkSym>(
         return Ok(None);
     };
     fbw_bump_executed_effect("store_journal");
-    // Overwrite is idempotent: a residual the sub-walk already executed
-    // wrote this same value.
-    let stored = unsafe { pyre_object::w_list_setitem(list_obj, index, value_obj) };
-    debug_assert!(stored, "orthodox list setitem: in-bounds store failed");
+    // `execute_and_record` runs `executor.execute` then `_record_helper`.
+    // The lowered `list.{int,float,obj}_setitem` (`do_resizable_list_setitem`)
+    // is `setarrayitem_gc_via_heapcache` → `walker_execute_setarrayitem_gc`;
+    // a store that cannot run is `walker_gc_store_not_executed`, which
+    // declines the helper (`inline_subwalk`) instead of `SubReturn`.
     Ok(Some(()))
 }
 

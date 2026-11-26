@@ -4311,7 +4311,7 @@ struct ExceptionPrintContext {
 impl ExceptionPrintContext {
     fn new(exc: PyObjectRef) -> Self {
         let mut seen = HashSet::new();
-        seen.insert(pyre_object::gc_hook::gc_identity_hash(exc as usize));
+        seen.insert(pyre_object::gc_hook::gc_id(exc as usize));
         Self {
             seen,
             exception_group_depth: 0,
@@ -4394,7 +4394,7 @@ fn pin_unseen_exception(
     }
     let slot = pyre_object::gc_roots::shadow_stack_len();
     let candidate = pyre_object::gc_roots::pin_root(candidate);
-    let identity = pyre_object::gc_hook::gc_identity_hash(candidate as usize);
+    let identity = pyre_object::gc_hook::gc_id(candidate as usize);
     context.seen.insert(identity).then_some(slot)
 }
 
@@ -4496,7 +4496,7 @@ fn write_exception_group<W: Write>(
         let child = pyre_object::gc_roots::shadow_stack_get(*child_slot);
         context
             .seen
-            .insert(pyre_object::gc_hook::gc_identity_hash(child as usize));
+            .insert(pyre_object::gc_hook::gc_id(child as usize));
     }
     context.need_close = false;
     for index in 0..count {

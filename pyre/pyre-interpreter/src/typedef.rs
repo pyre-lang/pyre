@@ -294,16 +294,14 @@ pub struct ClassAttr;
 /// `pypy/interpreter/typedef.py default_identity_hash`.
 ///
 /// Exact immutable builtin values use their value-derived unique id; ordinary
-/// objects use RPython's `compute_identity_hash`, whose translated minimark
-/// implementation is `mangle_hash(id_or_identityhash(obj))`.
+/// objects use RPython's `compute_identity_hash`, MiniMark `identityhash`.
 pub fn default_identity_hash_value(mut w_obj: PyObjectRef) -> i64 {
     if let Some(w_unique_id) =
         pyre_object::with_roots!(w_obj => crate::function::immutable_unique_id(w_obj))
     {
         return crate::builtins::hash_value(w_unique_id);
     }
-    let identity = pyre_object::gc_hook::gc_identity_hash(w_obj as usize) as i64;
-    identity ^ (identity >> 4)
+    pyre_object::gc_hook::gc_identityhash(w_obj as usize) as i64
 }
 
 pub fn default_identity_hash(_space: PyObjectRef, w_obj: PyObjectRef) -> PyObjectRef {
@@ -19186,8 +19184,8 @@ fn init_builtin_function_type(ns: PyObjectRef) {
                         let function_address =
                             unsafe { crate::gateway::builtin_code_get(code) } as *const () as usize;
                         let instance = unsafe { pyre_object::w_method_get_self(function) };
-                        let mut value = (pyre_object::gc_hook::gc_identity_hash(instance as usize)
-                            ^ pyre_object::gc_hook::gc_identity_hash(function_address))
+                        let mut value = (pyre_object::gc_hook::gc_id(instance as usize)
+                            ^ pyre_object::gc_hook::gc_id(function_address))
                             as i64;
                         if value == -1 {
                             value = -2;
@@ -19935,11 +19933,10 @@ fn init_method_wrapper_type(ns: PyObjectRef) {
                     let instance = unsafe { pyre_object::w_method_get_self(obj) };
                     let mut descr = descr_of(obj);
                     let instance_hash = pyre_object::with_roots!(descr => {
-                        pyre_object::gc_hook::gc_identity_hash(instance as usize)
+                        pyre_object::gc_hook::gc_id(instance as usize)
                     });
-                    let mut value = (instance_hash
-                        ^ pyre_object::gc_hook::gc_identity_hash(descr as usize))
-                        as i64;
+                    let mut value =
+                        (instance_hash ^ pyre_object::gc_hook::gc_id(descr as usize)) as i64;
                     if value == -1 {
                         value = -2;
                     }
@@ -21999,7 +21996,7 @@ fn instancemethod_descr_repr(args: &[PyObjectRef]) -> crate::PyResult {
         unsafe { pyre_object::instancemethod::w_instancemethod_get_func(roots.get(slot)) };
     let name = instancemethod_func_name(function);
     let live = roots.get(slot);
-    let addr = pyre_object::gc_hook::gc_identity_hash(live as usize);
+    let addr = pyre_object::gc_hook::gc_id(live as usize);
     let text = format!("<<instancemethod {name}> at 0x{addr:x}>");
     Ok(pyre_object::w_str_new_managed(&text))
 }

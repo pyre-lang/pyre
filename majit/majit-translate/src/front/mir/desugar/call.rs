@@ -69,10 +69,10 @@ impl<'a> Lowering<'a> {
                 .is_some_and(gc_root_pin_path),
             _ => false,
         };
-        let callee_identity_hash = match &call.func {
+        let callee_gc_identity = match &call.func {
             CallFunc::Regular(reg) => regular_call_name_path(reg, self.llbc)
                 .as_deref()
-                .is_some_and(gc_identity_hash_path),
+                .is_some_and(gc_identity_path),
             _ => false,
         };
 
@@ -1310,7 +1310,7 @@ impl<'a> Lowering<'a> {
                 // `rarithmetic.r_uint`: the unique graph's `usize` input is
                 // Unsigned. `cast_ptr_to_int` callers otherwise merge
                 // `r_uint ∪ int` (`annrpython.py` `mergeinputargs`).
-                if callee_identity_hash && let Some(arg) = args.first().cloned() {
+                if callee_gc_identity && let Some(arg) = args.first().cloned() {
                     args[0] = push_r_uint(&mut self.graph, bb_id, arg);
                 }
                 // `core::intrinsics::transmute::<A, B>(x)` is a bitwise
