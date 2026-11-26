@@ -4644,11 +4644,18 @@ fn declared_return_annotation(
     // (`lltype.py` `GcArray`, `rlist.py` `FixedSizeListRepr`). Interning
     // a ClassDef would rtype the residual as `InstanceRepr` of `object`
     // and then fail convert from the body's `Ptr(GcArray)`.
+    // `MutRef<T>` is the GC `&mut` cell (`rclass.py` `InstanceRepr`).
+    // Residual intern of `Option<&mut T>` is that instance
+    // (`annrpython.py` `unionof` of `s_None` with the Some cell).
+    // `project_struct_field_type` of a pointer spelling is SomePtr
+    // (`llannotation.py` `lltype_to_annotation`); skip that arm so
+    // the ClassDef intern below keeps the cell.
     let projected = bk.project_struct_field_type(root);
     if matches!(
         projected,
         crate::annotator::model::SomeValue::Ptr(_) | crate::annotator::model::SomeValue::List(_)
-    ) {
+    ) && !crate::front::mir::is_mut_ref_cell_name(root)
+    {
         return Some(projected);
     }
     if crate::front::semantic::is_list_family_spelling(root) {

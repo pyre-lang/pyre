@@ -1807,10 +1807,11 @@ fn analyze_pipeline_from_module_paths(
                         .map(|row| (row.name.clone(), row.ty.clone()))
                         .collect()
                 });
-            crate::annotator::classdesc::register_struct_fields_with_layout(
+            crate::annotator::classdesc::register_struct_fields_with_layout_and_registry(
                 qualified,
                 fields,
                 layout_pairs.as_deref(),
+                &program.struct_fields,
             );
         }
         crate::annotator::classdesc::register_flattened_list_storage_leaves(

@@ -2393,6 +2393,344 @@ fn std_cell_refcell_vec_gcref_borrow_any_annotates() {
         .unwrap_or_else(|e| panic!("arg_borrow_any annotate: {e}"));
 }
 
+/// Production accessor shape: a GC owner returns `&self.<RefCell field>`
+/// (`Assign` of `Rvalue::Ref` of the field, then a Deref reborrow into
+/// local 0) and a caller `.borrow()`s that result. RPython `getattr` of
+/// the attribute is the cell class (`classdesc.py` `ClassDef` /
+/// `unaryop.py` `SomeInstance.getattr`); returning it is that same
+/// annotation. The opaque-getter fixture above cannot see this body.
+#[test]
+fn std_cell_gc_owner_refcell_field_borrow_accessor_annotates() {
+    use crate::annotator::annrpython::RPythonAnnotator;
+    use crate::annotator::model::SomeValue;
+    use crate::flowspace::argument::Signature;
+    use crate::translator::rtyper::call_registry::{CallRegistry, FunctionPathKey};
+    use crate::translator::rtyper::cutover::lift_callee_to_pygraph;
+    use crate::translator::rtyper::flowspace_adapter::{
+        derive_subject_inputcells, function_graph_to_flowspace,
+    };
+    use std::rc::Rc;
+
+    let host_adt = named_adt(2, vec![]);
+    let host_ptr = serde_json::json!({"RawPtr": [host_adt.clone(), "Mut"]});
+    let vec_ty = named_adt(1, vec![host_ptr.clone()]);
+    let refcell_ty = named_adt(0, vec![vec_ty.clone()]);
+    let refcell_ref = serde_json::json!({"Ref": ["Erased", refcell_ty.clone(), "Shared"]});
+    let owner_adt = named_adt(3, vec![]);
+    let owner_ref = serde_json::json!({"Ref": ["Erased", owner_adt.clone(), "Shared"]});
+    let (unwind, ret) = window_unwind_and_return_blocks();
+
+    let refcell_decl = type_decl_struct(
+        0,
+        &["core", "cell", "RefCell"],
+        vec![
+            serde_json::json!({
+                "name": "borrow",
+                "ty": i64_ty(),
+                "attr_info": null
+            }),
+            serde_json::json!({
+                "name": "value",
+                "ty": vec_ty.clone(),
+                "attr_info": null
+            }),
+        ],
+    );
+    let vec_decl = type_decl_struct(1, &["alloc", "vec", "Vec"], vec![]);
+    let host_decl = type_decl_struct(2, &["fixture", "Host"], vec![]);
+    let owner_decl = type_decl_struct(
+        3,
+        &["fixture", "Owner"],
+        vec![serde_json::json!({
+            "name": "active",
+            "ty": refcell_ty.clone(),
+            "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true}
+        })],
+    );
+
+    let owner_deref = window_place(
+        serde_json::json!({"Projection": [
+            window_place(serde_json::json!({"Local": 1}), &owner_ref),
+            "Deref"
+        ]}),
+        &owner_adt,
+    );
+    let active_place = window_place(
+        serde_json::json!({"Projection": [
+            owner_deref,
+            {"Field": [null, 0]}
+        ]}),
+        &refcell_ty,
+    );
+    let tmp_ref_place = window_place(serde_json::json!({"Local": 2}), &refcell_ref);
+    let tmp_deref_place = window_place(
+        serde_json::json!({"Projection": [tmp_ref_place.clone(), "Deref"]}),
+        &refcell_ty,
+    );
+    let borrow_call = |arg_ty: &serde_json::Value, arg_local: u64, target: u64| {
+        serde_json::json!({"Call": {"call": {
+            "func": {"Regular": {
+                "kind": {"Fun": 2},
+                "generics": window_empty_generics()
+            }},
+            "args": [{"Read": window_place(serde_json::json!({"Local": arg_local}), arg_ty)}]
+        }, "dest": window_place(serde_json::json!({"Local": 0}), &vec_ty),
+            "target": target, "on_unwind": 1}})
+    };
+
+    let getter = serde_json::json!({
+        "def_id": 1,
+        "item_meta": window_meta(&["fixture", "Owner", "active_cell"], true),
+        "signature": {
+            "is_unsafe": false,
+            "inputs": [owner_ref.clone()],
+            "output": refcell_ref.clone()
+        },
+        "body": {"Unstructured": {
+            "span": window_span(),
+            "locals": {"arg_count": 1, "locals": [
+                window_local(0, &refcell_ref),
+                window_local(1, &owner_ref),
+                window_local(2, &refcell_ref)
+            ]},
+            "body": [{
+                "statements": [
+                    {
+                        "span": window_span(),
+                        "kind": {"Assign": [
+                            tmp_ref_place,
+                            {"Ref": {
+                                "place": active_place,
+                                "kind": "Shared",
+                                "ptr_metadata": null
+                            }}
+                        ]}
+                    },
+                    {
+                        "span": window_span(),
+                        "kind": {"Assign": [
+                            window_place(serde_json::json!({"Local": 0}), &refcell_ref),
+                            {"Ref": {
+                                "place": tmp_deref_place,
+                                "kind": "Shared",
+                                "ptr_metadata": null
+                            }}
+                        ]}
+                    }
+                ],
+                "kind": "Regular",
+                "terminator": {"span": window_span(), "kind": "Return"}
+            }]
+        }}
+    });
+    let borrow = window_opaque_fun(
+        2,
+        &["core", "cell", "RefCell", "borrow"],
+        vec![refcell_ref.clone()],
+        vec_ty.clone(),
+    );
+    let getter_caller = serde_json::json!({
+        "def_id": 0,
+        "item_meta": window_meta(&["fixture", "getter_borrow_any"], true),
+        "signature": {
+            "is_unsafe": false,
+            "inputs": [owner_ref.clone()],
+            "output": vec_ty.clone()
+        },
+        "body": {"Unstructured": {
+            "span": window_span(),
+            "locals": {"arg_count": 1, "locals": [
+                window_local(0, &vec_ty),
+                window_local(1, &owner_ref),
+                window_local(2, &refcell_ref)
+            ]},
+            "body": [
+                {
+                    "statements": [],
+                    "kind": "Regular",
+                    "terminator": {"span": window_span(), "kind": {"Call": {"call": {
+                        "func": {"Regular": {
+                            "kind": {"Fun": 1},
+                            "generics": window_empty_generics()
+                        }},
+                        "args": [{"Read": window_place(serde_json::json!({"Local": 1}), &owner_ref)}]
+                    }, "dest": window_place(serde_json::json!({"Local": 2}), &refcell_ref),
+                        "target": 2, "on_unwind": 1}}}
+                },
+                unwind.clone(),
+                {
+                    "statements": [],
+                    "kind": "Regular",
+                    "terminator": {"span": window_span(), "kind": borrow_call(&refcell_ref, 2, 3)}
+                },
+                ret
+            ]
+        }}
+    });
+
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": [refcell_decl, vec_decl, host_decl, owner_decl],
+            "fun_decls": [getter_caller, getter, borrow],
+            "global_decls": [],
+            "trait_decls": [{
+                "def_id": 0,
+                "item_meta": window_meta(&["majit_gc", "header", "GcType"], false)
+            }],
+            "trait_impls": [gctype_impl_for_adt(3)]
+        }
+    });
+    let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("accessor fixture parses");
+    let harvested = Rc::new(crate::front::mir::LowerContext::new(&llbc).struct_field_registry());
+    let program = crate::test_support::build_semantic_program_from_llbc(&llbc)
+        .unwrap_or_else(|e| panic!("semantic program: {e:?}"));
+    let (owner_key, owner_fields) = program
+        .struct_field_attrs
+        .iter()
+        .find(|(key, _)| key.rsplit("::").next() == Some("Owner"))
+        .expect("Owner FORCE fields are harvested");
+    let owner_layout: Vec<(String, String)> = program
+        .struct_fields
+        .fields
+        .get(owner_key)
+        .expect("Owner layout rows are harvested before FORCE")
+        .iter()
+        .map(|row| (row.name.clone(), row.ty.clone()))
+        .collect();
+    crate::annotator::classdesc::register_struct_fields_with_layout_and_registry(
+        owner_key,
+        owner_fields,
+        Some(&owner_layout),
+        &program.struct_fields,
+    );
+    let stamped = program
+        .functions
+        .iter()
+        .find(|f| f.name == "active_cell")
+        .expect("active_cell fixture is present");
+    let stamped_graph = stamped.graph();
+
+    // Production `build_decl` stamps this graph (`GraphStamp::apply`).
+    // `lower_function` does not, and would miss a header-token Integer.
+    let mut getter_graph = stamped_graph.clone();
+    // Looked-inside aggregate returns leave FUNC.RESULT unstamped; the
+    // declared signature token remains available for FunctionDesc.pycall.
+    getter_graph.return_type = None;
+    getter_graph.residual_return_type = Some("ref".to_string());
+    let getter_return = getter_graph
+        .blocks
+        .iter()
+        .find(|block| block.id == getter_graph.returnblock)
+        .and_then(|block| block.inputargs.first())
+        .cloned()
+        .expect("getter return block has its result variable");
+    let getter_dump = getter_graph.dump();
+
+    let ann = RPythonAnnotator::new(None, None, None, false);
+    ann.bookkeeper.set_struct_fields(harvested.clone());
+    let owner_classdef = ann
+        .bookkeeper
+        .classdef_for_known_struct_root(owner_key)
+        .expect("Owner ClassDef is interned from harvested rows");
+    let owner_attr = owner_classdef
+        .borrow()
+        .attrs
+        .get("active")
+        .expect("Owner.active FORCE attribute exists")
+        .s_value
+        .clone();
+    assert!(
+        matches!(
+            owner_attr,
+            SomeValue::Instance(ref inst) if inst.classdef.as_ref().is_some_and(|cd| {
+                cd.borrow().name.starts_with("cell::RefCell<")
+            })
+        ),
+        "Owner.active must be the cell class on its first annotation, got {owner_attr:?}"
+    );
+    assert!(
+        getter_return.annotation.borrow().is_none(),
+        "front lowering must not preseed the getter return: {:?}",
+        getter_return.annotation.borrow()
+    );
+    crate::translator::rtyper::legacy_annotator::annotate_with_bookkeeper(
+        &getter_graph,
+        Some(&ann.bookkeeper),
+    );
+    assert!(
+        matches!(
+            getter_return.annotation.borrow().as_deref(),
+            Some(SomeValue::Instance(inst)) if inst.classdef.as_ref().is_some_and(|cd| {
+                cd.borrow().name.starts_with("cell::RefCell<")
+            })
+        ),
+        "legacy getter return producer must stamp the cell class, got {:?}",
+        getter_return.annotation.borrow()
+    );
+    let registry = CallRegistry::new(ann.bookkeeper.clone());
+    let lifted_getter = function_graph_to_flowspace(&getter_graph, &registry)
+        .unwrap_or_else(|e| panic!("lift active_cell: {e:?}; {getter_dump}"));
+    crate::translator::simplify::simplify_graph(&lifted_getter.graph.borrow(), None);
+    let getter_cells = derive_subject_inputcells(&getter_graph, Some(&ann.bookkeeper))
+        .unwrap_or_else(|e| panic!("active_cell inputcells: {e:?}; {getter_dump}"));
+    let getter_start = lifted_getter.graph.borrow().startblock.clone();
+    let getter_opt: Vec<Option<SomeValue>> = getter_cells.into_iter().map(Some).collect();
+    ann.addpendingblock(&lifted_getter.graph, &getter_start, &getter_opt);
+    ann.complete_pending_blocks()
+        .unwrap_or_else(|e| panic!("active_cell annotate blocked: {e}; {getter_dump}"));
+    let getter_ret = lifted_getter.graph.borrow().getreturnvar();
+    let getter_s = ann.binding(&getter_ret);
+    let getter_is_cell = matches!(
+        &getter_s,
+        SomeValue::Instance(inst) if inst.classdef.as_ref().is_some_and(|cd| {
+            let name = cd.borrow().name.clone();
+            name.starts_with("cell::RefCell<") && name.contains("Vec<")
+        })
+    );
+    assert!(
+        getter_is_cell,
+        "accessor return must be the cell class, got {getter_s:?}; {getter_dump}"
+    );
+
+    let getter_sig = Signature::new(vec!["self".into()], None, None);
+    let getter_py = lift_callee_to_pygraph(&getter_graph, getter_sig.clone(), &registry)
+        .unwrap_or_else(|e| panic!("lift_callee active_cell: {e}; {getter_dump}"));
+    let crate::flowspace::model::Hlvalue::Variable(cached_return) =
+        getter_py.graph.borrow().getreturnvar()
+    else {
+        panic!("FunctionDesc cached return must be a Variable")
+    };
+    let cached_annotation = cached_return.annotation.borrow().clone();
+    assert!(
+        matches!(
+            cached_annotation.as_deref(),
+            Some(SomeValue::Instance(inst)) if inst.classdef.as_ref().is_some_and(|cd| {
+                cd.borrow().name.starts_with("cell::RefCell<")
+            })
+        ),
+        "FunctionDesc cached return must keep the field annotation, got {cached_annotation:?}"
+    );
+    let getter_key = FunctionPathKey::from_segments(["fixture", "Owner", "active_cell"]);
+    registry.register_callee(getter_key, getter_sig, getter_py);
+
+    let caller_graph = crate::front::mir::lower_function(&llbc, "getter_borrow_any")
+        .unwrap_or_else(|e| panic!("lower getter_borrow_any: {e:?}"));
+    let caller_dump = caller_graph.dump();
+    let lifted_caller = function_graph_to_flowspace(&caller_graph, &registry)
+        .unwrap_or_else(|e| panic!("lift getter_borrow_any: {e:?}; {caller_dump}"));
+    crate::translator::simplify::simplify_graph(&lifted_caller.graph.borrow(), None);
+    let caller_cells = derive_subject_inputcells(&caller_graph, Some(&ann.bookkeeper))
+        .unwrap_or_else(|e| panic!("getter_borrow_any inputcells: {e:?}; {caller_dump}"));
+    let caller_start = lifted_caller.graph.borrow().startblock.clone();
+    let caller_opt: Vec<Option<SomeValue>> = caller_cells.into_iter().map(Some).collect();
+    ann.addpendingblock(&lifted_caller.graph, &caller_start, &caller_opt);
+    ann.complete_pending_blocks()
+        .unwrap_or_else(|e| panic!("caller .borrow() blocked: {e}; {caller_dump}"));
+}
+
 /// `Ref<'b, T>` is `{ value: NonNull<T>, borrow }` — a pointer to T —
 /// so it occupies T's bank. `RefCell<T>` holds T inline and stays the
 /// cell class. Field / return / argument / class_root share that verdict.
@@ -2990,6 +3328,146 @@ fn register_std_cell_instantiation_keys_match_lowering_after_duplicate_payload_l
     assert!(
         !reg.fields.contains_key(&early),
         "empty-tombstone key {early} must not remain after disambiguation"
+    );
+}
+
+fn owner_refcell_f64_llbc(owner_before_cell: bool) -> Llbc {
+    let f64_ty = serde_json::json!({"Scalar": {"Float": "F64"}});
+    let (owner_id, cell_id) = if owner_before_cell {
+        (0u64, 1u64)
+    } else {
+        (1, 0)
+    };
+    let refcell_ty = named_adt(cell_id, vec![f64_ty.clone()]);
+    let refcell = type_decl_struct(
+        cell_id,
+        &["core", "cell", "RefCell"],
+        vec![
+            named_copy_field("borrow", i64_ty()),
+            named_copy_field("value", f64_ty),
+        ],
+    );
+    let owner = type_decl_struct(
+        owner_id,
+        &["fixture", "Owner"],
+        vec![named_copy_field("cell", refcell_ty)],
+    );
+    let types = if owner_before_cell {
+        vec![owner, refcell]
+    } else {
+        vec![refcell, owner]
+    };
+    llbc_with_types("fixture", types, vec![])
+}
+
+fn owner_cell_struct_field_attr(llbc: &Llbc) -> ValueType {
+    let (_, _, _, _, _, attrs, _, _) = super::derive_program_metadata(
+        llbc,
+        &super::harvest_declared_gc_facts(llbc).gc_struct_ids(),
+        super::no_immutable_fields(),
+        &std::collections::HashSet::new(),
+        &[],
+    );
+    let owner_attrs = attrs.get("Owner").unwrap_or_else(|| {
+        panic!(
+            "Owner FORCE attrs missing; keys={:?}",
+            attrs.keys().collect::<Vec<_>>()
+        )
+    });
+    owner_attrs
+        .iter()
+        .find(|(name, _)| name == "cell")
+        .map(|(_, ty)| ty.clone())
+        .unwrap_or_else(|| panic!("Owner.cell attr missing; owner_attrs={owner_attrs:?}"))
+}
+
+fn owner_cell_attr_is_cell_class(attr: &ValueType) -> bool {
+    matches!(
+        attr,
+        ValueType::Ref(Some(root))
+            if root.starts_with("cell::RefCell<") && root.contains("f64")
+    )
+}
+
+/// TypeDecl order must not change FORCE attrs of `Owner.cell: RefCell<f64>`.
+/// `bookkeeper.py` `Bookkeeper.getuniqueclassdef` returns one ClassDef;
+/// `classdesc.py` `ClassDesc._init_classdef` attaches the cell class.
+#[test]
+fn struct_field_attrs_of_refcell_f64_are_order_independent() {
+    let owner_first = owner_cell_struct_field_attr(&owner_refcell_f64_llbc(true));
+    let cell_first = owner_cell_struct_field_attr(&owner_refcell_f64_llbc(false));
+    assert_eq!(
+        owner_first, cell_first,
+        "Owner.cell FORCE attr must not depend on TypeDecl order; owner-first={owner_first:?} cell-first={cell_first:?}"
+    );
+    assert!(
+        owner_cell_attr_is_cell_class(&owner_first),
+        "Owner.cell is the cell class, got {owner_first:?}"
+    );
+}
+
+/// Crate 2's Opaque `RefCell<Payload>` publishes `cell::RefCell<Payload>`
+/// from crate 1's layout rows (`bookkeeper.py` `Bookkeeper.getuniqueclassdef`).
+#[test]
+fn opaque_refcell_of_new_payload_instantiates_from_prior_crate_layout_rows() {
+    use crate::codewriter::call::FuncObjDeclarations;
+    use crate::front::graph_body::GraphBodyProvider;
+    use std::collections::HashMap;
+
+    let i64 = i64_ty();
+    let layout_llbc = llbc_with_types(
+        "layout",
+        vec![type_decl_struct(
+            0,
+            &["core", "cell", "RefCell"],
+            vec![
+                named_copy_field("borrow", i64.clone()),
+                named_copy_field("value", i64.clone()),
+            ],
+        )],
+        vec![],
+    );
+    let payload_ty = named_adt(1, vec![]);
+    let refcell_ty = named_adt(0, vec![payload_ty.clone()]);
+    let opaque_llbc = llbc_with_types(
+        "caller",
+        vec![
+            opaque_type_decl(0, &["core", "cell", "RefCell"]),
+            type_decl_struct(1, &["caller", "Payload"], vec![named_copy_field("x", i64)]),
+        ],
+        vec![window_opaque_fun(
+            0,
+            &["caller", "takes_cell"],
+            vec![refcell_ty.clone()],
+            i64_ty(),
+        )],
+    );
+    let mut provider = GraphBodyProvider::new(
+        crate::HostStaticAddrs::default(),
+        &[],
+        HashMap::new(),
+        FuncObjDeclarations::default(),
+        Default::default(),
+    );
+    provider.lower_named_for_test(layout_llbc, &[]);
+    let program = provider.lower_named_for_test(opaque_llbc, &["takes_cell"]);
+    let instantiated: Vec<_> = program
+        .struct_fields
+        .fields
+        .keys()
+        .filter(|k| k.starts_with("cell::RefCell<") && k.contains("Payload"))
+        .cloned()
+        .collect();
+    assert_eq!(
+        instantiated.len(),
+        1,
+        "Opaque RefCell<Payload> must publish one instantiated key from the prior crate's layout rows; keys={:?}",
+        program
+            .struct_fields
+            .fields
+            .keys()
+            .filter(|k| k.contains("RefCell"))
+            .collect::<Vec<_>>()
     );
 }
 
@@ -20620,6 +21098,1169 @@ fn option_gc_mut_ref_none_is_mut_ref_cell_null() {
         ),
         other => panic!("takes_mut Input is Ref(MutRef), got {other:?}"),
     }
+}
+
+/// `Option<&mut *mut Payload>` is a remaining-pointer slot address
+/// (`rdict.py` `ll_get` / `llmemory.py` `GCREF`). An early `?`
+/// (`from_residual` Aggregate `None`) and a later `Some(&mut field)`
+/// share one nullable SomePtr (`annrpython.py`
+/// `RPythonAnnotator.mergeinputargs` / `unionof` of `s_None` with the
+/// Some pointer). `option_gc_mut_ref_none_is_mut_ref_cell_null` covers
+/// `Option<&mut Handle>` (GC struct), not this remaining-pointer shape.
+#[test]
+fn option_remaining_pointer_mut_ref_question_mark_annotates_nullable_cell() {
+    use crate::annotator::annrpython::RPythonAnnotator;
+    use crate::annotator::model::SomeValue;
+    use crate::flowspace::argument::Signature;
+    use crate::translator::rtyper::call_registry::{CallRegistry, FunctionPathKey};
+    use crate::translator::rtyper::cutover::lift_callee_to_pygraph;
+    use crate::translator::rtyper::flowspace_adapter::{
+        derive_subject_inputcells, function_graph_to_flowspace,
+    };
+    use std::rc::Rc;
+
+    let span = window_span();
+    let payload_adt = adt_node(0);
+    let owner_adt = adt_node(1);
+    let payload_raw = serde_json::json!({"RawPtr": [payload_adt.clone(), "Mut"]});
+    let mut_payload = serde_json::json!({"Ref": ["Erased", payload_raw.clone(), "Mut"]});
+    let option_ty = option_adt_node(2, mut_payload.clone());
+    let owner_mut = serde_json::json!({"Ref": ["Erased", owner_adt.clone(), "Mut"]});
+    let flag_ty = interior_i64();
+    let (unwind, ret) = window_unwind_and_return_blocks();
+    let layout = |size: u64| {
+        serde_json::json!([{
+            "key": "fixture-target",
+            "value": {
+                "size": size,
+                "align": 8,
+                "variant_layouts": [{"field_offsets": [0]}],
+                "repr": {"transparent": false}
+            }
+        }])
+    };
+    let mut payload_decl = type_decl_struct(0, &["fixture", "Payload"], vec![]);
+    payload_decl["layout"] = layout(0);
+    payload_decl["item_meta"]["is_local"] = serde_json::json!(true);
+    let mut owner_decl = type_decl_struct(
+        1,
+        &["Owner"],
+        vec![serde_json::json!({
+            "name": "value",
+            "ty": payload_raw.clone(),
+            "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true}
+        })],
+    );
+    owner_decl["layout"] = layout(8);
+    owner_decl["item_meta"]["is_local"] = serde_json::json!(true);
+
+    let t_var = serde_json::json!({"TypeVar": {"Bound": [0, 0]}});
+    let option_t = option_adt_node(2, t_var.clone());
+    let option_place = window_place(serde_json::json!({"Local": 0}), &option_ty);
+    let residual_dest = window_place(serde_json::json!({"Local": 0}), &option_t);
+    let flag_place = window_place(serde_json::json!({"Local": 1}), &flag_ty);
+    let residual_place = window_place(serde_json::json!({"Local": 3}), &flag_ty);
+    let field_place = serde_json::json!({
+        "kind": {"Projection": [
+            {"kind": {"Projection": [
+                window_place(serde_json::json!({"Local": 2}), &owner_mut),
+                "Deref"
+            ]}, "ty": owner_adt},
+            {"Field": [null, 0]}
+        ]},
+        "ty": payload_raw
+    });
+    let field_ref_place = window_place(serde_json::json!({"Local": 4}), &mut_payload);
+    let residual_none = serde_json::json!({"Aggregate": [
+        {"Adt": [
+            {"id": 2, "generics": {
+                "regions": [],
+                "types": [t_var.clone()],
+                "const_generics": [],
+                "trait_refs": []
+            }, "builtin": null},
+            0,
+            null
+        ]},
+        []
+    ]});
+    let none_aggregate = serde_json::json!({"Aggregate": [
+        {"Adt": [
+            {"id": 2, "generics": {
+                "regions": [],
+                "types": [mut_payload.clone()],
+                "const_generics": [],
+                "trait_refs": []
+            }, "builtin": null},
+            0,
+            null
+        ]},
+        []
+    ]});
+    let some_aggregate = serde_json::json!({"Aggregate": [
+        {"Adt": [
+            {"id": 2, "generics": {
+                "regions": [],
+                "types": [mut_payload.clone()],
+                "const_generics": [],
+                "trait_refs": []
+            }, "builtin": null},
+            1,
+            null
+        ]},
+        [{"Read": field_ref_place.clone()}]
+    ]});
+    let from_residual = serde_json::json!({
+        "def_id": 1,
+        "item_meta": window_meta(&["fixture", "from_residual"], true),
+        "generics": {
+            "regions": [],
+            "types": [{"index": 0, "name": "T"}],
+            "const_generics": [],
+            "trait_clauses": []
+        },
+        "signature": {
+            "is_unsafe": false,
+            "inputs": [flag_ty.clone()],
+            "output": option_t.clone()
+        },
+        "body": {"Unstructured": {
+            "span": span,
+            "locals": {"arg_count": 1, "locals": [
+                window_local(0, &option_t),
+                window_local(1, &flag_ty)
+            ]},
+            "body": [{
+                "statements": [{
+                    "span": span,
+                    "kind": {"Assign": [residual_dest, residual_none]}
+                }],
+                "kind": "Regular",
+                "terminator": {"span": span, "kind": "Return"}
+            }]
+        }}
+    });
+    let get_slot = serde_json::json!({
+        "def_id": 0,
+        "item_meta": window_meta(&["fixture", "get_slot"], true),
+        "signature": {
+            "is_unsafe": false,
+            "inputs": [flag_ty.clone(), owner_mut.clone()],
+            "output": option_ty.clone()
+        },
+        "body": {"Unstructured": {
+            "span": span,
+            "locals": {"arg_count": 2, "locals": [
+                window_local(0, &option_ty),
+                window_local(1, &flag_ty),
+                window_local(2, &owner_mut),
+                window_local(3, &flag_ty),
+                window_local(4, &mut_payload)
+            ]},
+            "body": [
+                {
+                    "statements": [{
+                        "span": span,
+                        "kind": {"Assign": [
+                            residual_place.clone(),
+                            {"Use": [{"Read": flag_place.clone()}, "No"]}
+                        ]}
+                    }],
+                    "kind": "Regular",
+                    "terminator": {"span": span, "kind": {"Switch": {
+                        "discr": {"Read": flag_place.clone()},
+                        "targets": {"SwitchInt": [
+                            null,
+                            [
+                                [{"Scalar": {"Signed": ["I64", "0"]}}, 1],
+                                [{"Scalar": {"Signed": ["I64", "1"]}}, 2]
+                            ],
+                            3
+                        ]}
+                    }}}
+                },
+                {
+                    "statements": [],
+                    "kind": "Regular",
+                    "terminator": {"span": span, "kind": {"Call": {
+                        "call": {
+                            "func": {"Regular": {
+                                "kind": {"Fun": 1},
+                                "generics": {
+                                    "regions": [],
+                                    "types": [mut_payload.clone()],
+                                    "const_generics": [],
+                                    "trait_refs": []
+                                }
+                            }},
+                            "args": [{"Read": residual_place}]
+                        },
+                        "dest": option_place.clone(),
+                        "target": 5,
+                        "on_unwind": 4
+                    }}}
+                },
+                {
+                    "statements": [{
+                        "span": span,
+                        "kind": {"Assign": [option_place.clone(), none_aggregate]}
+                    }],
+                    "kind": "Regular",
+                    "terminator": {"span": span, "kind": {"Goto": {"target": 5}}}
+                },
+                {
+                    "statements": [
+                        {
+                            "span": span,
+                            "kind": {"Assign": [
+                                field_ref_place,
+                                {"Ref": {
+                                    "place": field_place,
+                                    "kind": "Mut",
+                                    "ptr_metadata": null
+                                }}
+                            ]}
+                        },
+                        {
+                            "span": span,
+                            "kind": {"Assign": [option_place, some_aggregate]}
+                        }
+                    ],
+                    "kind": "Regular",
+                    "terminator": {"span": span, "kind": {"Goto": {"target": 5}}}
+                },
+                unwind,
+                ret
+            ]
+        }}
+    });
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": [payload_decl, owner_decl, option_enum(2)],
+            "fun_decls": [get_slot, from_residual],
+            "global_decls": [],
+            "trait_decls": handle_trait_decls(),
+            "trait_impls": [gctype_impl_for_adt(0), gctype_impl_for_adt(1)]
+        }
+    });
+    let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture parses");
+    let option_ty: TyRef = serde_json::from_value(option_ty.clone()).unwrap();
+    let tomb = no_tombstoned_leaves();
+    let gc = super::harvest_declared_gc_facts(&llbc).gc_struct_ids();
+    let raw = std::collections::HashSet::<String>::new();
+    let payload_node = crate::front::result_exc::tyref_option_payload(&option_ty, &llbc)
+        .and_then(|payload| super::tyref_node(&payload, &llbc).cloned())
+        .expect("Option payload node");
+    assert!(
+        super::option_payload_remaining_pointer(&payload_node, &llbc),
+        "Option<&mut *mut Payload> is a remaining pointer after one Ref"
+    );
+    let cell = super::tyref_option_gc_mut_ref_cell_root(&option_ty, &llbc, tomb, &gc, &raw, None);
+    assert!(
+        cell.is_none(),
+        "remaining-pointer Mut Option is a slot address, not a MutRef cell, got {cell:?}"
+    );
+    assert!(
+        super::tyref_option_remaining_pointer_slot(&option_ty, &llbc),
+        "Option<&mut *mut Payload> is a remaining-pointer slot"
+    );
+    with_fixture_lowering(&llbc, |lowering| {
+        let cast = lowering.option_niche_null_cast(&option_ty);
+        assert!(
+            matches!(
+                &cast,
+                Some((root, ValueType::Ref(Some(r)))) if root == "GCREF" && r == "GCREF"
+            ),
+            "None of Option<&mut *mut Payload> is GCREF, got {cast:?}"
+        );
+    });
+    let residual_root = super::dont_look_inside_return_class_root(
+        &option_ty,
+        &llbc,
+        crate::ErrorCarrierSpec::default(),
+        tomb,
+        &gc,
+        &raw,
+        None,
+    );
+    assert_eq!(
+        residual_root.as_deref(),
+        Some("GCREF"),
+        "residual intern of remaining-pointer Mut Option is the GCREF slot, got {residual_root:?}"
+    );
+    assert_eq!(
+        super::dont_look_inside_return_token(
+            &option_ty,
+            &llbc,
+            crate::ErrorCarrierSpec::default(),
+            &gc,
+            &raw,
+            None,
+        )
+        .as_deref(),
+        Some("gcref"),
+        "residual token of remaining-pointer Mut Option is gcref"
+    );
+    assert!(
+        super::dont_look_inside_return_can_be_none(
+            &option_ty,
+            &llbc,
+            crate::ErrorCarrierSpec::default(),
+            &gc,
+            &raw,
+        ),
+        "residual intern of remaining-pointer Mut Option is nullable"
+    );
+    let value_ty = super::tyref_to_value_type_with(&option_ty, &llbc, tomb, &gc, &raw, None);
+    assert!(
+        matches!(value_ty, ValueType::Ref(None)),
+        "remaining-pointer Option intern stays Ref(None) so dest recast can narrow, got {value_ty:?}"
+    );
+
+    let graph_ops = |name: &str| {
+        let graph = crate::test_support::lower_function(&llbc, name)
+            .unwrap_or_else(|err| panic!("lower {name}: {err}"));
+        let dump = graph.dump();
+        let const_ref_nulls = graph
+            .blocks
+            .iter()
+            .flat_map(|block| block.operations.iter())
+            .filter(|op| matches!(op.kind, OpKind::ConstRefNull))
+            .count();
+        let null_muts = graph
+            .blocks
+            .iter()
+            .flat_map(|block| block.operations.iter())
+            .filter(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call { target, .. } if target.to_string() == "core::ptr::null_mut"
+                )
+            })
+            .count();
+        let cast_roots: Vec<String> = graph
+            .blocks
+            .iter()
+            .flat_map(|block| block.operations.iter())
+            .filter_map(|op| crate::model::cast_instance_root(&op.kind).map(str::to_string))
+            .collect();
+        (graph, dump, const_ref_nulls, null_muts, cast_roots)
+    };
+    let (_from_graph, from_dump, from_nulls, from_null_muts, from_roots) =
+        graph_ops("from_residual");
+    let (slot_graph, slot_dump, slot_nulls, _slot_null_muts, slot_roots) = graph_ops("get_slot");
+    assert_eq!(
+        slot_nulls, 0,
+        "get_slot must not emit ConstRefNull; roots={slot_roots:?} dump={slot_dump}"
+    );
+    assert!(
+        slot_roots.iter().any(|root| root == "GCREF"),
+        "get_slot None/Some share GCREF, got {slot_roots:?} dump={slot_dump}"
+    );
+    assert!(
+        slot_roots.iter().all(|root| !root.starts_with("MutRef<")),
+        "get_slot must not recast onto MutRef, got {slot_roots:?} dump={slot_dump}"
+    );
+    let taken = slot_graph
+        .blocks
+        .iter()
+        .flat_map(|block| block.operations.iter())
+        .filter(|op| {
+            matches!(
+                &op.kind,
+                OpKind::FieldRead { field, .. }
+                    if field.name == "value" && field.taken_by_address
+            )
+        })
+        .count();
+    assert!(
+        taken >= 1,
+        "get_slot Some is taken_by_address FieldRead of value; dump={slot_dump}"
+    );
+
+    let program = crate::test_support::build_semantic_program_from_llbc(&llbc)
+        .unwrap_or_else(|e| panic!("semantic program: {e:?}"));
+    let (owner_key, owner_fields) = program
+        .struct_field_attrs
+        .iter()
+        .find(|(key, _)| key.rsplit("::").next() == Some("Owner"))
+        .expect("Owner FORCE fields are harvested");
+    let owner_layout: Vec<(String, String)> = program
+        .struct_fields
+        .fields
+        .get(owner_key)
+        .expect("Owner layout rows are harvested before FORCE")
+        .iter()
+        .map(|row| (row.name.clone(), row.ty.clone()))
+        .collect();
+    crate::annotator::classdesc::register_struct_fields_with_layout_and_registry(
+        owner_key,
+        owner_fields,
+        Some(&owner_layout),
+        &program.struct_fields,
+    );
+    crate::annotator::classdesc::register_struct_fields_with_layout_and_registry(
+        "Owner",
+        owner_fields,
+        Some(&owner_layout),
+        &program.struct_fields,
+    );
+    let names: Vec<&str> = program.functions.iter().map(|f| f.name.as_str()).collect();
+    let spec_fn = program
+        .functions
+        .iter()
+        .find(|f| f.name.contains("from_residual") && f.name.contains("__spec_"))
+        .unwrap_or_else(|| panic!("specialized from_residual missing; names={names:?}"));
+    assert_eq!(
+        spec_fn.return_class_root.as_deref(),
+        Some("GCREF"),
+        "specialized from_residual residual intern is GCREF, got {:?}",
+        spec_fn.return_class_root
+    );
+    let spec_graph = spec_fn.graph();
+    let spec_nulls = spec_graph
+        .blocks
+        .iter()
+        .flat_map(|block| block.operations.iter())
+        .filter(|op| matches!(op.kind, OpKind::ConstRefNull))
+        .count();
+    let spec_null_muts = spec_graph
+        .blocks
+        .iter()
+        .flat_map(|block| block.operations.iter())
+        .filter(|op| {
+            matches!(
+                &op.kind,
+                OpKind::Call { target, .. } if target.to_string() == "core::ptr::null_mut"
+            )
+        })
+        .count();
+    let spec_roots: Vec<String> = spec_graph
+        .blocks
+        .iter()
+        .flat_map(|block| block.operations.iter())
+        .filter_map(|op| crate::model::cast_instance_root(&op.kind).map(str::to_string))
+        .collect();
+    let spec_dump = spec_graph.dump();
+    assert_eq!(
+        spec_nulls, 0,
+        "specialized from_residual None must not be ConstRefNull (Ptr(GCREF)); null_muts={spec_null_muts} roots={spec_roots:?} return_type={:?} return_class_root={:?} template_nulls={from_nulls} template_null_muts={from_null_muts} template_roots={from_roots:?} spec={spec_dump} template={from_dump}",
+        spec_fn.return_type, spec_fn.return_class_root
+    );
+    assert!(
+        spec_null_muts >= 1 && spec_roots.iter().any(|root| root == "GCREF"),
+        "specialized from_residual None is null_mut + GCREF; roots={spec_roots:?} return_type={:?} return_class_root={:?} template_nulls={from_nulls} template_roots={from_roots:?} spec={spec_dump} template={from_dump}",
+        spec_fn.return_type,
+        spec_fn.return_class_root
+    );
+    let stamped = program
+        .functions
+        .iter()
+        .find(|f| f.name == "get_slot")
+        .expect("get_slot is present");
+    let mut getter_graph = stamped.graph().clone();
+    getter_graph.return_type = None;
+    getter_graph.residual_return_type = Some("ref".to_string());
+    let ann = RPythonAnnotator::new(None, None, None, false);
+    ann.bookkeeper
+        .set_struct_fields(Rc::new(program.struct_fields.clone()));
+    let owner_classdef = ann
+        .bookkeeper
+        .classdef_for_known_struct_root("Owner")
+        .or_else(|| ann.bookkeeper.classdef_for_known_struct_root(owner_key))
+        .unwrap_or_else(|| {
+            panic!("Owner ClassDef is interned from harvested rows; owner_key={owner_key}")
+        });
+    assert!(
+        owner_classdef.borrow().attrs.contains_key("value"),
+        "Owner.value FORCE attribute exists; owner_key={owner_key}"
+    );
+    crate::translator::rtyper::legacy_annotator::annotate_with_bookkeeper(
+        &spec_graph,
+        Some(&ann.bookkeeper),
+    );
+    crate::translator::rtyper::legacy_annotator::annotate_with_bookkeeper(
+        &getter_graph,
+        Some(&ann.bookkeeper),
+    );
+    let getter_return = getter_graph
+        .blocks
+        .iter()
+        .find(|block| block.id == getter_graph.returnblock)
+        .and_then(|block| block.inputargs.first())
+        .cloned()
+        .expect("get_slot return block has its result variable");
+    assert!(
+        matches!(
+            getter_return.annotation.borrow().as_deref(),
+            Some(SomeValue::Ptr(_))
+        ),
+        "legacy get_slot return is one SomePtr slot, got {:?}; dump={slot_dump}",
+        getter_return.annotation.borrow()
+    );
+    let registry = CallRegistry::new(ann.bookkeeper.clone());
+    let spec_sig = Signature::new(vec!["residual".into()], None, None);
+    let spec_py = lift_callee_to_pygraph(&spec_graph, spec_sig.clone(), &registry)
+        .unwrap_or_else(|e| panic!("lift_callee from_residual spec: {e}; {spec_dump}"));
+    let spec_key = if spec_fn.harvest_segments.is_empty() {
+        FunctionPathKey::from_segments(spec_fn.call_segments.iter().cloned())
+    } else {
+        FunctionPathKey::from_segments(spec_fn.harvest_segments.iter().cloned())
+    };
+    registry.register_callee(spec_key, spec_sig, spec_py);
+    let lifted = function_graph_to_flowspace(&getter_graph, &registry)
+        .unwrap_or_else(|e| panic!("lift get_slot: {e:?}; {slot_dump} spec={spec_dump}"));
+    crate::translator::simplify::simplify_graph(&lifted.graph.borrow(), None);
+    let cells = derive_subject_inputcells(&getter_graph, Some(&ann.bookkeeper))
+        .unwrap_or_else(|e| panic!("get_slot inputcells: {e:?}; {slot_dump}"));
+    assert!(
+        cells.iter().any(|cell| matches!(
+            cell,
+            SomeValue::Instance(inst) if inst.classdef.as_ref().is_some_and(|cd| {
+                cd.borrow().name.contains("Owner")
+            })
+        )),
+        "get_slot Owner Input intern's Owner; cells={cells:?} owner_key={owner_key}"
+    );
+    let start = lifted.graph.borrow().startblock.clone();
+    let opt_cells: Vec<Option<SomeValue>> = cells.into_iter().map(Some).collect();
+    ann.addpendingblock(&lifted.graph, &start, &opt_cells);
+    ann.complete_pending_blocks().unwrap_or_else(|e| {
+        panic!(
+            "get_slot annotate: {e}; residual_root={residual_root:?} spec_roots={spec_roots:?} spec_return_type={:?} spec_class_root={:?} dump={slot_dump} spec={spec_dump}",
+            spec_fn.return_type, spec_fn.return_class_root
+        )
+    });
+    let ret_var = lifted.graph.borrow().getreturnvar();
+    let ret_s = ann.binding(&ret_var);
+    assert!(
+        matches!(&ret_s, SomeValue::Ptr(_)),
+        "return is one SomePtr slot, got {ret_s:?}; residual_root={residual_root:?} spec_roots={spec_roots:?} dump={slot_dump} spec={spec_dump}"
+    );
+}
+
+/// Slot intern is `&mut *mut T` only (`rdict.py` `ll_get`). Shared
+/// `Option<&*mut T>` is still a remaining pointer so it is not extra-peeled
+/// into class `T`. A Mut ref of a struct ADT / `Box` is an object handle.
+#[test]
+fn remaining_pointer_slot_intern_is_mut_raw_ptr_only() {
+    let payload_adt = adt_node(0);
+    let payload_raw = serde_json::json!({"RawPtr": [payload_adt.clone(), "Mut"]});
+    let mut_raw = serde_json::json!({"Ref": ["Erased", payload_raw.clone(), "Mut"]});
+    let shared_raw = option_shared_ref(payload_raw.clone());
+    let mut_struct = serde_json::json!({"Ref": ["Erased", payload_adt.clone(), "Mut"]});
+    let box_adt = serde_json::json!({
+        "Adt": {
+            "id": 2,
+            "generics": {
+                "regions": [],
+                "types": [payload_adt.clone()],
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }
+    });
+    let mut_box = serde_json::json!({"Ref": ["Erased", box_adt, "Mut"]});
+    let mut payload_decl = type_decl_struct(0, &["fixture", "Payload"], vec![]);
+    payload_decl["item_meta"]["is_local"] = serde_json::json!(true);
+    let box_decl = type_decl_struct(2, &["core", "boxed", "Box"], vec![]);
+    let llbc = llbc_with_types(
+        "fixture",
+        vec![payload_decl, option_enum(1), box_decl],
+        vec![],
+    );
+    let mut_opt: TyRef = serde_json::from_value(option_adt_node(1, mut_raw.clone())).unwrap();
+    let shared_opt: TyRef = serde_json::from_value(option_adt_node(1, shared_raw.clone())).unwrap();
+    let struct_opt: TyRef = serde_json::from_value(option_adt_node(1, mut_struct)).unwrap();
+    let box_opt: TyRef = serde_json::from_value(option_adt_node(1, mut_box)).unwrap();
+    let mut_raw_ty: TyRef = serde_json::from_value(mut_raw).unwrap();
+    let shared_raw_ty: TyRef = serde_json::from_value(shared_raw).unwrap();
+    let payload_of = |ty: &TyRef| {
+        crate::front::result_exc::tyref_option_payload(ty, &llbc)
+            .and_then(|payload| super::tyref_node(&payload, &llbc).cloned())
+            .expect("Option payload node")
+    };
+    assert!(
+        super::option_payload_remaining_pointer(&payload_of(&mut_opt), &llbc),
+        "Option<&mut *mut Payload> is a remaining pointer"
+    );
+    assert!(
+        super::option_payload_remaining_pointer(&payload_of(&shared_opt), &llbc),
+        "Option<&*mut Payload> is a remaining pointer"
+    );
+    assert!(
+        !super::option_payload_remaining_pointer(&payload_of(&struct_opt), &llbc),
+        "Option<&mut Payload> is a handle, not a remaining pointer"
+    );
+    assert!(
+        !super::option_payload_remaining_pointer(&payload_of(&box_opt), &llbc),
+        "Option<&mut Box<Payload>> is a handle, not a remaining pointer"
+    );
+    assert!(
+        super::tyref_option_remaining_pointer_slot(&mut_opt, &llbc),
+        "Option<&mut *mut Payload> intern is the slot"
+    );
+    assert!(
+        !super::tyref_option_remaining_pointer_slot(&shared_opt, &llbc),
+        "shared remaining-pointer Option is not the slot intern"
+    );
+    assert!(
+        !super::tyref_option_remaining_pointer_slot(&struct_opt, &llbc)
+            && !super::tyref_option_remaining_pointer_slot(&box_opt, &llbc),
+        "handle Option intern is not the slot"
+    );
+    assert!(
+        super::tyref_remaining_mut_pointer_slot(&mut_raw_ty, &llbc),
+        "`&mut *mut Payload` Field dest is the slot"
+    );
+    assert!(
+        !super::tyref_remaining_mut_pointer_slot(&shared_raw_ty, &llbc),
+        "shared `&*mut Payload` Field dest is not the slot intern"
+    );
+}
+
+/// A residual `&mut *mut T` argument is the slot address. Both a field
+/// borrow (`&mut owner.value`) and the remaining-pointer `get_slot`
+/// result intern `SomePtr` (`annrpython.py` `RPythonAnnotator.mergeinputargs`
+/// / `description.py` `FunctionDesc.pycall`; `rclass.py` `InstanceRepr` /
+/// `llannotation.py` `lltype_to_annotation`). A write through that
+/// address is `setfield` of the owner field, not a MutRef copy.
+#[test]
+fn remaining_pointer_residual_mut_arg_unifies_field_borrow_and_get_slot() {
+    use crate::annotator::annrpython::RPythonAnnotator;
+    use crate::annotator::model::SomeValue;
+
+    let span = window_span();
+    let payload_adt = adt_node(0);
+    let owner_adt = adt_node(1);
+    let payload_raw = serde_json::json!({"RawPtr": [payload_adt.clone(), "Mut"]});
+    let mut_payload = serde_json::json!({"Ref": ["Erased", payload_raw.clone(), "Mut"]});
+    let option_ty = option_adt_node(2, mut_payload.clone());
+    let owner_mut = serde_json::json!({"Ref": ["Erased", owner_adt.clone(), "Mut"]});
+    let unit = serde_json::json!({
+        "Adt": {
+            "builtin": "Tuple",
+            "generics": {"regions": [], "types": [], "const_generics": [], "trait_refs": []}
+        }
+    });
+    let (unwind, ret) = window_unwind_and_return_blocks();
+    let layout = |size: u64| {
+        serde_json::json!([{
+            "key": "fixture-target",
+            "value": {
+                "size": size,
+                "align": 8,
+                "variant_layouts": [{"field_offsets": [0]}],
+                "repr": {"transparent": false}
+            }
+        }])
+    };
+    let mut payload_decl = type_decl_struct(0, &["fixture", "SlotPayload"], vec![]);
+    payload_decl["layout"] = layout(0);
+    payload_decl["item_meta"]["is_local"] = serde_json::json!(true);
+    let mut owner_decl = type_decl_struct(
+        1,
+        &["SlotOwner"],
+        vec![serde_json::json!({
+            "name": "value",
+            "ty": payload_raw.clone(),
+            "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true}
+        })],
+    );
+    owner_decl["layout"] = layout(8);
+    owner_decl["item_meta"]["is_local"] = serde_json::json!(true);
+
+    let field_place = serde_json::json!({
+        "kind": {"Projection": [
+            {"kind": {"Projection": [
+                window_place(serde_json::json!({"Local": 1}), &owner_mut),
+                "Deref"
+            ]}, "ty": owner_adt},
+            {"Field": [null, 0]}
+        ]},
+        "ty": payload_raw
+    });
+    let field_ref_place = window_place(serde_json::json!({"Local": 3}), &mut_payload);
+    let option_place = window_place(serde_json::json!({"Local": 3}), &option_ty);
+    let some_payload_place = serde_json::json!({
+        "kind": {"Projection": [
+            option_place.clone(),
+            {"Field": [null, 0]}
+        ]},
+        "ty": mut_payload
+    });
+    let slot_place = window_place(serde_json::json!({"Local": 4}), &mut_payload);
+    let deref_slot = serde_json::json!({
+        "kind": {"Projection": [
+            slot_place.clone(),
+            "Deref"
+        ]},
+        "ty": payload_raw
+    });
+    let empty_generics = serde_json::json!({
+        "regions": [],
+        "types": [],
+        "const_generics": [],
+        "trait_refs": []
+    });
+    let get_slot = serde_json::json!({
+        "def_id": 0,
+        "item_meta": window_meta(&["fixture", "get_slot"], true),
+        "signature": {
+            "is_unsafe": false,
+            "inputs": [owner_mut.clone()],
+            "output": option_ty.clone()
+        },
+        "body": {"Unstructured": {
+            "span": span,
+            "locals": {"arg_count": 1, "locals": [
+                window_local(0, &option_ty),
+                window_local(1, &owner_mut),
+                window_local(2, &mut_payload)
+            ]},
+            "body": [
+                {
+                    "statements": [
+                        {
+                            "span": span,
+                            "kind": {"Assign": [
+                                window_place(serde_json::json!({"Local": 2}), &mut_payload),
+                                {"Ref": {
+                                    "place": field_place.clone(),
+                                    "kind": "Mut",
+                                    "ptr_metadata": null
+                                }}
+                            ]}
+                        },
+                        {
+                            "span": span,
+                            "kind": {"Assign": [
+                                window_place(serde_json::json!({"Local": 0}), &option_ty),
+                                {"Aggregate": [
+                                    {"Adt": [
+                                        {"id": 2, "generics": {
+                                            "regions": [],
+                                            "types": [mut_payload.clone()],
+                                            "const_generics": [],
+                                            "trait_refs": []
+                                        }, "builtin": null},
+                                        1,
+                                        null
+                                    ]},
+                                    [{"Read": window_place(serde_json::json!({"Local": 2}), &mut_payload)}]
+                                ]}
+                            ]}
+                        }
+                    ],
+                    "kind": "Regular",
+                    "terminator": {"span": span, "kind": "Return"}
+                }
+            ]
+        }}
+    });
+    let replace_word = serde_json::json!({
+        "def_id": 1,
+        "item_meta": window_meta(&["fixture", "replace_word"], true),
+        "signature": {
+            "is_unsafe": false,
+            "inputs": [mut_payload.clone(), payload_raw.clone()],
+            "output": payload_raw.clone()
+        },
+        "body": "Opaque"
+    });
+    let look_inside_false = serde_json::json!({
+        "def_id": 0,
+        "item_meta": window_meta(&["fixture", "_jit_look_inside_replace_word"], true),
+        "global_kind": "NamedConst",
+        "ty": {"Scalar": "Bool"},
+        "value": [{"Bool": false}, {"Scalar": "Bool"}]
+    });
+    let from_field = serde_json::json!({
+        "def_id": 2,
+        "item_meta": window_meta(&["fixture", "from_field"], true),
+        "signature": {
+            "is_unsafe": false,
+            "inputs": [owner_mut.clone(), payload_raw.clone()],
+            "output": payload_raw.clone()
+        },
+        "body": {"Unstructured": {
+            "span": span,
+            "locals": {"arg_count": 2, "locals": [
+                window_local(0, &payload_raw),
+                window_local(1, &owner_mut),
+                window_local(2, &payload_raw),
+                window_local(3, &mut_payload)
+            ]},
+            "body": [
+                {
+                    "statements": [{
+                        "span": span,
+                        "kind": {"Assign": [
+                            field_ref_place.clone(),
+                            {"Ref": {
+                                "place": field_place.clone(),
+                                "kind": "Mut",
+                                "ptr_metadata": null
+                            }}
+                        ]}
+                    }],
+                    "kind": "Regular",
+                    "terminator": {"span": span, "kind": {"Call": {
+                        "call": {
+                            "func": {"Regular": {
+                                "kind": {"Fun": 1},
+                                "generics": empty_generics.clone()
+                            }},
+                            "args": [
+                                {"Read": field_ref_place.clone()},
+                                {"Read": window_place(serde_json::json!({"Local": 2}), &payload_raw)}
+                            ]
+                        },
+                        "dest": window_place(serde_json::json!({"Local": 0}), &payload_raw),
+                        "target": 2,
+                        "on_unwind": 1
+                    }}}
+                },
+                unwind.clone(),
+                ret.clone()
+            ]
+        }}
+    });
+    let from_get = serde_json::json!({
+        "def_id": 3,
+        "item_meta": window_meta(&["fixture", "from_get"], true),
+        "signature": {
+            "is_unsafe": false,
+            "inputs": [owner_mut.clone(), payload_raw.clone()],
+            "output": payload_raw.clone()
+        },
+        "body": {"Unstructured": {
+            "span": span,
+            "locals": {"arg_count": 2, "locals": [
+                window_local(0, &payload_raw),
+                window_local(1, &owner_mut),
+                window_local(2, &payload_raw),
+                window_local(3, &option_ty),
+                window_local(4, &mut_payload)
+            ]},
+            "body": [
+                {
+                    "statements": [],
+                    "kind": "Regular",
+                    "terminator": {"span": span, "kind": {"Call": {
+                        "call": {
+                            "func": {"Regular": {
+                                "kind": {"Fun": 0},
+                                "generics": empty_generics.clone()
+                            }},
+                            "args": [
+                                {"Read": window_place(serde_json::json!({"Local": 1}), &owner_mut)}
+                            ]
+                        },
+                        "dest": option_place.clone(),
+                        "target": 1,
+                        "on_unwind": 3
+                    }}}
+                },
+                {
+                    "statements": [{
+                        "span": span,
+                        "kind": {"Assign": [
+                            slot_place.clone(),
+                            {"Use": [{"Read": some_payload_place.clone()}, "No"]}
+                        ]}
+                    }],
+                    "kind": "Regular",
+                    "terminator": {"span": span, "kind": {"Call": {
+                        "call": {
+                            "func": {"Regular": {
+                                "kind": {"Fun": 1},
+                                "generics": empty_generics.clone()
+                            }},
+                            "args": [
+                                {"Read": slot_place.clone()},
+                                {"Read": window_place(serde_json::json!({"Local": 2}), &payload_raw)}
+                            ]
+                        },
+                        "dest": window_place(serde_json::json!({"Local": 0}), &payload_raw),
+                        "target": 2,
+                        "on_unwind": 3
+                    }}}
+                },
+                ret.clone(),
+                unwind.clone()
+            ]
+        }}
+    });
+    let write_via_get = serde_json::json!({
+        "def_id": 4,
+        "item_meta": window_meta(&["fixture", "write_via_get"], true),
+        "signature": {
+            "is_unsafe": false,
+            "inputs": [owner_mut.clone(), payload_raw.clone()],
+            "output": unit.clone()
+        },
+        "body": {"Unstructured": {
+            "span": span,
+            "locals": {"arg_count": 2, "locals": [
+                window_local(0, &unit),
+                window_local(1, &owner_mut),
+                window_local(2, &payload_raw),
+                window_local(3, &option_ty),
+                window_local(4, &mut_payload)
+            ]},
+            "body": [
+                {
+                    "statements": [],
+                    "kind": "Regular",
+                    "terminator": {"span": span, "kind": {"Call": {
+                        "call": {
+                            "func": {"Regular": {
+                                "kind": {"Fun": 0},
+                                "generics": empty_generics.clone()
+                            }},
+                            "args": [
+                                {"Read": window_place(serde_json::json!({"Local": 1}), &owner_mut)}
+                            ]
+                        },
+                        "dest": option_place,
+                        "target": 1,
+                        "on_unwind": 3
+                    }}}
+                },
+                {
+                    "statements": [
+                        {
+                            "span": span,
+                            "kind": {"Assign": [
+                                slot_place.clone(),
+                                {"Use": [{"Read": some_payload_place}, "No"]}
+                            ]}
+                        },
+                        {
+                            "span": span,
+                            "kind": {"Assign": [
+                                deref_slot,
+                                {"Use": [{"Read": window_place(serde_json::json!({"Local": 2}), &payload_raw)}, "No"]}
+                            ]}
+                        },
+                        {
+                            "span": span,
+                            "kind": {"Assign": [
+                                window_place(serde_json::json!({"Local": 0}), &unit),
+                                {"Aggregate": ["Tuple", []]}
+                            ]}
+                        }
+                    ],
+                    "kind": "Regular",
+                    "terminator": {"span": span, "kind": {"Goto": {"target": 2}}}
+                },
+                ret,
+                unwind
+            ]
+        }}
+    });
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": [payload_decl, owner_decl, option_enum(2)],
+            "fun_decls": [get_slot, replace_word, from_field, from_get, write_via_get],
+            "global_decls": [look_inside_false],
+            "trait_decls": handle_trait_decls(),
+            "trait_impls": [gctype_impl_for_adt(0), gctype_impl_for_adt(1)]
+        }
+    });
+    let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture parses");
+    let field_graph = crate::test_support::lower_function(&llbc, "from_field")
+        .unwrap_or_else(|err| panic!("lower from_field: {err}"));
+    let get_graph = crate::test_support::lower_function(&llbc, "from_get")
+        .unwrap_or_else(|err| panic!("lower from_get: {err}"));
+    let write_graph = crate::test_support::lower_function(&llbc, "write_via_get")
+        .unwrap_or_else(|err| panic!("lower write_via_get: {err}"));
+    let field_dump = field_graph.dump();
+    let get_dump = get_graph.dump();
+    let write_dump = write_graph.dump();
+    let residual_arg = |graph: &crate::model::FunctionGraph, dump: &str| {
+        graph
+            .blocks
+            .iter()
+            .flat_map(|block| block.operations.iter())
+            .find_map(|op| match &op.kind {
+                OpKind::Call { target, args, .. }
+                    if target.to_string().contains("replace_word") =>
+                {
+                    args.first()
+                        .and_then(crate::model::LinkArg::as_variable)
+                        .cloned()
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("residual replace_word arg; dump={dump}"))
+    };
+    let field_arg = residual_arg(&field_graph, &field_dump);
+    let get_arg = residual_arg(&get_graph, &get_dump);
+    let field_gcref = field_graph
+        .blocks
+        .iter()
+        .flat_map(|block| block.operations.iter())
+        .any(|op| {
+            crate::model::cast_instance_root(&op.kind) == Some("GCREF")
+                && op.result.as_ref() == Some(&field_arg)
+        })
+        || field_graph
+            .blocks
+            .iter()
+            .flat_map(|block| block.operations.iter())
+            .any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::FieldRead { field, .. }
+                        if field.name == "value" && field.taken_by_address
+                ) && op.result.as_ref() == Some(&field_arg)
+            });
+    assert!(
+        field_gcref,
+        "from_field residual arg is GCREF recast or taken_by_address value; dump={field_dump}"
+    );
+    let get_gcref = get_graph
+        .blocks
+        .iter()
+        .flat_map(|block| block.operations.iter())
+        .any(|op| crate::model::cast_instance_root(&op.kind) == Some("GCREF"));
+    assert!(
+        get_gcref,
+        "from_get remaining-pointer get_slot intern is GCREF; dump={get_dump}"
+    );
+    assert!(
+        field_graph
+            .blocks
+            .iter()
+            .flat_map(|block| block.operations.iter())
+            .all(|op| crate::model::cast_instance_root(&op.kind)
+                .is_none_or(|root| !root.starts_with("MutRef<"))),
+        "from_field must not wrap the residual slot as MutRef; dump={field_dump}"
+    );
+    assert!(
+        get_graph
+            .blocks
+            .iter()
+            .flat_map(|block| block.operations.iter())
+            .all(|op| crate::model::cast_instance_root(&op.kind)
+                .is_none_or(|root| !root.starts_with("MutRef<"))),
+        "from_get must not wrap the residual slot as MutRef; dump={get_dump}"
+    );
+    let writes_owner = write_graph
+        .blocks
+        .iter()
+        .flat_map(|block| block.operations.iter())
+        .any(|op| {
+            matches!(
+                &op.kind,
+                OpKind::FieldWrite { field, .. }
+                    if field.name == "value"
+                        && field
+                            .owner_root
+                            .as_deref()
+                            .is_some_and(|root| root.contains("SlotOwner"))
+            )
+        });
+    let deref_write = write_graph
+        .blocks
+        .iter()
+        .flat_map(|block| block.operations.iter())
+        .any(|op| match &op.kind {
+            OpKind::RawStore { .. } => true,
+            OpKind::Call { target, .. } => {
+                let name = target.to_string();
+                name.contains("deref_write")
+                    || name.contains("raw_store")
+                    || name.contains("setfield")
+            }
+            _ => false,
+        });
+    let writes_mut_ref = write_graph
+        .blocks
+        .iter()
+        .flat_map(|block| block.operations.iter())
+        .any(|op| {
+            matches!(
+                &op.kind,
+                OpKind::FieldWrite { field, .. }
+                    if field
+                        .owner_root
+                        .as_deref()
+                        .is_some_and(|root| root.starts_with("MutRef<"))
+            )
+        });
+    assert!(
+        (writes_owner || deref_write) && !writes_mut_ref,
+        "write through get_slot reaches SlotOwner.value; owner={writes_owner} deref={deref_write} mutref={writes_mut_ref} dump={write_dump}"
+    );
+
+    let program = crate::test_support::build_semantic_program_from_llbc(&llbc)
+        .unwrap_or_else(|e| panic!("semantic program: {e:?}"));
+    let (owner_key, owner_fields) = program
+        .struct_field_attrs
+        .iter()
+        .find(|(key, _)| key.rsplit("::").next() == Some("SlotOwner"))
+        .expect("SlotOwner FORCE fields are harvested");
+    let owner_layout: Vec<(String, String)> = program
+        .struct_fields
+        .fields
+        .get(owner_key)
+        .expect("SlotOwner layout rows are harvested before FORCE")
+        .iter()
+        .map(|row| (row.name.clone(), row.ty.clone()))
+        .collect();
+    crate::annotator::classdesc::register_struct_fields_with_layout_and_registry(
+        owner_key,
+        owner_fields,
+        Some(&owner_layout),
+        &program.struct_fields,
+    );
+    crate::annotator::classdesc::register_struct_fields_with_layout_and_registry(
+        "SlotOwner",
+        owner_fields,
+        Some(&owner_layout),
+        &program.struct_fields,
+    );
+    let ann = RPythonAnnotator::new(None, None, None, false);
+    ann.bookkeeper
+        .set_struct_fields(std::rc::Rc::new(program.struct_fields.clone()));
+    let owner_classdef = ann
+        .bookkeeper
+        .classdef_for_known_struct_root("SlotOwner")
+        .or_else(|| ann.bookkeeper.classdef_for_known_struct_root(owner_key))
+        .unwrap_or_else(|| {
+            panic!("SlotOwner ClassDef is interned from harvested rows; owner_key={owner_key}")
+        });
+    assert!(
+        owner_classdef.borrow().attrs.contains_key("value"),
+        "SlotOwner.value FORCE attribute exists; owner_key={owner_key}"
+    );
+    crate::translator::rtyper::legacy_annotator::annotate_with_bookkeeper(
+        &field_graph,
+        Some(&ann.bookkeeper),
+    );
+    crate::translator::rtyper::legacy_annotator::annotate_with_bookkeeper(
+        &get_graph,
+        Some(&ann.bookkeeper),
+    );
+    let field_s = field_arg.annotation.borrow().clone();
+    let get_s = get_arg.annotation.borrow().clone();
+    assert!(
+        matches!(field_s.as_deref(), Some(SomeValue::Ptr(_))),
+        "from_field residual arg intern is SomePtr, got {field_s:?}; dump={field_dump}"
+    );
+    assert!(
+        matches!(get_s.as_deref(), Some(SomeValue::Ptr(_))),
+        "from_get residual arg intern is SomePtr, got {get_s:?}; dump={get_dump}"
+    );
 }
 
 #[test]

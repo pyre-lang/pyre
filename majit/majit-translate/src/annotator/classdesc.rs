@@ -247,6 +247,12 @@ enum ForceAnnotation {
         can_be_none: bool,
         flags: std::collections::BTreeMap<String, bool>,
     },
+    /// A layout-present std cell. The FORCE table is populated after
+    /// struct-row harvest but before a translation Bookkeeper exists, so it
+    /// stores the intern key and `_init_classdef` resolves the one ClassDef.
+    StructInstance {
+        root: String,
+    },
     /// Two-word fat-dyn (`two_word_fat_struct`): data then metadata, or
     /// the reverse when the host lays the vtable word first.
     Tuple(Vec<ForceAnnotation>),
@@ -304,7 +310,10 @@ impl ForceAnnotation {
         }
     }
 
-    fn to_somevalue(&self) -> SomeValue {
+    fn to_somevalue(
+        &self,
+        bookkeeper: Option<&Rc<crate::annotator::bookkeeper::Bookkeeper>>,
+    ) -> SomeValue {
         match self {
             ForceAnnotation::Impossible => SomeValue::Impossible,
             ForceAnnotation::Integer {
@@ -336,8 +345,23 @@ impl ForceAnnotation {
             ForceAnnotation::InstanceNone { can_be_none, flags } => SomeValue::Instance(
                 super::model::SomeInstance::new(None, *can_be_none, flags.clone()),
             ),
+            ForceAnnotation::StructInstance { root } => {
+                let projected = bookkeeper
+                    .map(|bk| bk.project_struct_field_type(root))
+                    .unwrap_or_else(|| {
+                        panic!("FORCE struct instance {root:?} requires harvested rows")
+                    });
+                assert!(
+                    matches!(projected, SomeValue::Instance(ref inst) if inst.classdef.is_some()),
+                    "FORCE struct instance {root:?} projected as {projected:?}"
+                );
+                projected
+            }
             ForceAnnotation::Tuple(items) => SomeValue::Tuple(SomeTuple::new(
-                items.iter().map(ForceAnnotation::to_somevalue).collect(),
+                items
+                    .iter()
+                    .map(|item| item.to_somevalue(bookkeeper))
+                    .collect(),
             )),
             ForceAnnotation::PtrCCharp => {
                 crate::translator::rtyper::llannotation::lltype_to_annotation(
@@ -350,10 +374,11 @@ impl ForceAnnotation {
 
 fn force_attr_map_from_stored(
     stored: &IndexMap<String, ForceAnnotation>,
+    bookkeeper: Option<&Rc<crate::annotator::bookkeeper::Bookkeeper>>,
 ) -> IndexMap<String, SomeValue> {
     stored
         .iter()
-        .map(|(name, ann)| (name.clone(), ann.to_somevalue()))
+        .map(|(name, ann)| (name.clone(), ann.to_somevalue(bookkeeper)))
         .collect()
 }
 
@@ -547,6 +572,26 @@ pub fn register_struct_fields_with_layout(
     fields: &[(String, crate::model::ValueType)],
     layout: Option<&[(String, String)]>,
 ) {
+    register_struct_fields_with_layout_impl(qualname, fields, layout, None);
+}
+
+/// Production FORCE writer. `struct_fields` is the already-harvested
+/// registry from the same SemanticProgram as `fields` and `layout`.
+pub fn register_struct_fields_with_layout_and_registry(
+    qualname: &str,
+    fields: &[(String, crate::model::ValueType)],
+    layout: Option<&[(String, String)]>,
+    struct_fields: &crate::front::StructFieldRegistry,
+) {
+    register_struct_fields_with_layout_impl(qualname, fields, layout, Some(struct_fields));
+}
+
+fn register_struct_fields_with_layout_impl(
+    qualname: &str,
+    fields: &[(String, crate::model::ValueType)],
+    layout: Option<&[(String, String)]>,
+    struct_fields: Option<&crate::front::StructFieldRegistry>,
+) {
     let mut tables = FORCE_ATTRIBUTES_INTO_CLASSES.write();
     tables.struct_keys.insert(qualname.to_string());
     let entry = tables.attributes.entry(qualname.to_string()).or_default();
@@ -556,6 +601,17 @@ pub fn register_struct_fields_with_layout(
         if let Some(rows) = layout
             && let Some((_, ty)) = rows.iter().find(|(n, _)| n == name)
         {
+            // `ClassDef._init_classdef` installs the attribute annotation
+            // once. A layout-present std cell is its cell class, the same
+            // harvested-row verdict used by `tyref_std_cell_class_root`;
+            // its pointer-sized register bank is not an Integer annotation.
+            if crate::front::std_identity::std_cell_layout_present(ty, struct_fields) {
+                entry.insert(
+                    name.clone(),
+                    ForceAnnotation::StructInstance { root: ty.clone() },
+                );
+                continue;
+            }
             if majit_ir::rvec::rust_vec_item_kind_for_spelling(ty, word).is_some() {
                 continue;
             }
@@ -757,7 +813,7 @@ fn forced_attributes_for(qualname: &str) -> Option<indexmap::IndexMap<String, So
         .read()
         .attributes
         .get(qualname)
-        .map(force_attr_map_from_stored)
+        .map(|stored| force_attr_map_from_stored(stored, None))
 }
 
 // AttrSource (classdesc.py: implicit via duck-typing on InstanceSource /
@@ -1758,7 +1814,7 @@ impl ClassDesc {
                         .filter(|k| tables.struct_keys.contains(*k))
                         .and_then(|k| tables.attributes.get(k))
                 })
-                .map(force_attr_map_from_stored)
+                .map(|stored| force_attr_map_from_stored(stored, Some(&bk)))
         }
         .or_else(|| positional_shape_forced_attributes(&qualname));
         if let Some(overrides) = overrides {

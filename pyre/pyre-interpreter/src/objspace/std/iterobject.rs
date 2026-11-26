@@ -1,7 +1,5 @@
 //! `pypy/objspace/std/iterobject.py` sequence iterator payload and declarations.
 
-#![allow(unsafe_op_in_unsafe_fn)]
-
 use indexmap::IndexMap;
 use pyre_object::gc_roots::RootedItems;
 use pyre_object::typedef::{TypeDef, TypeDefValue};
@@ -33,7 +31,8 @@ pub struct W_StringIterObject {
 // `PyByteArrayIter_Type.tp_name` `"bytearray_iterator"`,
 // `_PyMemoryIter_Type.tp_name` `"memory_iterator"`,
 // `arrayiter_spec.name` `"array.arrayiterator"`.
-// Keep PyPy's `W_SeqIterObject` payload; each identity is its own `PyType`.
+// `bytearray_iterator` shares `W_StringIterObject`'s payload and GC type id,
+// and has its own `PyType` for its Python-visible name.
 // Str uses [`W_FastUnicodeIterObject`].  Bytes/bytearray use
 // [`W_StringIterObject`].
 pub static BYTEARRAY_ITER_TYPE: PyType = pyre_object::new_pytype("bytearray_iterator");

@@ -836,6 +836,601 @@ fn fnptr_field_family_unions_constructor_parameter_across_artefacts() {
     );
 }
 
+fn dynamic_call_ctor_with_fn(
+    def_id: u64,
+    path: &[&str],
+    ctor_id: u64,
+    stored_fun: u64,
+    type_id: u64,
+) -> serde_json::Value {
+    let struct_ty = adt_ty(type_id);
+    let fn_ty = fnptr_ty();
+    serde_json::json!({
+        "def_id": def_id,
+        "item_meta": item_meta_json(path, "", true),
+        "signature": {"is_unsafe": false, "inputs": [], "output": unit_ty()},
+        "src": "Normal",
+        "body": {"Unstructured": {
+            "span": span_json(),
+            "locals": {"arg_count": 0, "locals": [
+                local_ty(0, &unit_ty()),
+                local_ty(1, &fn_ty),
+                local_ty(2, &fn_ty),
+                local_ty(3, &struct_ty)
+            ]},
+            "body": [
+                {
+                    "statements": [
+                        assign_local(1, &fn_ty, fn_def_to_fn_ptr(fn_def_const(ctor_id))),
+                        assign_local(2, &fn_ty, fn_def_to_fn_ptr(fn_def_const(stored_fun)))
+                    ],
+                    "kind": "Regular",
+                    "terminator": {"span": span_json(), "kind": {"Call": {
+                        "call": {
+                            "func": {"Dynamic": [move_local(1, &fn_ty), {"regions": []}]},
+                            "args": [move_local(2, &fn_ty)]
+                        },
+                        "dest": typed_local(3, &struct_ty),
+                        "target": 1,
+                        "on_unwind": 1
+                    }}}
+                },
+                {
+                    "statements": [],
+                    "kind": "Regular",
+                    "terminator": {"span": span_json(), "kind": "Return"}
+                }
+            ]
+        }}
+    })
+}
+
+/// Direct `make(f)` plus a Dynamic call of `make` through a closed fn
+/// pointer with `g` unions both members (`FunctionDesc.pycall` /
+/// `Bookkeeper.consider_call_site` of that `SomePBC`).
+#[test]
+fn fnptr_field_family_unions_resolvable_dynamic_call_of_constructor() {
+    let llbc = fnptr_family_llbc(
+        vec![table_type(0, &["c", "mod", "Table"], &["slot"])],
+        vec![
+            unit_fun(1, &["c", "mod", "f"]),
+            unit_fun(2, &["c", "mod", "g"]),
+            table_param_constructor(21, &["c", "mod", "make"], 0),
+            call_ctor_with_fn(22, &["c", "mod", "call_f"], 21, 1, 0),
+            dynamic_call_ctor_with_fn(23, &["c", "mod", "call_g_dyn"], 21, 2, 0),
+        ],
+        vec![],
+    );
+    let rows = discover_fnptr_field_families(&llbc);
+    assert_eq!(
+        family_members(&rows, "mod::Table", "slot"),
+        ["c::mod::f", "c::mod::g"],
+        "Regular make(f) and Dynamic make(g) union: {rows:?}"
+    );
+}
+
+fn unresolvable_dynamic_taking_ctor_address(
+    def_id: u64,
+    path: &[&str],
+    ctor_id: u64,
+    stored_fun: u64,
+    type_id: u64,
+) -> serde_json::Value {
+    let struct_ty = adt_ty(type_id);
+    let fn_ty = fnptr_ty();
+    serde_json::json!({
+        "def_id": def_id,
+        "item_meta": item_meta_json(path, "", true),
+        "signature": {
+            "is_unsafe": false,
+            "inputs": [fn_ty.clone()],
+            "output": unit_ty()
+        },
+        "src": "Normal",
+        "body": {"Unstructured": {
+            "span": span_json(),
+            "locals": {"arg_count": 1, "locals": [
+                local_ty(0, &unit_ty()),
+                local_ty(1, &fn_ty),
+                local_ty(2, &fn_ty),
+                local_ty(3, &fn_ty),
+                local_ty(4, &struct_ty)
+            ]},
+            "body": [
+                {
+                    "statements": [
+                        assign_local(2, &fn_ty, fn_def_to_fn_ptr(fn_def_const(ctor_id))),
+                        assign_local(3, &fn_ty, fn_def_to_fn_ptr(fn_def_const(stored_fun)))
+                    ],
+                    "kind": "Regular",
+                    "terminator": {"span": span_json(), "kind": {"Call": {
+                        "call": {
+                            "func": {"Dynamic": [move_local(1, &fn_ty), {"regions": []}]},
+                            "args": [move_local(3, &fn_ty)]
+                        },
+                        "dest": typed_local(4, &struct_ty),
+                        "target": 1,
+                        "on_unwind": 1
+                    }}}
+                },
+                {
+                    "statements": [],
+                    "kind": "Regular",
+                    "terminator": {"span": span_json(), "kind": "Return"}
+                }
+            ]
+        }}
+    })
+}
+
+/// Direct `make(f)` plus an unresolvable Dynamic call, with `make`
+/// used as a value, cannot close over `f` (`SomePBC` of every
+/// address-taken FunDecl).
+#[test]
+fn fnptr_field_family_unknown_when_unresolvable_dynamic_can_call_constructor() {
+    let llbc = fnptr_family_llbc(
+        vec![table_type(0, &["c", "mod", "Table"], &["slot"])],
+        vec![
+            unit_fun(1, &["c", "mod", "f"]),
+            unit_fun(2, &["c", "mod", "g"]),
+            table_param_constructor(21, &["c", "mod", "make"], 0),
+            call_ctor_with_fn(22, &["c", "mod", "call_f"], 21, 1, 0),
+            unresolvable_dynamic_taking_ctor_address(23, &["c", "mod", "poison"], 21, 2, 0),
+        ],
+        vec![],
+    );
+    let rows = discover_fnptr_field_families(&llbc);
+    assert!(
+        family_members(&rows, "mod::Table", "slot").is_empty(),
+        "unresolvable Dynamic while make is a value unpublishes: {rows:?}"
+    );
+    assert!(
+        !super::fnptr_field_family_contains(&llbc, "mod::Table", "slot"),
+        "an incomplete input must not publish a smaller closed family"
+    );
+}
+
+fn wrapper_reassign_then_ctor(
+    def_id: u64,
+    path: &[&str],
+    ctor_id: u64,
+    reassigned_fun: u64,
+    type_id: u64,
+) -> serde_json::Value {
+    let struct_ty = adt_ty(type_id);
+    let fn_ty = fnptr_ty();
+    let bool_ty = serde_json::json!({"Scalar": "Bool"});
+    serde_json::json!({
+        "def_id": def_id,
+        "item_meta": item_meta_json(path, "", true),
+        "signature": {
+            "is_unsafe": false,
+            "inputs": [bool_ty.clone(), fn_ty.clone()],
+            "output": unit_ty()
+        },
+        "src": "Normal",
+        "body": {"Unstructured": {
+            "span": span_json(),
+            "locals": {"arg_count": 2, "locals": [
+                local_ty(0, &unit_ty()),
+                local_ty(1, &bool_ty),
+                local_ty(2, &fn_ty),
+                local_ty(3, &struct_ty)
+            ]},
+            "body": [
+                {
+                    "statements": [],
+                    "kind": "Regular",
+                    "terminator": {"span": span_json(), "kind": {"Switch": {
+                        "discr": {"Read": typed_local(1, &bool_ty)},
+                        "targets": {"If": [1, 2]}
+                    }}}
+                },
+                {
+                    "statements": [assign_local(
+                        2,
+                        &fn_ty,
+                        fn_def_to_fn_ptr(fn_def_const(reassigned_fun))
+                    )],
+                    "kind": "Regular",
+                    "terminator": {"span": span_json(), "kind": {"Goto": {"target": 3}}}
+                },
+                {
+                    "statements": [],
+                    "kind": "Regular",
+                    "terminator": {"span": span_json(), "kind": {"Goto": {"target": 3}}}
+                },
+                {
+                    "statements": [],
+                    "kind": "Regular",
+                    "terminator": {"span": span_json(), "kind": {"Call": {
+                        "call": {
+                            "func": {"Regular": {
+                                "kind": {"Fun": ctor_id},
+                                "generics": empty_generics()
+                            }},
+                            "args": [move_local(2, &fn_ty)]
+                        },
+                        "dest": typed_local(3, &struct_ty),
+                        "target": 4,
+                        "on_unwind": 4
+                    }}}
+                },
+                {
+                    "statements": [],
+                    "kind": "Regular",
+                    "terminator": {"span": span_json(), "kind": "Return"}
+                }
+            ]
+        }}
+    })
+}
+
+fn call_wrapper_with_fn(
+    def_id: u64,
+    path: &[&str],
+    wrapper_id: u64,
+    stored_fun: u64,
+) -> serde_json::Value {
+    let fn_ty = fnptr_ty();
+    let bool_ty = serde_json::json!({"Scalar": "Bool"});
+    serde_json::json!({
+        "def_id": def_id,
+        "item_meta": item_meta_json(path, "", true),
+        "signature": {"is_unsafe": false, "inputs": [], "output": unit_ty()},
+        "src": "Normal",
+        "body": {"Unstructured": {
+            "span": span_json(),
+            "locals": {"arg_count": 0, "locals": [
+                local_ty(0, &unit_ty()),
+                local_ty(1, &fn_ty)
+            ]},
+            "body": [
+                {
+                    "statements": [assign_local(
+                        1,
+                        &fn_ty,
+                        fn_def_to_fn_ptr(fn_def_const(stored_fun))
+                    )],
+                    "kind": "Regular",
+                    "terminator": {"span": span_json(), "kind": {"Call": {
+                        "call": {
+                            "func": {"Regular": {
+                                "kind": {"Fun": wrapper_id},
+                                "generics": empty_generics()
+                            }},
+                            "args": [
+                                {"Const": [{"Bool": true}, bool_ty]},
+                                move_local(1, &fn_ty)
+                            ]
+                        },
+                        "dest": typed_local(0, &unit_ty()),
+                        "target": 1,
+                        "on_unwind": 1
+                    }}}
+                },
+                {
+                    "statements": [],
+                    "kind": "Regular",
+                    "terminator": {"span": span_json(), "kind": "Return"}
+                }
+            ]
+        }}
+    })
+}
+
+/// A wrapper that receives `f`, conditionally does `f = g`, then calls
+/// `make(f)` unions the incoming argument with the reassignment
+/// (`RPythonAnnotator.mergeinputargs`).
+#[test]
+fn fnptr_field_family_unions_parameter_with_conditional_reassignment() {
+    let llbc = fnptr_family_llbc(
+        vec![table_type(0, &["c", "mod", "Table"], &["slot"])],
+        vec![
+            unit_fun(1, &["c", "mod", "f"]),
+            unit_fun(2, &["c", "mod", "g"]),
+            table_param_constructor(21, &["c", "mod", "make"], 0),
+            wrapper_reassign_then_ctor(22, &["c", "mod", "wrapper"], 21, 2, 0),
+            call_wrapper_with_fn(23, &["c", "mod", "call_wrapper"], 22, 1),
+        ],
+        vec![],
+    );
+    let rows = discover_fnptr_field_families(&llbc);
+    assert_eq!(
+        family_members(&rows, "mod::Table", "slot"),
+        ["c::mod::f", "c::mod::g"],
+        "incoming f and reassigned g: {rows:?}"
+    );
+}
+
+fn forward_param_to_callees(
+    def_id: u64,
+    path: &[&str],
+    callee_ids: &[u64],
+    callee_output: &serde_json::Value,
+) -> serde_json::Value {
+    let fn_ty = fnptr_ty();
+    let mut locals = vec![local_ty(0, &unit_ty()), local_ty(1, &fn_ty)];
+    for i in 0..callee_ids.len() as u64 {
+        locals.push(local_ty(2 + i, callee_output));
+    }
+    let mut blocks = Vec::new();
+    for (i, callee_id) in callee_ids.iter().enumerate() {
+        let i = i as u64;
+        blocks.push(serde_json::json!({
+            "statements": [],
+            "kind": "Regular",
+            "terminator": {"span": span_json(), "kind": {"Call": {
+                "call": {
+                    "func": {"Regular": {
+                        "kind": {"Fun": callee_id},
+                        "generics": empty_generics()
+                    }},
+                    "args": [copy_local(1, &fn_ty)]
+                },
+                "dest": typed_local(2 + i, callee_output),
+                "target": i + 1,
+                "on_unwind": i + 1
+            }}}
+        }));
+    }
+    blocks.push(serde_json::json!({
+        "statements": [],
+        "kind": "Regular",
+        "terminator": {"span": span_json(), "kind": "Return"}
+    }));
+    serde_json::json!({
+        "def_id": def_id,
+        "item_meta": item_meta_json(path, "", true),
+        "signature": {
+            "is_unsafe": false,
+            "inputs": [fn_ty],
+            "output": unit_ty()
+        },
+        "src": "Normal",
+        "body": {"Unstructured": {
+            "span": span_json(),
+            "locals": {"arg_count": 1, "locals": locals},
+            "body": blocks
+        }}
+    })
+}
+
+fn call_wrappers_with_fn(
+    def_id: u64,
+    path: &[&str],
+    wrapper_ids: &[u64],
+    stored_fun: u64,
+) -> serde_json::Value {
+    let fn_ty = fnptr_ty();
+    let mut locals = vec![local_ty(0, &unit_ty()), local_ty(1, &fn_ty)];
+    for i in 0..wrapper_ids.len() as u64 {
+        locals.push(local_ty(2 + i, &unit_ty()));
+    }
+    let mut blocks = vec![serde_json::json!({
+        "statements": [assign_local(
+            1,
+            &fn_ty,
+            fn_def_to_fn_ptr(fn_def_const(stored_fun))
+        )],
+        "kind": "Regular",
+        "terminator": {"span": span_json(), "kind": {"Call": {
+            "call": {
+                "func": {"Regular": {
+                    "kind": {"Fun": wrapper_ids[0]},
+                    "generics": empty_generics()
+                }},
+                "args": [copy_local(1, &fn_ty)]
+            },
+            "dest": typed_local(2, &unit_ty()),
+            "target": 1,
+            "on_unwind": 1
+        }}}
+    })];
+    for (i, wrapper_id) in wrapper_ids.iter().enumerate().skip(1) {
+        let i = i as u64;
+        blocks.push(serde_json::json!({
+            "statements": [],
+            "kind": "Regular",
+            "terminator": {"span": span_json(), "kind": {"Call": {
+                "call": {
+                    "func": {"Regular": {
+                        "kind": {"Fun": wrapper_id},
+                        "generics": empty_generics()
+                    }},
+                    "args": [copy_local(1, &fn_ty)]
+                },
+                "dest": typed_local(2 + i, &unit_ty()),
+                "target": i + 1,
+                "on_unwind": i + 1
+            }}}
+        }));
+    }
+    blocks.push(serde_json::json!({
+        "statements": [],
+        "kind": "Regular",
+        "terminator": {"span": span_json(), "kind": "Return"}
+    }));
+    serde_json::json!({
+        "def_id": def_id,
+        "item_meta": item_meta_json(path, "", true),
+        "signature": {"is_unsafe": false, "inputs": [], "output": unit_ty()},
+        "src": "Normal",
+        "body": {"Unstructured": {
+            "span": span_json(),
+            "locals": {"arg_count": 0, "locals": locals},
+            "body": blocks
+        }}
+    })
+}
+
+/// A 25-layer diamond of wrappers (two callers per layer, 2^25 paths to
+/// the constructor) closes over the one FunDecl constant at the top in
+/// linear time (`RPythonAnnotator.complete` worklist, not a DFS of paths).
+#[test]
+fn fnptr_field_family_resolves_diamond_wrapper_chain_in_linear_time() {
+    const LAYERS: usize = 25;
+    let f_id = 1u64;
+    let make_id = 2u64;
+    let top_id = 3u64;
+    let wrapper_id = |layer: usize, which: usize| 10 + (layer as u64) * 2 + (which as u64);
+    let mut names = Vec::new();
+    for layer in 0..LAYERS {
+        for which in 0..2 {
+            names.push(format!("w{layer:02}{}", if which == 0 { 'a' } else { 'b' }));
+        }
+    }
+    let mut funs = vec![
+        unit_fun(f_id, &["c", "mod", "f"]),
+        table_param_constructor(make_id, &["c", "mod", "make"], 0),
+    ];
+    let table_ty = adt_ty(0);
+    let unit = unit_ty();
+    for layer in 0..LAYERS {
+        let callees: Vec<u64> = if layer == 0 {
+            vec![make_id]
+        } else {
+            vec![wrapper_id(layer - 1, 0), wrapper_id(layer - 1, 1)]
+        };
+        let output = if layer == 0 { &table_ty } else { &unit };
+        for which in 0..2 {
+            let name = &names[layer * 2 + which];
+            funs.push(forward_param_to_callees(
+                wrapper_id(layer, which),
+                &["c", "mod", name],
+                &callees,
+                output,
+            ));
+        }
+    }
+    funs.push(call_wrappers_with_fn(
+        top_id,
+        &["c", "mod", "top"],
+        &[wrapper_id(LAYERS - 1, 0), wrapper_id(LAYERS - 1, 1)],
+        f_id,
+    ));
+    let llbc = fnptr_family_llbc(
+        vec![table_type(0, &["c", "mod", "Table"], &["slot"])],
+        funs,
+        vec![],
+    );
+    let started = std::time::Instant::now();
+    let rows = discover_fnptr_field_families(&llbc);
+    let elapsed = started.elapsed();
+    assert_eq!(
+        family_members(&rows, "mod::Table", "slot"),
+        ["c::mod::f"],
+        "diamond chain closes over the top FunDecl: {rows:?}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(1),
+        "diamond chain of {LAYERS} layers took {elapsed:?}"
+    );
+}
+
+/// `a = phi(b, f)`, `b = phi(a, g)`: querying `a` then `b` from one
+/// function still closes `b` over both FunDecls. Caching a cycle-cut
+/// `ClosedCopy` on `b` while `a` is on the stack would keep only `g`.
+#[test]
+fn fnptr_field_family_unions_cyclic_local_phis_on_second_query() {
+    let fn_ty = fnptr_ty();
+    let table_a = adt_ty(0);
+    let table_b = adt_ty(1);
+    let cycle = serde_json::json!({
+        "def_id": 23,
+        "item_meta": item_meta_json(&["c", "mod", "cycle"], "", true),
+        "signature": {"is_unsafe": false, "inputs": [], "output": unit_ty()},
+        "src": "Normal",
+        "body": {"Unstructured": {
+            "span": span_json(),
+            "locals": {"arg_count": 0, "locals": [
+                local_ty(0, &unit_ty()),
+                local_ty(1, &fn_ty),
+                local_ty(2, &fn_ty),
+                local_ty(3, &table_a),
+                local_ty(4, &table_b)
+            ]},
+            "body": [
+                {
+                    "statements": [
+                        assign_local(1, &fn_ty, fn_def_to_fn_ptr(fn_def_const(1))),
+                        assign_local(2, &fn_ty, fn_def_to_fn_ptr(fn_def_const(2))),
+                        assign_local(
+                            1,
+                            &fn_ty,
+                            serde_json::json!({"Use": [copy_local(2, &fn_ty), "No"]})
+                        ),
+                        assign_local(
+                            2,
+                            &fn_ty,
+                            serde_json::json!({"Use": [copy_local(1, &fn_ty), "No"]})
+                        )
+                    ],
+                    "kind": "Regular",
+                    "terminator": {"span": span_json(), "kind": {"Call": {
+                        "call": {
+                            "func": {"Regular": {
+                                "kind": {"Fun": 21},
+                                "generics": empty_generics()
+                            }},
+                            "args": [copy_local(1, &fn_ty)]
+                        },
+                        "dest": typed_local(3, &table_a),
+                        "target": 1,
+                        "on_unwind": 1
+                    }}}
+                },
+                {
+                    "statements": [],
+                    "kind": "Regular",
+                    "terminator": {"span": span_json(), "kind": {"Call": {
+                        "call": {
+                            "func": {"Regular": {
+                                "kind": {"Fun": 22},
+                                "generics": empty_generics()
+                            }},
+                            "args": [copy_local(2, &fn_ty)]
+                        },
+                        "dest": typed_local(4, &table_b),
+                        "target": 2,
+                        "on_unwind": 2
+                    }}}
+                },
+                {
+                    "statements": [],
+                    "kind": "Regular",
+                    "terminator": {"span": span_json(), "kind": "Return"}
+                }
+            ]
+        }}
+    });
+    let llbc = fnptr_family_llbc(
+        vec![
+            table_type(0, &["c", "mod", "TableA"], &["slot"]),
+            table_type(1, &["c", "mod", "TableB"], &["slot"]),
+        ],
+        vec![
+            unit_fun(1, &["c", "mod", "f"]),
+            unit_fun(2, &["c", "mod", "g"]),
+            table_param_constructor(21, &["c", "mod", "make_a"], 0),
+            table_param_constructor(22, &["c", "mod", "make_b"], 1),
+            cycle,
+        ],
+        vec![],
+    );
+    let rows = discover_fnptr_field_families(&llbc);
+    assert_eq!(
+        family_members(&rows, "mod::TableA", "slot"),
+        ["c::mod::f", "c::mod::g"],
+        "first query a unions f and g: {rows:?}"
+    );
+    assert_eq!(
+        family_members(&rows, "mod::TableB", "slot"),
+        ["c::mod::f", "c::mod::g"],
+        "second query b must still include f: {rows:?}"
+    );
+}
+
 fn dynamic_call_fun(
     def_id: u64,
     path: &[&str],

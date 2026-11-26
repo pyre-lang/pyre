@@ -2321,10 +2321,13 @@ pub(in crate::front::mir) fn one_level_pointer_pointee<'a>(
 
 /// After exactly one `Ref` ([`strip_ty_indirections`], not
 /// [`strip_ty_wrappers`]) plus alias peel, the Option payload is still a
-/// pointer (`Option<&*mut T>` / `Option<&&T>`): the address of a slot, not
-/// class `T`. [`option_payload_instance_class_root`] and
+/// raw pointer (`Option<&*mut T>` / `Option<&mut *mut T>` / alias such as
+/// `PyObjectRef`): the address of a slot, not class `T`.
+/// [`option_payload_instance_class_root`] and
 /// [`Lowering::option_residual_narrow_root`] share this test so a remaining
 /// pointer is not extra-peeled into the pointee class (`rdict.py` `ll_get`).
+/// `Box<T>` / `NonNull<T>` / an extra `Ref` is an object handle, not a
+/// remaining-pointer slot (`one_level_pointer_pointee` peels those).
 pub(in crate::front::mir) fn option_payload_remaining_pointer(
     payload: &serde_json::Value,
     llbc: &Llbc,
@@ -2344,7 +2347,32 @@ pub(in crate::front::mir) fn option_payload_remaining_pointer(
         return false;
     };
     let pointee = type_node_peel_aliases(pointee, llbc).unwrap_or(pointee);
-    one_level_pointer_pointee(pointee, llbc).is_some()
+    pointee
+        .as_object()
+        .is_some_and(|obj| obj.contains_key("RawPtr"))
+}
+
+/// `llmemory.py` `GCREF` intern of a remaining-pointer slot
+/// (`Option<&mut *mut T>` / `&mut *mut T`): the address of a slot,
+/// not class `T` (`rdict.py` `ll_get`). Same intern as a harvested
+/// `taken_by_address` FieldRead (`jtransform.py` `rewrite_op_getsubstruct`).
+pub(in crate::front::mir) const REMAINING_POINTER_SLOT_ROOT: &str = "GCREF";
+
+/// `&mut *mut T` / `&mut AliasToRawPtr`: the address of a remaining-pointer
+/// slot. Shared leftover `Option<&*mut T>` is a remaining pointer
+/// ([`option_payload_remaining_pointer`]) but not this slot intern.
+pub(in crate::front::mir) fn tyref_remaining_mut_pointer_slot(ty: &TyRef, llbc: &Llbc) -> bool {
+    tyref_mut_ref_pointee(ty, llbc).is_some()
+        && tyref_node(ty, llbc).is_some_and(|node| option_payload_remaining_pointer(node, llbc))
+}
+
+/// True when `ty` is `Option<&mut *mut T>` (or alias): leftover intern is
+/// the slot address ([`REMAINING_POINTER_SLOT_ROOT`]).
+pub(in crate::front::mir) fn tyref_option_remaining_pointer_slot(ty: &TyRef, llbc: &Llbc) -> bool {
+    let Some(payload) = crate::front::result_exc::tyref_option_payload(ty, llbc) else {
+        return false;
+    };
+    tyref_remaining_mut_pointer_slot(&payload, llbc)
 }
 
 /// Whether `node` names a harvested `_alloc_flavor_ = raw` ADT
@@ -5475,6 +5503,14 @@ pub(in crate::front::mir) fn dont_look_inside_return_token(
     if tyref_is_gcref_spelling(kind_src, llbc) {
         return Some(crate::translator::rtyper::cutover::GCREF_RETURN_TYPE.to_string());
     }
+    // Remaining-pointer `Option<&mut *mut T>` is the slot address
+    // (`rdict.py` `ll_get`), intern'd as `llmemory.GCREF` SomePtr
+    // (`llannotation.py` `lltype_to_annotation`). Token `"ref"` would
+    // keep the Option enum ClassDef beside a harvested FieldRead
+    // `Ptr(GCREF)` (`annrpython.py` `RPythonAnnotator.mergeinputargs`).
+    if tyref_option_remaining_pointer_slot(kind_src, llbc) {
+        return Some(crate::translator::rtyper::cutover::GCREF_RETURN_TYPE.to_string());
+    }
     // `history.py` `getkind` of a raw `Ptr` is `int`, including `*mut f64`.
     // `return_type_string_to_value_type` reads the `i64` token as that int.
     // A byte pointer stays on the `ref` arm below.
@@ -5605,6 +5641,25 @@ pub(in crate::front::mir) fn dont_look_inside_return_class_root(
     // holds T inline is not treated as a wrapper of T
     // (`signature.py` `annotationoftype`).
     if let Some(root) = tyref_std_cell_class_root(ty, llbc, tombstoned, struct_fields) {
+        return Some(root);
+    }
+    // A remaining-pointer `Option<&mut *mut T>` is the slot address
+    // (`rdict.py` `ll_get` / `llmemory.py` `GCREF`). A GC handle
+    // `Option<&mut T>` payload is the MutRef cell
+    // (`option_niche_payload_class_root` /
+    // `tyref_option_gc_mut_ref_cell_root`). Before the GC-payload
+    // Option spelling so residual intern is that slot / cell, not
+    // `project_struct_field_type` of the Option
+    // (`annrpython.py` `RPythonAnnotator.mergeinputargs` / `unionof`
+    // of `s_None` with the Some instance; `rclass.py` `InstanceRepr`).
+    if let Some(root) = tyref_option_gc_mut_ref_or_slot_root(
+        ty,
+        llbc,
+        tombstoned,
+        gc_struct_ids,
+        raw_alloc_flavor_structs,
+        struct_fields,
+    ) {
         return Some(root);
     }
     if let Some(root) =
@@ -5855,6 +5910,20 @@ pub(in crate::front::mir) fn dont_look_inside_return_can_be_none(
         )
         .is_some()
         || tyref_raw_ptr_pointee_is_string_value(ty, llbc)
+        // Remaining-pointer `Option<&mut *mut T>` is a nullable slot
+        // address (`rdict.py` `ll_get` / `llmemory.py` `GCREF`).
+        || tyref_option_remaining_pointer_slot(ty, llbc)
+        // `Option<&mut T>` is the MutRef cell, nullable
+        // (`gc_mut_ref_input_stamp` / `model.py` `SomeInstance.__init__`).
+        || tyref_option_gc_mut_ref_cell_root(
+            ty,
+            llbc,
+            no_tombstoned_leaves(),
+            gc_struct_ids,
+            raw_alloc_flavor_structs,
+            None,
+        )
+        .is_some()
 }
 
 /// Field-layout spelling of a `*mut Vec<T>` / `*mut VecDeque<T>` / `*mut [T]`
@@ -13407,7 +13476,7 @@ pub(in crate::front::mir) fn tyref_peel_one_raw_ptr_through_aliases<'l>(
 /// The callee writes the field, so the post-call read is not the pre-call
 /// SSA value. `optimizeopt/virtualize.py` removes the cell once the callee
 /// is inlined; this pass must leave the constructor.
-pub(in crate::front::mir) fn is_mut_ref_cell_name(name: &str) -> bool {
+pub(crate) fn is_mut_ref_cell_name(name: &str) -> bool {
     name.starts_with("MutRef<")
 }
 
@@ -13659,6 +13728,8 @@ pub(in crate::front::mir) fn gc_mut_ref_param_locals(
 /// `Option<&mut T>` occupies a MutRef cell in its Some payload when `T`
 /// is a GC pointer. The Option itself is not a cell:
 /// [`tyref_gc_mut_ref_cell_root`] / [`gc_mut_ref_param_root`] name `&mut T`.
+/// A remaining-pointer payload (`Option<&mut *mut T>`) is the slot
+/// address, not a cell (`rdict.py` `ll_get`).
 pub(in crate::front::mir) fn tyref_option_gc_mut_ref_cell_root(
     ty: &TyRef,
     llbc: &Llbc,
@@ -13667,6 +13738,9 @@ pub(in crate::front::mir) fn tyref_option_gc_mut_ref_cell_root(
     raw_alloc_flavor_structs: &std::collections::HashSet<String>,
     struct_fields: Option<&crate::front::semantic::StructFieldRegistry>,
 ) -> Option<String> {
+    if tyref_option_remaining_pointer_slot(ty, llbc) {
+        return None;
+    }
     let payload = crate::front::result_exc::tyref_option_payload(ty, llbc)?;
     tyref_gc_mut_ref_cell_root(
         &payload,
@@ -13676,6 +13750,33 @@ pub(in crate::front::mir) fn tyref_option_gc_mut_ref_cell_root(
         raw_alloc_flavor_structs,
         struct_fields,
     )
+}
+
+/// Recast / leftover intern root of a GC `Option<&mut T>` dest: the
+/// MutRef cell for a handle payload, [`REMAINING_POINTER_SLOT_ROOT`]
+/// for a remaining-pointer payload. Shared by Some construction, dest
+/// recast, and residual intern (`annrpython.py`
+/// `RPythonAnnotator.mergeinputargs`).
+pub(in crate::front::mir) fn tyref_option_gc_mut_ref_or_slot_root(
+    ty: &TyRef,
+    llbc: &Llbc,
+    tombstoned: &std::collections::HashSet<String>,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+    struct_fields: Option<&crate::front::semantic::StructFieldRegistry>,
+) -> Option<String> {
+    if tyref_option_remaining_pointer_slot(ty, llbc) {
+        Some(REMAINING_POINTER_SLOT_ROOT.to_string())
+    } else {
+        tyref_option_gc_mut_ref_cell_root(
+            ty,
+            llbc,
+            tombstoned,
+            gc_struct_ids,
+            raw_alloc_flavor_structs,
+            struct_fields,
+        )
+    }
 }
 
 /// Input stamp of a MutRef cell parameter.

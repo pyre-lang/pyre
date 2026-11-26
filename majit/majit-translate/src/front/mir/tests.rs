@@ -22479,9 +22479,10 @@ fn residual_option_dest_cast_roots(graph: &FunctionGraph) -> Vec<&str> {
         .collect()
 }
 
-/// Residual dest `Option<&*mut GcStruct>` is a slot address (`rdict.py`
-/// `ll_get`): `option_residual_narrow_root` must not extra-peel it into
-/// class `GcStruct`. `Option<*mut GcStruct>` keeps today's payload-class
+/// Residual dest `Option<&*mut GcStruct>` is a remaining pointer
+/// (`rdict.py` `ll_get`) but not the Mut remaining-pointer slot intern
+/// (`llmemory.py` `GCREF`). Dest recast stays off class `GcStruct` and
+/// off `GCREF`. `Option<*mut GcStruct>` keeps today's payload-class
 /// trailing `__cast_instance_intrinsic`.
 #[test]
 fn residual_slot_ref_option_dest_is_not_the_pointee_class() {

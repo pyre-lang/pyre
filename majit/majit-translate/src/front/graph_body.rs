@@ -205,7 +205,7 @@ impl GraphBodyProvider {
         let module_filter = mir::normalize_module_filter(module_paths);
         let paint_tombstones =
             mir::prelink_crate(&llbc, cross_tombstoned_leaves, raw_alloc_flavor_structs);
-        let mut state = CrateLoweringState::new(
+        let mut state = CrateLoweringState::new_with_prior_struct_fields(
             &llbc,
             &paint_tombstones,
             self.tables.func_hints.clone(),
@@ -215,14 +215,20 @@ impl GraphBodyProvider {
             None,
             None,
             self.tables.struct_layouts.clone(),
+            &self
+                .crates
+                .iter()
+                .map(|prev| prev.state.struct_fields())
+                .collect::<Vec<_>>(),
         );
         for prev in &self.crates {
-            state.absorb_struct_fields(prev.state.struct_fields());
             state.absorb_raw_alloc_flavor_structs(prev.state.raw_alloc_flavor_structs());
         }
         // Stub FUNC.RESULT tokens read the harvested intern rows ordinary
         // lowering uses (`std_cell_layout_present`). Collect after
-        // `CrateLoweringState::new` so the classifier sees one registry.
+        // `CrateLoweringState::new_with_prior_struct_fields` so the
+        // classifier sees one registry, including instantiation keys
+        // published from earlier crates' layout rows.
         let (stubs, foreign) = self.collect_residual_stubs(
             &llbc,
             gc_struct_ids,
@@ -248,14 +254,18 @@ impl GraphBodyProvider {
     /// pipeline declares every admitted funcobj; a test that only reads
     /// one body should not lower the rest.
     #[cfg(test)]
-    fn lower_named_for_test(&mut self, llbc: Llbc, function_names: &[&str]) -> SemanticProgram {
+    pub(crate) fn lower_named_for_test(
+        &mut self,
+        llbc: Llbc,
+        function_names: &[&str],
+    ) -> SemanticProgram {
         let function_filter: HashSet<String> = function_names
             .iter()
             .map(|name| (*name).to_string())
             .collect();
         let paint_tombstones = mir::prelink_crate(&llbc, &HashSet::new(), &HashSet::new());
         let gc_struct_ids = mir::harvest_declared_gc_facts(&llbc).gc_struct_ids();
-        let mut state = CrateLoweringState::new(
+        let mut state = CrateLoweringState::new_with_prior_struct_fields(
             &llbc,
             &paint_tombstones,
             self.tables.func_hints.clone(),
@@ -265,9 +275,13 @@ impl GraphBodyProvider {
             None,
             Some(&function_filter),
             self.tables.struct_layouts.clone(),
+            &self
+                .crates
+                .iter()
+                .map(|prev| prev.state.struct_fields())
+                .collect::<Vec<_>>(),
         );
         for prev in &self.crates {
-            state.absorb_struct_fields(prev.state.struct_fields());
             state.absorb_raw_alloc_flavor_structs(prev.state.raw_alloc_flavor_structs());
         }
         let empty_raw = HashSet::new();

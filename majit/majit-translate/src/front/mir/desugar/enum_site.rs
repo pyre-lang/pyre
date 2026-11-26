@@ -623,6 +623,17 @@ impl<'a> Lowering<'a> {
         {
             return Some((root, ValueType::Int));
         }
+        // Remaining-pointer `Option<&mut *mut T>` is the slot address
+        // (`rdict.py` `ll_get` / `llmemory.py` `GCREF`). `Ref(Some(GCREF))`
+        // so leftover intern is `SomePtr`; `enum_payload_is_nullable_instance_ptr`
+        // skips a GCREF root so the word is not recast onto `W_ROOT`
+        // (`llannotation.py` `lltype_to_annotation` of `Ptr(GcOpaqueType)`).
+        if tyref_option_remaining_pointer_slot(option_ty, self.llbc) {
+            return Some((
+                REMAINING_POINTER_SLOT_ROOT.to_string(),
+                ValueType::Ref(Some(REMAINING_POINTER_SLOT_ROOT.to_string())),
+            ));
+        }
         // `None` of a nullable instance is RPython's `None`, which unions
         // into `SomeInstance(T, can_be_none=True)` and keeps the class
         // (`model.py` `unionof`). The bare `null_mut()` is classdef-less.
@@ -669,6 +680,7 @@ impl<'a> Lowering<'a> {
                             && !root.starts_with("VecDeque<")
                             && !crate::front::mir::is_str_family_class_root(&root)
                             && !crate::front::mir::is_str_family_class_root(payload)
+                            && !crate::annotator::bookkeeper::is_gcref_type_spelling(&root)
                 )
             })
         {

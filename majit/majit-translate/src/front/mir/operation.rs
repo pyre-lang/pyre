@@ -3435,6 +3435,19 @@ impl<'a> Lowering<'a> {
                 // A Deref reborrow of an existing `&[u8]` keeps the identity.
                 let v = self.resolve_place(mir_bb, place)?;
                 self.mark_place_address_of(mir_bb, address, before, &v);
+                // Remaining-pointer `&mut *mut T` of a field is the slot
+                // address (`rdict.py` `ll_get` / `jtransform.py`
+                // `rewrite_op_getsubstruct`). Recast onto `llmemory.GCREF`
+                // so a residual `&mut T` argument intern's `SomePtr` with
+                // the Option leftover intern (`annrpython.py`
+                // `RPythonAnnotator.mergeinputargs`).
+                let recast_slot = matches!(address, BorrowAddress::Field)
+                    && tyref_remaining_mut_pointer_slot(dest_ty, self.llbc);
+                let v = if recast_slot {
+                    self.cast_ref_word(mir_bb, v, REMAINING_POINTER_SLOT_ROOT)
+                } else {
+                    v
+                };
                 Ok((None, v))
             }
             // `RawPtr { place, ... }` — `&raw const x` / `&raw mut x`.
@@ -3932,6 +3945,25 @@ impl<'a> Lowering<'a> {
                                 Some(crate::model::cast_instance_call("GCREF", orig)),
                                 res,
                             ));
+                        }
+                        // `Some` of a GC `Option<&mut T>` is the MutRef
+                        // cell (`option_niche_payload_class_root`). A
+                        // remaining-pointer field address
+                        // (`&mut owner.value` of `*mut T`) is a FieldRead
+                        // of T; recast onto `llmemory.GCREF` so it unions
+                        // with None (`annrpython.py` `unionof` of
+                        // `s_None` with the Some instance; `rclass.py`
+                        // `InstanceRepr` / `llannotation.py`
+                        // `lltype_to_annotation`).
+                        if let Some(root) = tyref_option_gc_mut_ref_or_slot_root(
+                            dest_ty,
+                            self.llbc,
+                            self.tombstoned_leaves,
+                            self.gc_struct_ids,
+                            &self.raw_alloc_flavor_structs,
+                            self.struct_fields,
+                        ) {
+                            return Ok((None, self.cast_ref_word(mir_bb, value, &root)));
                         }
                         Ok(self.retag_error_carrier(dest_ty, value))
                     }
@@ -7366,6 +7398,7 @@ impl<'a> Lowering<'a> {
             self.tombstoned_leaves,
             self.gc_struct_ids,
             &self.raw_alloc_flavor_structs,
+            self.struct_fields,
         )
         .or_else(|| {
             tyref_by_value_struct_decl(
@@ -7374,6 +7407,7 @@ impl<'a> Lowering<'a> {
                 self.tombstoned_leaves,
                 self.gc_struct_ids,
                 &self.raw_alloc_flavor_structs,
+                self.struct_fields,
             )
         })?;
         if type_decl_is_by_value_integer_newtype(parent_td, self.llbc) {
