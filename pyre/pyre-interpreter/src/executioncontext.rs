@@ -6,7 +6,7 @@ use std::cell::{Cell, RefCell};
 use std::ops::Deref;
 use std::ptr::NonNull;
 use std::sync::OnceLock;
-use std::sync::atomic::AtomicPtr;
+use std::sync::atomic::{AtomicBool, AtomicPtr};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::PyFrame;
@@ -510,13 +510,13 @@ impl WRootFinalizerQueue {
         pyre_object::gc_hook::try_gc_get_finalizer_queue_index(Self::fq_tag())
     }
 
-    /// `pypy/interpreter/executioncontext.py:640` —
+    /// `executioncontext.py UserDelAction._run_finalizers` —
     /// `self.space.finalizer_queue.next_dead()`.
     ///
     /// Returns the next `w_obj` whose finalizer should run, or `None`
     /// when the death queue is empty.
     ///
-    pub fn next_dead(&mut self) -> Option<PyObjectRef> {
+    pub fn next_dead(&self) -> Option<PyObjectRef> {
         let obj = pyre_object::gc_hook::try_gc_finalizer_next_dead(Self::fq_index());
         (!obj.is_null()).then_some(obj)
     }
@@ -584,7 +584,7 @@ pub(crate) fn walk_space_user_del_action_roots(visitor: &mut dyn FnMut(&mut maji
         }
     };
     forward(&mut action.base.space);
-    if let Some(pending) = action.pending_with_disabled_del.as_mut() {
+    if let Some(pending) = action.pending_with_disabled_del.lock().as_mut() {
         for obj in pending {
             forward(obj);
         }
@@ -1498,6 +1498,7 @@ impl ExecutionContext {
     }
 
     pub fn install_user_del_action(&mut self) {
+        let _action_lock = action_flag_lock();
         let actionflag = self.actionflag.shared_mut();
         install_space_user_del_action(self.space, actionflag);
         #[cfg(all(
@@ -2619,9 +2620,8 @@ impl ExecutionContext {
     pub fn checksignals(&mut self) -> Result<(), crate::PyError> {
         if let Some(action) = self.check_signal_action {
             let self_ptr = self as *mut ExecutionContext;
-            unsafe {
-                perform_async_action(action, self_ptr, std::ptr::null_mut())?;
-            }
+            let result = unsafe { perform_async_action(action, self_ptr, std::ptr::null_mut()) };
+            finish_async_action(result?);
         }
         Ok(())
     }
@@ -2738,35 +2738,52 @@ pub extern "C" fn perform_pending_actions(ec: *mut ExecutionContext, frame: *mut
     }
 }
 
-/// Invoke one action, ending the action object's exclusive borrow before a
-/// requested GIL hand-off.  `GILReleaseAction` is process-owned, so the next
-/// thread can dispatch this same object as soon as it acquires the GIL.  A
-/// direct `perform()` implementation that yields would leave the first
-/// thread's `&mut dyn AsyncActionOps` live across that second mutable borrow.
+/// Invoke one action and return any requested GIL hand-off to the caller.
+/// `perform` has a shared receiver because, with the GIL off, no lock spans
+/// `executioncontext.py action_dispatcher`'s call into application code.
+/// `GILReleaseAction` still returns the hand-off request so yielding happens
+/// after the action call itself has completed.
 ///
 /// # Safety
 ///
 /// `action` and `ec` must point to live objects for the duration of the
-/// action call.  The caller must hold the GIL on entry.
+/// action call. Each implementation must keep its shared state atomic or hold
+/// a short state-update lock that is released before application code runs.
 unsafe fn perform_async_action(
     action: *mut dyn AsyncActionOps,
     ec: *mut ExecutionContext,
     frame: *mut PyFrame,
-) -> Result<(), crate::PyError> {
-    let control = unsafe { (*action).perform(&mut *ec, frame)? };
+) -> Result<AsyncActionControl, crate::PyError> {
+    unsafe { (&*action).perform(&mut *ec, frame) }
+}
+
+fn finish_async_action(control: AsyncActionControl) {
     if control == AsyncActionControl::YieldGil {
         majit_gc::rgil::yield_thread();
     }
-    Ok(())
 }
 
-#[derive(Clone)]
 pub struct AbstractActionFlag {
     _periodic_actions: Vec<*mut dyn AsyncActionOps>,
     _nonperiodic_actions: Vec<*mut dyn AsyncActionOps>,
-    pub(crate) _fired_bitmask: usize,
-    has_bytecode_counter: bool,
+    pub(crate) _fired_bitmask: AtomicUsize,
+    has_bytecode_counter: AtomicBool,
     pub checkinterval_scaled: usize,
+}
+
+impl Clone for AbstractActionFlag {
+    fn clone(&self) -> Self {
+        let _action_lock = action_flag_lock();
+        Self {
+            _periodic_actions: self._periodic_actions.clone(),
+            _nonperiodic_actions: self._nonperiodic_actions.clone(),
+            _fired_bitmask: AtomicUsize::new(self._fired_bitmask.load(Ordering::Acquire)),
+            has_bytecode_counter: AtomicBool::new(
+                self.has_bytecode_counter.load(Ordering::Relaxed),
+            ),
+            checkinterval_scaled: self.checkinterval_scaled,
+        }
+    }
 }
 
 impl Default for AbstractActionFlag {
@@ -2780,8 +2797,8 @@ impl AbstractActionFlag {
         Self {
             _periodic_actions: Vec::new(),
             _nonperiodic_actions: Vec::new(),
-            _fired_bitmask: 0,
-            has_bytecode_counter: false,
+            _fired_bitmask: AtomicUsize::new(0),
+            has_bytecode_counter: AtomicBool::new(false),
             checkinterval_scaled: 10000 * TICK_COUNTER_STEP,
         }
     }
@@ -2827,7 +2844,7 @@ impl AbstractActionFlag {
 /// the default bodies stay a line-for-line port of upstream.
 pub trait ActionFlagOps {
     /// pypy/interpreter/executioncontext.py `ActionFlag.reset_ticker`.
-    fn reset_ticker(&mut self, value: isize);
+    fn reset_ticker(&self, value: isize);
 
     /// pypy/interpreter/executioncontext.py `ActionFlag.get_ticker`.
     fn get_ticker(&self) -> isize;
@@ -2880,6 +2897,7 @@ pub trait ActionFlagOps {
         action: *mut dyn PeriodicAsyncActionOps,
         use_bytecode_counter: bool,
     ) {
+        let _action_lock = action_flag_lock();
         // Trait upcast (stable since Rust 1.86) erases the periodic
         // marker so storage stays as the polymorphic
         // `*mut dyn AsyncActionOps` that `action_dispatcher` reads.
@@ -2887,7 +2905,7 @@ pub trait ActionFlagOps {
         let flag = self.abstract_flag_mut();
         if use_bytecode_counter {
             flag._periodic_actions.push(action_ops);
-            flag.has_bytecode_counter = true;
+            flag.has_bytecode_counter.store(true, Ordering::Relaxed);
         } else {
             flag._periodic_actions.insert(0, action_ops);
         }
@@ -2898,6 +2916,7 @@ pub trait ActionFlagOps {
     /// `register_nonperiodic_action`.  Trait default for the same
     /// reason as `register_periodic_action` above.
     fn register_nonperiodic_action(&mut self, action: *mut dyn AsyncActionOps) -> isize {
+        let _action_lock = action_flag_lock();
         let flag = self.abstract_flag_mut();
         flag._nonperiodic_actions.push(action);
         assert!(flag._nonperiodic_actions.len() < 32);
@@ -2907,6 +2926,7 @@ pub trait ActionFlagOps {
 
     /// pypy/interpreter/executioncontext.py `getcheckinterval`.
     fn getcheckinterval(&self) -> usize {
+        let _action_lock = action_flag_lock();
         self.abstract_flag().checkinterval_scaled / TICK_COUNTER_STEP
     }
 
@@ -2930,7 +2950,7 @@ pub trait ActionFlagOps {
     /// `#[dont_look_inside]` emits a generic prebuild method, and that
     /// method would make object-safe `ActionFlagOps` unusable as
     /// `dyn ActionFlagOps`.
-    fn fire(&mut self, action: *mut dyn AsyncActionOps) {
+    fn fire(&self, action: *mut dyn AsyncActionOps) {
         #[doc(hidden)]
         #[allow(non_upper_case_globals)]
         const _jit_look_inside_fire: bool = false;
@@ -2944,9 +2964,14 @@ pub trait ActionFlagOps {
             "periodic actions must not call fire"
         );
         let bitmask = base.bitmask;
-        let already_fired = self.abstract_flag()._fired_bitmask & bitmask != 0;
-        if !already_fired {
-            self.abstract_flag_mut()._fired_bitmask |= bitmask;
+        // `executioncontext.py AbstractActionFlag.fire` can run inside a GC
+        // callback while another thread parks holding the action lock. Only
+        // atomic state is touched here; taking that lock would deadlock STW.
+        let previous = self
+            .abstract_flag()
+            ._fired_bitmask
+            .fetch_or(bitmask, Ordering::AcqRel);
+        if previous & bitmask == 0 {
             self.reset_ticker(-1);
         }
     }
@@ -2964,6 +2989,7 @@ pub trait ActionFlagOps {
     ///     self.reset_ticker(-1)
     /// ```
     fn setcheckinterval(&mut self, interval: usize) {
+        let _action_lock = action_flag_lock();
         let max = usize::MAX / TICK_COUNTER_STEP;
         let interval = interval.max(1).min(max);
         self.abstract_flag_mut().checkinterval_scaled = interval * TICK_COUNTER_STEP;
@@ -3033,39 +3059,52 @@ pub trait ActionFlagOps {
             majit_gc::gc_sync::safepoint_poll();
             return Err(crate::runtime_ops::asynchronous_memory_error());
         }
-        // executioncontext.py:539-540 — periodic actions iter.
-        // Snapshot pointers before iteration; perform() may register
-        // additional actions and mutate `_periodic_actions`.
-        let periodic: Vec<*mut dyn AsyncActionOps> = self.abstract_flag()._periodic_actions.clone();
+
+        // executioncontext.py `action_dispatcher` — periodic actions iter.
+        // Snapshot pointers before iteration; perform() may register more
+        // actions. Registration uses this lock, but perform() never holds it.
+        let periodic: Vec<*mut dyn AsyncActionOps> = {
+            let _action_lock = action_flag_lock();
+            self.abstract_flag()._periodic_actions.clone()
+        };
         for action_ptr in periodic {
             if action_ptr.is_null() || ec.is_null() {
                 continue;
             }
-            unsafe {
-                perform_async_action(action_ptr, ec, anchor.live())?;
-            }
+            let result = unsafe { perform_async_action(action_ptr, ec, anchor.live()) };
+            finish_async_action(result?);
         }
-        // executioncontext.py:543-556 — nonperiodic bit-mask scan.
+        // executioncontext.py `action_dispatcher` — nonperiodic bit-mask scan.
         // Clear each bit before perform() so a fire() during perform()
         // re-arms cleanly (NB at executioncontext.py).
-        if self.abstract_flag()._fired_bitmask != 0 {
-            let nactions = self.abstract_flag()._nonperiodic_actions.len();
-            for i in 0..nactions {
+        if self.abstract_flag()._fired_bitmask.load(Ordering::Acquire) != 0 {
+            // `for i in range(len(self._nonperiodic_actions))` reads the length
+            // after the periodic actions ran, so an action they registered is
+            // scanned now. Registration only appends, so the snapshot holds the
+            // same entries the loop would read by index.
+            let nonperiodic: Vec<*mut dyn AsyncActionOps> = {
+                let _action_lock = action_flag_lock();
+                self.abstract_flag()._nonperiodic_actions.clone()
+            };
+            for (i, action_ptr) in nonperiodic.into_iter().enumerate() {
                 let mask: usize = 1usize << i;
-                if self.abstract_flag()._fired_bitmask & mask != 0 {
-                    let action_ptr = self.abstract_flag()._nonperiodic_actions[i];
-                    self.abstract_flag_mut()._fired_bitmask &= !mask;
-                    if !action_ptr.is_null() && !ec.is_null() {
-                        unsafe {
-                            perform_async_action(action_ptr, ec, anchor.live())?;
-                        }
-                    }
+                if action_ptr.is_null() || ec.is_null() {
+                    continue;
                 }
+                let fired = self
+                    .abstract_flag()
+                    ._fired_bitmask
+                    .fetch_and(!mask, Ordering::AcqRel);
+                if fired & mask == 0 {
+                    continue;
+                }
+                let result = unsafe { perform_async_action(action_ptr, ec, anchor.live()) };
+                finish_async_action(result?);
             }
-            // executioncontext.py:560-561 — if a higher-index action
+            // executioncontext.py `action_dispatcher` — if a higher-index action
             // re-fired an earlier bit during iteration, force the next
             // bytecode to re-enter dispatch.
-            if self.abstract_flag()._fired_bitmask != 0 {
+            if self.abstract_flag()._fired_bitmask.load(Ordering::Acquire) != 0 {
                 self.reset_ticker(-1);
             }
         }
@@ -3172,7 +3211,7 @@ impl ActionFlag {
     /// `pypysig_getaddr_occurred` returns. Used to identify the
     /// signal-driving ticker; the cell is process-global and stable
     /// for the process lifetime.
-    pub fn ticker_addr(&mut self) -> *mut isize {
+    pub fn ticker_addr(&self) -> *mut isize {
         let p = majit_rlib::rsignal::pypysig_getaddr_occurred();
         unsafe { (*p).c_value.as_ptr() }
     }
@@ -3180,7 +3219,7 @@ impl ActionFlag {
     /// Transfer an asynchronous eval-breaker request into the registered
     /// ticker. The OS handler may already have stored `-1`; this is the
     /// GIL-side copy for a bit armed without that store.
-    pub(crate) fn sync_async_ticker(&mut self) {
+    pub(crate) fn sync_async_ticker(&self) {
         if self.is_registered_ticker() {
             let p = majit_rlib::rsignal::pypysig_getaddr_occurred();
             unsafe { (*p).c_value.store(-1, std::sync::atomic::Ordering::Relaxed) };
@@ -3195,10 +3234,12 @@ impl ActionFlag {
     /// Does not add another periodic-action object: the poll is the
     /// `on_ticker_wrap` call in `action_dispatcher`.
     pub fn enable_gc_bytecode_counter(&mut self) {
-        if self.base.has_bytecode_counter {
+        if self.base.has_bytecode_counter.load(Ordering::Relaxed) {
             return;
         }
-        self.base.has_bytecode_counter = true;
+        self.base
+            .has_bytecode_counter
+            .store(true, Ordering::Relaxed);
         let p = majit_rlib::rsignal::pypysig_getaddr_occurred();
         let value = unsafe { (*p).c_value.load(std::sync::atomic::Ordering::Relaxed) };
         if value == 0 {
@@ -3247,7 +3288,7 @@ impl ActionFlagOps for ActionFlag {
 
     /// interp_signal.py `SignalActionFlag.reset_ticker` —
     /// `pypysig_getaddr_occurred` then `p.c_value = value`.
-    fn reset_ticker(&mut self, value: isize) {
+    fn reset_ticker(&self, value: isize) {
         let p = majit_rlib::rsignal::pypysig_getaddr_occurred();
         unsafe {
             (*p).c_value
@@ -3295,6 +3336,19 @@ impl ActionFlagOps for ActionFlag {
     /// decremented here — it only goes negative when the OS handler calls
     /// `signal_pushback` (or `fire` requests a non-periodic action).
     fn decrement_ticker(&mut self, by: isize) -> isize {
+        self.decrement_ticker_shared(by)
+    }
+
+    fn rearm_ticker(&mut self) {
+        self.reset_ticker(-1);
+        // Compiled loops also poll the eval-breaker word on wasm.
+        arm_async_eval_breaker();
+    }
+}
+
+impl ActionFlag {
+    /// Shared atomic hot path from `interp_signal.py SignalActionFlag.decrement_ticker`.
+    fn decrement_ticker_shared(&self, by: isize) -> isize {
         // `signals.c pypysig_counter`: a relaxed load and a relaxed store.
         // A concurrent `fire_action_ticker` store of `-1` can land between
         // them and be overwritten. That is the race `pypysig_pushback` has.
@@ -3305,7 +3359,7 @@ impl ActionFlagOps for ActionFlag {
         // signal bits when a blocked thread resumes.
         let p = majit_rlib::rsignal::pypysig_getaddr_occurred();
         let value = unsafe { (*p).c_value.load(std::sync::atomic::Ordering::Relaxed) };
-        if self.base.has_bytecode_counter {
+        if self.base.has_bytecode_counter.load(Ordering::Relaxed) {
             if by == 0 {
                 return value;
             }
@@ -3321,14 +3375,6 @@ impl ActionFlagOps for ActionFlag {
         }
         value
     }
-
-    fn rearm_ticker(&mut self) {
-        self.reset_ticker(-1);
-        // Compiled loops poll the eval-breaker word. On wasm the signal
-        // module never registers the ticker cell, so reset_ticker alone
-        // would leave that word unarmed.
-        arm_async_eval_breaker();
-    }
 }
 
 /// Stable reference to the process-owned `space.actionflag`.
@@ -3337,15 +3383,32 @@ impl ActionFlagOps for ActionFlag {
 /// reaches it through `self.space.actionflag` (`executioncontext.py`).
 /// Pyre's opaque `PyObjectRef` space has no typed Rust fields yet, so the
 /// process runtime owns the equivalent allocation and each EC carries this
-/// thin reference.  The GIL serializes interpreter access just as it does for
-/// PyPy's plain Python fields; the OS signal handler is the only asynchronous
-/// writer and already uses the registered ticker address.
+/// thin reference. The GIL serializes action state while enabled; otherwise
+/// the process action lock serializes registration and dispatch snapshots.
+/// No lock spans `perform`: each action protects only its own state updates.
+/// The ticker, fired bits and bytecode-counter flag are atomic, so GC callbacks
+/// and the bytecode hot path use shared references without taking the lock.
 #[derive(Clone, Copy)]
 pub struct SpaceActionFlag {
     ptr: *mut ActionFlag,
 }
 
 static SPACE_ACTIONFLAG: OnceLock<usize> = OnceLock::new();
+static ACTION_FLAG_LOCK: pyre_object::objlock::LockFamily = pyre_object::objlock::LockFamily::new();
+
+fn action_flag_lock() -> pyre_object::objlock::ObjectLockGuard {
+    let word = if majit_gc::rgil::gil_disabled() {
+        ACTION_FLAG_LOCK.acquire_unconditionally(0)
+    } else {
+        0
+    };
+    // SAFETY: this thread owns the acquisition, or zero releases nothing.
+    unsafe { pyre_object::objlock::ObjectLockGuard::from_word(word) }
+}
+
+pub(crate) fn action_flag_lock_after_fork_child() {
+    ACTION_FLAG_LOCK.after_fork_child();
+}
 
 impl Default for SpaceActionFlag {
     fn default() -> Self {
@@ -3368,13 +3431,14 @@ impl SpaceActionFlag {
 
     fn inner(&self) -> &ActionFlag {
         // SAFETY: SPACE_ACTIONFLAG owns one leaked process-lifetime value.
-        // Interpreter calls are serialized by the GIL; the signal handler
-        // touches only process-global atomics, never this allocation.
+        // Nonatomic state is serialized by the GIL or action lock; unlocked
+        // fire/ticker paths access only atomics through this shared reference.
         unsafe { &*self.ptr }
     }
 
     fn inner_mut(&mut self) -> &mut ActionFlag {
-        // SAFETY: see `inner`; callers hold the GIL while mutating the flag.
+        // SAFETY: see `inner`; callers hold the GIL or action lock across
+        // mutable access to action state. The ticker word is atomic.
         unsafe { &mut *self.ptr }
     }
 
@@ -3382,22 +3446,33 @@ impl SpaceActionFlag {
     /// `space.actionflag` back-reference.  Returning the shared allocation,
     /// rather than this EC's thin wrapper, keeps the pointer valid even if an
     /// embedding drops the EC that first registered the action.
-    pub fn shared_mut(&mut self) -> &'static mut ActionFlag {
+    fn shared_mut(&mut self) -> &'static mut ActionFlag {
         // SAFETY: SPACE_ACTIONFLAG owns one leaked process-lifetime value.
-        // Registration and action dispatch are serialized by the GIL.
+        // Callers hold the GIL or action lock throughout registration;
+        // cached back-references use shared atomic access when firing.
         unsafe { &mut *self.ptr }
     }
 
     pub fn ticker_addr(&mut self) -> *mut isize {
-        self.inner_mut().ticker_addr()
+        self.inner().ticker_addr()
     }
 
     pub(crate) fn sync_async_ticker(&mut self) {
-        self.inner_mut().sync_async_ticker()
+        let _action_lock = action_flag_lock();
+        self.inner().sync_async_ticker()
     }
 
     pub fn enable_gc_bytecode_counter(&mut self) {
+        let _action_lock = action_flag_lock();
         self.inner_mut().enable_gc_bytecode_counter();
+    }
+
+    pub fn register_periodic_action<A>(&mut self, action: &mut A, use_bytecode_counter: bool)
+    where
+        A: PeriodicAsyncActionOps + 'static,
+    {
+        let _action_lock = action_flag_lock();
+        action.register_periodic_action(self.shared_mut(), use_bytecode_counter);
     }
 }
 
@@ -3422,16 +3497,17 @@ impl ActionFlagOps for SpaceActionFlag {
         self.inner().get_ticker()
     }
 
-    fn reset_ticker(&mut self, value: isize) {
-        self.inner_mut().reset_ticker(value);
+    fn reset_ticker(&self, value: isize) {
+        self.inner().reset_ticker(value);
     }
 
     fn decrement_ticker(&mut self, by: isize) -> isize {
-        self.inner_mut().decrement_ticker(by)
+        self.inner().decrement_ticker_shared(by)
     }
 
     fn rearm_ticker(&mut self) {
-        self.inner_mut().rearm_ticker();
+        self.inner().reset_ticker(-1);
+        arm_async_eval_breaker();
     }
 }
 
@@ -3642,11 +3718,12 @@ pub trait AsyncActionOps {
     ///
     /// Returns `Result` so an overriding action (e.g. `CheckSignalAction`)
     /// can raise — PyPy's `perform` propagates an `OperationError` up
-    /// through `action_dispatcher` to the eval loop.  The control value lets
-    /// the process-owned GIL action defer its hand-off until this method's
-    /// exclusive receiver has ended.
+    /// through `action_dispatcher` to the eval loop. With the GIL off, every
+    /// implementation may run concurrently and no dispatcher lock spans this
+    /// call. The control value lets the process-owned GIL action defer its
+    /// hand-off until this method has returned.
     fn perform(
-        &mut self,
+        &self,
         executioncontext: &mut ExecutionContext,
         frame: *mut PyFrame,
     ) -> Result<AsyncActionControl, crate::PyError>;
@@ -3713,7 +3790,7 @@ pub trait AsyncActionOps {
     /// `self.actionflag.is_null()` would mean the action skipped both
     /// `register_nonperiodic_action` and `register_periodic_action`,
     /// which is a programmer error.
-    fn fire(&mut self)
+    fn fire(&self)
     where
         Self: Sized + 'static,
     {
@@ -3722,7 +3799,8 @@ pub trait AsyncActionOps {
             !actionflag.is_null(),
             "AsyncAction::fire called before registration (executioncontext.py:605)"
         );
-        let action_ptr: *mut dyn AsyncActionOps = self;
+        let action_ptr =
+            self as *const Self as *const dyn AsyncActionOps as *mut dyn AsyncActionOps;
         // executioncontext.py — `self.space.actionflag.fire(self)`.
         // The trait dispatch reaches the `ActionFlagOps::fire` default
         // body at line 1454 (which encodes executioncontext.py
@@ -3736,7 +3814,7 @@ pub trait AsyncActionOps {
 /// subclasses override.
 impl AsyncActionOps for AsyncAction {
     fn perform(
-        &mut self,
+        &self,
         _executioncontext: &mut ExecutionContext,
         _frame: *mut PyFrame,
     ) -> Result<AsyncActionControl, crate::PyError> {
@@ -3826,7 +3904,7 @@ impl PeriodicAsyncAction {
 /// subclasses (CheckSignalAction etc.) override.
 impl AsyncActionOps for PeriodicAsyncAction {
     fn perform(
-        &mut self,
+        &self,
         _executioncontext: &mut ExecutionContext,
         _frame: *mut PyFrame,
     ) -> Result<AsyncActionControl, crate::PyError> {
@@ -3848,10 +3926,10 @@ impl PeriodicAsyncActionOps for PeriodicAsyncAction {}
 
 pub struct UserDelAction {
     pub base: AsyncAction,
-    pub finalizers_lock_count: usize,
+    pub finalizers_lock_count: AtomicUsize,
     pub enabled_at_app_level: bool,
-    pub pending_with_disabled_del: Option<Vec<PyObjectRef>>,
-    /// `pypy/interpreter/executioncontext.py:640` —
+    pub pending_with_disabled_del: parking_lot::Mutex<Option<Vec<PyObjectRef>>>,
+    /// `executioncontext.py UserDelAction._run_finalizers` —
     /// `self.space.finalizer_queue` access target.
     ///
     /// TODO: PyPy reads the queue via `self.space`
@@ -3891,9 +3969,9 @@ impl UserDelAction {
                 // `self.space.actionflag` constant lookup).
                 actionflag: actionflag as *mut dyn ActionFlagOps,
             },
-            finalizers_lock_count: 0,
+            finalizers_lock_count: AtomicUsize::new(0),
             enabled_at_app_level: true,
-            pending_with_disabled_del: None,
+            pending_with_disabled_del: parking_lot::Mutex::new(None),
             finalizer_queue: WRootFinalizerQueue::default(),
         });
         let action_ptr: *mut dyn AsyncActionOps = &mut *action;
@@ -3927,7 +4005,7 @@ impl UserDelAction {
     /// a decision about the body, and the body is one to keep out of a trace:
     /// it drains a collector queue and runs app-level finalizers.
     #[majit_macros::dont_look_inside]
-    pub fn _run_finalizers(&mut self) {
+    pub fn _run_finalizers(&self) {
         loop {
             let w_obj = self.finalizer_queue.next_dead();
             match w_obj {
@@ -3942,9 +4020,12 @@ impl UserDelAction {
         }
     }
 
-    pub fn gc_disabled(&mut self, w_obj: PyObjectRef) -> bool {
-        let _ = w_obj;
-        if let Some(list) = self.pending_with_disabled_del.as_mut() {
+    pub fn gc_disabled(&self, w_obj: PyObjectRef) -> bool {
+        let mut pending = self.pending_with_disabled_del.lock();
+        // `perform` is shared in the free-threaded dispatcher. The mutex is
+        // held only while updating the deferred list and is released before
+        // any finalizer or other application code runs.
+        if let Some(list) = pending.as_mut() {
             list.push(w_obj);
             true
         } else {
@@ -3967,7 +4048,7 @@ impl UserDelAction {
     /// generators and coroutines, and `__del__`.  The remaining branches
     /// release a buffer export, which `tp_dealloc` does and `tp_finalize`
     /// does not.
-    pub fn begin_finalizer(&mut self, w_obj: PyObjectRef) -> bool {
+    pub fn begin_finalizer(&self, w_obj: PyObjectRef) -> bool {
         if self.gc_disabled(w_obj) {
             return false;
         }
@@ -3975,7 +4056,7 @@ impl UserDelAction {
         true
     }
 
-    pub fn _call_finalizer(&mut self, w_obj: PyObjectRef) {
+    pub fn _call_finalizer(&self, w_obj: PyObjectRef) {
         let _roots = pyre_object::gc_roots::push_roots();
         let root_base = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(w_obj);
@@ -4122,7 +4203,7 @@ impl UserDelAction {
 /// `self._run_finalizers()`.
 impl AsyncActionOps for UserDelAction {
     fn perform(
-        &mut self,
+        &self,
         _executioncontext: &mut ExecutionContext,
         _frame: *mut PyFrame,
     ) -> Result<AsyncActionControl, crate::PyError> {
@@ -4185,7 +4266,7 @@ const _: () = {
     /// `state.py` — `perform` is `_rawrefcount_perform(self.space)`.
     impl AsyncActionOps for PyObjDeallocAction {
         fn perform(
-            &mut self,
+            &self,
             _executioncontext: &mut ExecutionContext,
             _frame: *mut PyFrame,
         ) -> Result<AsyncActionControl, crate::PyError> {

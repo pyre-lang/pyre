@@ -34,12 +34,11 @@ impl GilReleaseAction {
 impl AsyncActionOps for GilReleaseAction {
     /// gil.py `perform`: request `rgil.yield_thread()`.
     ///
-    /// The dispatcher performs the request after this method returns so its
-    /// `&mut GilReleaseAction` has ended before another thread dispatches the
-    /// same process-owned action.  This is the Rust ownership boundary around
-    /// the otherwise line-for-line upstream hand-off.
+    /// The dispatcher performs the request after this method returns. The
+    /// shared receiver permits concurrent free-threaded dispatch without a
+    /// lock spanning `perform`; the hand-off remains outside the call.
     fn perform(
-        &mut self,
+        &self,
         _ec: &mut ExecutionContext,
         _frame: *mut PyFrame,
     ) -> Result<AsyncActionControl, crate::PyError> {
@@ -70,7 +69,7 @@ static GIL_RELEASE_ACTION: OnceLock<usize> = OnceLock::new();
 pub fn initialize(ec: &mut ExecutionContext) {
     GIL_RELEASE_ACTION.get_or_init(|| {
         let action: &'static mut GilReleaseAction = Box::leak(GilReleaseAction::new(ec.space()));
-        action.register_periodic_action(ec.actionflag.shared_mut(), true);
+        ec.actionflag.register_periodic_action(action, true);
         action as *mut GilReleaseAction as usize
     });
 }

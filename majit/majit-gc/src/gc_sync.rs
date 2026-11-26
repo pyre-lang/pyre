@@ -508,6 +508,7 @@ pub fn unregister_thread() {
 /// makes the mutator RUNNING again.
 #[must_use = "the GIL is only released for as long as the guard is alive"]
 pub struct BlockingGuard {
+    suspended_critical_sections: bool,
     left_census: bool,
     held_gil: bool,
     /// The guard hands the GIL back to the thread that released it, and
@@ -529,6 +530,9 @@ pub struct CallbackGuard {
 
 impl Drop for BlockingGuard {
     fn drop(&mut self) {
+        if self.suspended_critical_sections {
+            crate::critical_section::resume_all();
+        }
         // `rffi.aroundstate.after()` retakes the GIL on return from a
         // `releasegil=True` call (`_RPyGilAcquire`, threadlocal.h:158-161).
         // Before rejoining RUNNING, so that the wait for the GIL itself is
@@ -554,6 +558,7 @@ impl Drop for BlockingGuard {
 
 #[inline]
 pub fn before_external_block() -> BlockingGuard {
+    let suspended_critical_sections = crate::critical_section::suspend_all();
     // `rffi.aroundstate.before()` drops the GIL before a `releasegil=True`
     // call (`_RPyGilRelease`, threadlocal.h:162-166), so that a thread asleep
     // in the external call holds nothing another mutator needs.
@@ -578,6 +583,7 @@ pub fn before_external_block() -> BlockingGuard {
         GC_SYNC.quiesced.notify_all();
     }
     BlockingGuard {
+        suspended_critical_sections,
         left_census,
         held_gil,
         _not_send: std::marker::PhantomData,
@@ -696,6 +702,8 @@ pub fn after_fork_child() {
     let registered = GC_THREAD.with(|t| t.registered.get());
     let running = GC_THREAD.with(|t| t.running.get());
     REGISTERED_THREADS.store(usize::from(registered), Ordering::SeqCst);
+    // Replacement child mutexes have no ownership represented by this stack.
+    crate::critical_section::after_fork_child();
     // `fork()` runs inside `request_stw`, so this thread held the GIL across
     // it and still does; only the queue behind it has to be rebuilt.
     crate::rgil::after_fork_child();

@@ -105,21 +105,30 @@ impl LockFamily {
     /// A contended stripe must not be waited on from inside the running-mutator
     /// census: the owner can allocate under the stripe and request a collection,
     /// which then waits for this thread while this thread waits for the stripe.
-    /// Leave the census around the blocking acquire (`before_external_block`).
+    /// Leave the census around the wait (`before_external_block`), releasing
+    /// the new stripe before resuming suspended stripes to avoid hold-and-wait
+    /// across detach/resume. Retry the acquire only after resume completes.
     pub fn acquire_unconditionally(&'static self, key: usize) -> usize {
         let lock = self.stripe(key);
         let guard = if let Some(guard) = lock.try_lock() {
             guard
         } else {
-            let blocked = majit_gc::gc_sync::before_external_block();
-            let guard = lock.lock();
-            drop(blocked);
-            guard
+            loop {
+                {
+                    let _blocked = majit_gc::gc_sync::before_external_block();
+                    majit_gc::critical_section::wait_until_unlocked(lock);
+                }
+                if let Some(guard) = lock.try_lock() {
+                    break guard;
+                }
+            }
         };
         // lock_api::ReentrantMutex::force_unlock explicitly supports a forgotten
         // guard. Transfer exactly that obligation into the returned handle.
         std::mem::forget(guard);
-        lock as *const parking_lot::ReentrantMutex<()> as usize
+        let word = lock as *const parking_lot::ReentrantMutex<()> as usize;
+        majit_gc::critical_section::note_acquired(word);
+        word
     }
 
     pub fn after_fork_child(&self) {
@@ -139,7 +148,9 @@ impl LockFamily {
         let lock = self.stripe(crate::gc_hook::gc_id(obj));
         let guard = lock.try_lock()?;
         std::mem::forget(guard);
-        Some(lock as *const parking_lot::ReentrantMutex<()> as usize)
+        let word = lock as *const parking_lot::ReentrantMutex<()> as usize;
+        majit_gc::critical_section::note_acquired(word);
+        Some(word)
     }
 }
 
@@ -200,7 +211,10 @@ pub unsafe fn object_lock_release(lock: usize) {
 /// on this thread.
 #[majit_macros::dont_look_inside_cannot_raise]
 pub unsafe fn object_lock_release_held(lock: usize) {
-    unsafe { (&*(lock as *const parking_lot::ReentrantMutex<()>)).force_unlock() };
+    // An absent word was invalidated with its replacement mutex by a child fork reset.
+    if majit_gc::critical_section::note_released(lock) {
+        unsafe { (&*(lock as *const parking_lot::ReentrantMutex<()>)).force_unlock() };
+    }
 }
 
 /// Run `$body` holding the object-lock stripe `$acquire` returns for the

@@ -157,6 +157,228 @@ fn pyre_gil_zero_threaded_alloc_checksum_matches_serial() {
     assert!(parts.next().is_none(), "{out}");
 }
 
+#[cfg(unix)]
+#[test]
+fn pyre_gil_zero_serializes_signal_actions_with_worker_tickers() {
+    let source = r#"
+import signal
+import threading
+import time
+
+handled = 0
+results = [None] * 4
+
+def handle_usr1(signum, frame):
+    global handled
+    handled += 1
+
+def run(tid):
+    x = 0
+    for _ in range(2_000_000):
+        x += 1
+    results[tid] = x
+
+workers = [threading.Thread(target=run, args=(tid,)) for tid in range(4)]
+for worker in workers:
+    worker.start()
+signal.signal(signal.SIGUSR1, handle_usr1)
+for _ in range(200):
+    signal.raise_signal(signal.SIGUSR1)
+    time.sleep(0.001)
+for worker in workers:
+    worker.join()
+print(handled, sum(results))
+"#;
+    assert_eq!(
+        stdout_of_source_timeout(
+            "gil_env_switch_signal_actions.py",
+            source,
+            &[("PYRE_GIL", "0")],
+            120,
+        ),
+        "200 8000000"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn pyre_gil_zero_signal_handler_does_not_block_worker_ticker() {
+    let source = r#"
+import os
+import signal
+import threading
+
+started = False
+done = False
+
+def handle_usr1(signum, frame):
+    global started
+    started = True
+    while not done:
+        pass
+
+def run():
+    global done
+    while not started:
+        pass
+    x = 0
+    for _ in range(300_000):
+        x += 1
+    done = True
+
+signal.signal(signal.SIGUSR1, handle_usr1)
+worker = threading.Thread(target=run)
+worker.start()
+os.kill(os.getpid(), signal.SIGUSR1)
+worker.join()
+print("ok")
+"#;
+    assert_eq!(
+        stdout_of_source_timeout(
+            "gil_env_switch_signal_handler_worker_ticker.py",
+            source,
+            &[("PYRE_GIL", "0")],
+            60,
+        ),
+        "ok"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn pyre_gil_zero_signal_action_runs_while_worker_finalizer_blocks() {
+    let source = r#"
+import gc
+import os
+import signal
+import threading
+import time
+
+ev = threading.Event()
+finalizer_started = False
+finalizer_on_worker = False
+wait_result = None
+worker = None
+worker_ready = False
+
+class C:
+    def __del__(self):
+        global finalizer_started, finalizer_on_worker, wait_result
+        finalizer_on_worker = threading.current_thread() is worker
+        finalizer_started = True
+        wait_result = ev.wait(30)
+
+def handle_usr1(signum, frame):
+    ev.set()
+
+def run():
+    global worker_ready
+    gc.collect()
+    worker_ready = True
+    time.sleep(0.1)
+    while not finalizer_started:
+        obj = C()
+        obj.cycle = obj
+        del obj
+        gc.collect_step()
+
+signal.signal(signal.SIGUSR1, handle_usr1)
+worker = threading.Thread(target=run)
+worker.start()
+while not worker_ready:
+    time.sleep(0.001)
+time.sleep(2)
+while not finalizer_started:
+    time.sleep(0.001)
+os.kill(os.getpid(), signal.SIGUSR1)
+worker.join()
+print(wait_result if finalizer_on_worker else "wrong-thread")
+"#;
+    assert_eq!(
+        stdout_of_source_timeout(
+            "gil_env_switch_signal_during_worker_finalizer.py",
+            source,
+            &[("PYRE_GIL", "0")],
+            60,
+        ),
+        "True"
+    );
+}
+
+#[test]
+fn pyre_gil_zero_workers_run_finalizers_concurrently() {
+    // Plain flags polled with `time.sleep`, not `threading.Event`: a finalizer
+    // may be dispatched on a thread that is inside `Event.wait` holding the
+    // condition's lock, and an `Event.set` in that finalizer would then wait
+    // on its own thread.
+    let source = r#"
+import gc
+import threading
+import time
+
+state = {"started": False, "released": False, "waiter_dropped": False,
+         "setter_dropped": False}
+results = []
+
+def wait_for(key, seconds=50):
+    deadline = time.monotonic() + seconds
+    while not state[key]:
+        if time.monotonic() > deadline:
+            return False
+        time.sleep(0.001)
+    return True
+
+class Waiter:
+    def __del__(self):
+        state["started"] = True
+        results.append(wait_for("released"))
+
+class Setter:
+    def __del__(self):
+        state["released"] = True
+
+def wait_in_finalizer():
+    obj = Waiter()
+    obj.cycle = obj
+    del obj
+    state["waiter_dropped"] = True
+    if not wait_for("setter_dropped"):
+        return
+    gc.collect()
+
+def release_other_finalizer():
+    if not wait_for("waiter_dropped"):
+        return
+    obj = Setter()
+    obj.cycle = obj
+    del obj
+    state["setter_dropped"] = True
+    if not wait_for("started"):
+        return
+    gc.collect()
+
+workers = [
+    threading.Thread(target=wait_in_finalizer),
+    threading.Thread(target=release_other_finalizer),
+]
+for worker in workers:
+    worker.start()
+for worker in workers:
+    worker.join()
+if results == [True] and state["released"]:
+    print("ok")
+"#;
+    assert_eq!(
+        stdout_of_source_timeout(
+            "gil_env_switch_concurrent_finalizers.py",
+            source,
+            &[("PYRE_GIL", "0")],
+            60,
+        ),
+        "ok"
+    );
+}
+
 /// `loops_compiled=` from the `MAJIT_STATS=1` summary on stderr.
 fn loops_compiled_running(source_name: &str, source: &str, env: &[(&str, &str)]) -> u64 {
     let mut path = PathBuf::from(env!("CARGO_TARGET_TMPDIR"));

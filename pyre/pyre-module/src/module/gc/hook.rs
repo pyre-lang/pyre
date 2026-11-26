@@ -8,10 +8,14 @@ use pyre_interpreter::pyframe::PyFrame;
 use pyre_object::*;
 use rustpython_wtf8::Wtf8;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
-struct GcMinorHookAction {
-    base: AsyncAction,
-    depth: usize,
+// `pypy/module/gc/hook.py NoRecursiveAction.perform` keeps `depth` set while
+// the callback runs so a callback-triggered collection drops the recursive
+// delivery. The atomic preserves that action-wide guard without a lock. Each
+// stats mutex below is held only to update or snapshot/reset counters; it is
+// released before `_do_perform` calls application code.
+struct GcMinorHookState {
     count: i64,
     duration: f64,
     duration_min: f64,
@@ -20,40 +24,54 @@ struct GcMinorHookAction {
     pinned_objects: usize,
 }
 
+struct GcMinorHookAction {
+    base: AsyncAction,
+    depth: AtomicUsize,
+    state: parking_lot::Mutex<GcMinorHookState>,
+}
+
 impl GcMinorHookAction {
     fn new() -> Self {
         Self {
             base: AsyncAction::default(),
-            depth: 0,
-            count: 0,
-            duration: 0.0,
-            duration_min: f64::INFINITY,
-            duration_max: 0.0,
-            total_memory_used: 0,
-            pinned_objects: 0,
+            depth: AtomicUsize::new(0),
+            state: parking_lot::Mutex::new(GcMinorHookState {
+                count: 0,
+                duration: 0.0,
+                duration_min: f64::INFINITY,
+                duration_max: 0.0,
+                total_memory_used: 0,
+                pinned_objects: 0,
+            }),
         }
     }
 
-    fn reset(&mut self) {
-        self.count = 0;
-        self.duration = 0.0;
-        self.duration_min = f64::INFINITY;
-        self.duration_max = 0.0;
+    fn reset(state: &mut GcMinorHookState) {
+        state.count = 0;
+        state.duration = 0.0;
+        state.duration_min = f64::INFINITY;
+        state.duration_max = 0.0;
     }
 
-    fn do_perform(&mut self) -> Result<(), pyre_interpreter::PyError> {
+    fn do_perform(&self) -> Result<(), pyre_interpreter::PyError> {
         // `self` is a field of this very allocation, so read the callback
         // through the pointer rather than borrowing the whole singleton.
         let Some(hooks) = app_hooks_ptr() else {
             return Ok(());
         };
-        let count = self.count;
-        let duration = self.duration;
-        let duration_min = self.duration_min;
-        let duration_max = self.duration_max;
-        let total_memory_used = self.total_memory_used;
-        let pinned_objects = self.pinned_objects;
-        self.reset();
+        let (count, duration, duration_min, duration_max, total_memory_used, pinned_objects) = {
+            let mut state = self.state.lock();
+            let snapshot = (
+                state.count,
+                state.duration,
+                state.duration_min,
+                state.duration_max,
+                state.total_memory_used,
+                state.pinned_objects,
+            );
+            Self::reset(&mut state);
+            snapshot
+        };
 
         let _roots = pyre_object::gc_roots::push_roots();
         let _ = pyre_object::gc_roots::pin_root(unsafe { (*hooks).w_on_gc_minor });
@@ -78,16 +96,19 @@ impl GcMinorHookAction {
 
 impl AsyncActionOps for GcMinorHookAction {
     fn perform(
-        &mut self,
+        &self,
         _executioncontext: &mut ExecutionContext,
         _frame: *mut PyFrame,
     ) -> Result<AsyncActionControl, pyre_interpreter::PyError> {
-        if self.depth != 0 {
+        if self
+            .depth
+            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
             return Ok(AsyncActionControl::Continue);
         }
-        self.depth += 1;
         let result = self.do_perform();
-        self.depth -= 1;
+        self.depth.store(0, Ordering::Release);
         result.map(|()| AsyncActionControl::Continue)
     }
 
@@ -100,9 +121,7 @@ impl AsyncActionOps for GcMinorHookAction {
     }
 }
 
-struct GcCollectStepHookAction {
-    base: AsyncAction,
-    depth: usize,
+struct GcCollectStepHookState {
     count: i64,
     duration: f64,
     duration_min: f64,
@@ -111,40 +130,54 @@ struct GcCollectStepHookAction {
     newstate: u8,
 }
 
+struct GcCollectStepHookAction {
+    base: AsyncAction,
+    depth: AtomicUsize,
+    state: parking_lot::Mutex<GcCollectStepHookState>,
+}
+
 impl GcCollectStepHookAction {
     fn new() -> Self {
         Self {
             base: AsyncAction::default(),
-            depth: 0,
-            count: 0,
-            duration: 0.0,
-            duration_min: f64::INFINITY,
-            duration_max: 0.0,
-            oldstate: 0,
-            newstate: 0,
+            depth: AtomicUsize::new(0),
+            state: parking_lot::Mutex::new(GcCollectStepHookState {
+                count: 0,
+                duration: 0.0,
+                duration_min: f64::INFINITY,
+                duration_max: 0.0,
+                oldstate: 0,
+                newstate: 0,
+            }),
         }
     }
 
-    fn reset(&mut self) {
-        self.count = 0;
-        self.duration = 0.0;
-        self.duration_min = f64::INFINITY;
-        self.duration_max = 0.0;
+    fn reset(state: &mut GcCollectStepHookState) {
+        state.count = 0;
+        state.duration = 0.0;
+        state.duration_min = f64::INFINITY;
+        state.duration_max = 0.0;
     }
 
-    fn do_perform(&mut self) -> Result<(), pyre_interpreter::PyError> {
+    fn do_perform(&self) -> Result<(), pyre_interpreter::PyError> {
         // `self` is a field of this very allocation, so read the callback
         // through the pointer rather than borrowing the whole singleton.
         let Some(hooks) = app_hooks_ptr() else {
             return Ok(());
         };
-        let count = self.count;
-        let duration = self.duration;
-        let duration_min = self.duration_min;
-        let duration_max = self.duration_max;
-        let oldstate = self.oldstate;
-        let newstate = self.newstate;
-        self.reset();
+        let (count, duration, duration_min, duration_max, oldstate, newstate) = {
+            let mut state = self.state.lock();
+            let snapshot = (
+                state.count,
+                state.duration,
+                state.duration_min,
+                state.duration_max,
+                state.oldstate,
+                state.newstate,
+            );
+            Self::reset(&mut state);
+            snapshot
+        };
 
         let _roots = pyre_object::gc_roots::push_roots();
         let _ = pyre_object::gc_roots::pin_root(unsafe { (*hooks).w_on_gc_collect_step });
@@ -170,16 +203,19 @@ impl GcCollectStepHookAction {
 
 impl AsyncActionOps for GcCollectStepHookAction {
     fn perform(
-        &mut self,
+        &self,
         _executioncontext: &mut ExecutionContext,
         _frame: *mut PyFrame,
     ) -> Result<AsyncActionControl, pyre_interpreter::PyError> {
-        if self.depth != 0 {
+        if self
+            .depth
+            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
             return Ok(AsyncActionControl::Continue);
         }
-        self.depth += 1;
         let result = self.do_perform();
-        self.depth -= 1;
+        self.depth.store(0, Ordering::Release);
         result.map(|()| AsyncActionControl::Continue)
     }
 
@@ -192,9 +228,7 @@ impl AsyncActionOps for GcCollectStepHookAction {
     }
 }
 
-struct GcCollectHookAction {
-    base: AsyncAction,
-    depth: usize,
+struct GcCollectHookState {
     count: i64,
     num_major_collects: usize,
     arenas_count_before: usize,
@@ -205,37 +239,60 @@ struct GcCollectHookAction {
     pinned_objects: usize,
 }
 
+struct GcCollectHookAction {
+    base: AsyncAction,
+    depth: AtomicUsize,
+    state: parking_lot::Mutex<GcCollectHookState>,
+}
+
 impl GcCollectHookAction {
     fn new() -> Self {
         Self {
             base: AsyncAction::default(),
-            depth: 0,
-            count: 0,
-            num_major_collects: 0,
-            arenas_count_before: 0,
-            arenas_count_after: 0,
-            arenas_bytes: 0,
-            rawmalloc_bytes_before: 0,
-            rawmalloc_bytes_after: 0,
-            pinned_objects: 0,
+            depth: AtomicUsize::new(0),
+            state: parking_lot::Mutex::new(GcCollectHookState {
+                count: 0,
+                num_major_collects: 0,
+                arenas_count_before: 0,
+                arenas_count_after: 0,
+                arenas_bytes: 0,
+                rawmalloc_bytes_before: 0,
+                rawmalloc_bytes_after: 0,
+                pinned_objects: 0,
+            }),
         }
     }
 
-    fn do_perform(&mut self) -> Result<(), pyre_interpreter::PyError> {
+    fn do_perform(&self) -> Result<(), pyre_interpreter::PyError> {
         // `self` is a field of this very allocation, so read the callback
         // through the pointer rather than borrowing the whole singleton.
         let Some(hooks) = app_hooks_ptr() else {
             return Ok(());
         };
-        let count = self.count;
-        let num_major_collects = self.num_major_collects;
-        let arenas_count_before = self.arenas_count_before;
-        let arenas_count_after = self.arenas_count_after;
-        let arenas_bytes = self.arenas_bytes;
-        let rawmalloc_bytes_before = self.rawmalloc_bytes_before;
-        let rawmalloc_bytes_after = self.rawmalloc_bytes_after;
-        let pinned_objects = self.pinned_objects;
-        self.count = 0;
+        let (
+            count,
+            num_major_collects,
+            arenas_count_before,
+            arenas_count_after,
+            arenas_bytes,
+            rawmalloc_bytes_before,
+            rawmalloc_bytes_after,
+            pinned_objects,
+        ) = {
+            let mut state = self.state.lock();
+            let snapshot = (
+                state.count,
+                state.num_major_collects,
+                state.arenas_count_before,
+                state.arenas_count_after,
+                state.arenas_bytes,
+                state.rawmalloc_bytes_before,
+                state.rawmalloc_bytes_after,
+                state.pinned_objects,
+            );
+            state.count = 0;
+            snapshot
+        };
 
         let _roots = pyre_object::gc_roots::push_roots();
         let _ = pyre_object::gc_roots::pin_root(unsafe { (*hooks).w_on_gc_collect });
@@ -262,16 +319,19 @@ impl GcCollectHookAction {
 
 impl AsyncActionOps for GcCollectHookAction {
     fn perform(
-        &mut self,
+        &self,
         _executioncontext: &mut ExecutionContext,
         _frame: *mut PyFrame,
     ) -> Result<AsyncActionControl, pyre_interpreter::PyError> {
-        if self.depth != 0 {
+        if self
+            .depth
+            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
             return Ok(AsyncActionControl::Continue);
         }
-        self.depth += 1;
         let result = self.do_perform();
-        self.depth -= 1;
+        self.depth.store(0, Ordering::Release);
         result.map(|()| AsyncActionControl::Continue)
     }
 
@@ -497,25 +557,31 @@ fn is_gc_collect_enabled() -> bool {
 
 fn on_gc_minor(duration: f64, total_memory_used: usize, pinned_objects: usize) {
     let Some(hooks) = app_hooks_ptr() else { return };
-    let action = unsafe { &mut (*hooks).gc_minor };
-    action.count += 1;
-    action.duration += duration;
-    action.duration_min = action.duration_min.min(duration);
-    action.duration_max = action.duration_max.max(duration);
-    action.total_memory_used = total_memory_used;
-    action.pinned_objects = pinned_objects;
+    let action = unsafe { &(*hooks).gc_minor };
+    {
+        let mut state = action.state.lock();
+        state.count += 1;
+        state.duration += duration;
+        state.duration_min = state.duration_min.min(duration);
+        state.duration_max = state.duration_max.max(duration);
+        state.total_memory_used = total_memory_used;
+        state.pinned_objects = pinned_objects;
+    }
     action.fire();
 }
 
 fn on_gc_collect_step(duration: f64, oldstate: u8, newstate: u8) {
     let Some(hooks) = app_hooks_ptr() else { return };
-    let action = unsafe { &mut (*hooks).gc_collect_step };
-    action.count += 1;
-    action.duration += duration;
-    action.duration_min = action.duration_min.min(duration);
-    action.duration_max = action.duration_max.max(duration);
-    action.oldstate = oldstate;
-    action.newstate = newstate;
+    let action = unsafe { &(*hooks).gc_collect_step };
+    {
+        let mut state = action.state.lock();
+        state.count += 1;
+        state.duration += duration;
+        state.duration_min = state.duration_min.min(duration);
+        state.duration_max = state.duration_max.max(duration);
+        state.oldstate = oldstate;
+        state.newstate = newstate;
+    }
     action.fire();
 }
 
@@ -530,15 +596,18 @@ fn on_gc_collect(
     pinned_objects: usize,
 ) {
     let Some(hooks) = app_hooks_ptr() else { return };
-    let action = unsafe { &mut (*hooks).gc_collect };
-    action.count += 1;
-    action.num_major_collects = num_major_collects;
-    action.arenas_count_before = arenas_count_before;
-    action.arenas_count_after = arenas_count_after;
-    action.arenas_bytes = arenas_bytes;
-    action.rawmalloc_bytes_before = rawmalloc_bytes_before;
-    action.rawmalloc_bytes_after = rawmalloc_bytes_after;
-    action.pinned_objects = pinned_objects;
+    let action = unsafe { &(*hooks).gc_collect };
+    {
+        let mut state = action.state.lock();
+        state.count += 1;
+        state.num_major_collects = num_major_collects;
+        state.arenas_count_before = arenas_count_before;
+        state.arenas_count_after = arenas_count_after;
+        state.arenas_bytes = arenas_bytes;
+        state.rawmalloc_bytes_before = rawmalloc_bytes_before;
+        state.rawmalloc_bytes_after = rawmalloc_bytes_after;
+        state.pinned_objects = pinned_objects;
+    }
     action.fire();
 }
 

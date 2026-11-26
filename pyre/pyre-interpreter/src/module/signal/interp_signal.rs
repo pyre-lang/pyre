@@ -10,7 +10,7 @@ use crate::executioncontext::{
 use crate::pyframe::PyFrame;
 use pyre_object::PyObjectRef;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
 
 /// The signal numbers and names `<signal.h>` supplies elsewhere.
 ///
@@ -521,15 +521,15 @@ pub fn default_int_handler_obj() -> PyObjectRef {
 /// which for SIGINT (default) raises `KeyboardInterrupt`.
 pub struct CheckSignalAction {
     base: PeriodicAsyncAction,
-    /// interp_signal.py — a signal seen on a worker but not yet reported by
-    /// the signal-enabled main execution context.
-    pending_signal: i32,
-    /// interp_signal.py/82-91 — a worker found a pending signal and left it
-    /// for the signal-enabled main execution context.
-    fire_in_another_thread: bool,
-    /// interp_signal.py:66/103 — re-entrancy guard so a handler that
-    /// itself triggers a checkpoint does not recurse into polling.
-    in_poll: bool,
+    /// interp_signal.py `CheckSignalAction._poll_for_signals_unlocked` — a
+    /// signal seen on a worker but not yet reported by the signal-enabled EC.
+    pending_signal: AtomicI32,
+    /// interp_signal.py `CheckSignalAction._after_thread_switch` — a worker
+    /// found a pending signal and left it for the signal-enabled main EC.
+    fire_in_another_thread: AtomicBool,
+    /// interp_signal.py `CheckSignalAction._poll_for_signals` — re-entrancy
+    /// guard so a handler-triggered checkpoint does not recurse into polling.
+    in_poll: AtomicBool,
 }
 
 impl CheckSignalAction {
@@ -551,11 +551,19 @@ impl CheckSignalAction {
             signalstate::rearm_ticker();
             return;
         }
-        if unsafe { (*action).fire_in_another_thread }
+        if unsafe {
+            (*action)
+                .fire_in_another_thread
+                .load(Ordering::Acquire)
+        }
             && !ec.is_null()
             && unsafe { (*ec).signals_enabled } != 0
         {
-            unsafe { (*action).fire_in_another_thread = false };
+            unsafe {
+                (*action)
+                    .fire_in_another_thread
+                    .store(false, Ordering::Release)
+            };
             signalstate::rearm_ticker();
         } else if !ec.is_null()
             && unsafe { (*ec).signals_enabled } != 0
@@ -580,28 +588,31 @@ impl CheckSignalAction {
             base: PeriodicAsyncAction {
                 base: AsyncAction::new_periodic_base(space),
             },
-            pending_signal: -1,
-            fire_in_another_thread: false,
-            in_poll: false,
+            pending_signal: AtomicI32::new(-1),
+            fire_in_another_thread: AtomicBool::new(false),
+            in_poll: AtomicBool::new(false),
         })
     }
 
     /// interp_signal.py `_poll_for_signals` — the re-entrancy
     /// guard around the unlocked poll.
-    fn poll_for_signals(&mut self, ec: &mut ExecutionContext) -> Result<(), crate::PyError> {
-        if self.in_poll {
+    fn poll_for_signals(&self, ec: &mut ExecutionContext) -> Result<(), crate::PyError> {
+        if self
+            .in_poll
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
             return Ok(());
         }
-        self.in_poll = true;
         let result = self.poll_for_signals_unlocked(ec);
-        self.in_poll = false;
+        self.in_poll.store(false, Ordering::Release);
         result
     }
 
     /// interp_signal.py `_poll_for_signals_unlocked`; the
     /// remote-debugger arm is not surfaced.
     fn poll_for_signals_unlocked(
-        &mut self,
+        &self,
         ec: &mut ExecutionContext,
     ) -> Result<(), crate::PyError> {
         // interp_signal.py:112-115 — report any wakeup-fd write error the
@@ -610,17 +621,16 @@ impl CheckSignalAction {
         if werr != 0 {
             report_wakeup_fd_error(ec, werr);
         }
-        let mut n = self.pending_signal;
+        let mut n = self.pending_signal.swap(-1, Ordering::AcqRel);
         if n < 0 {
             n = signalstate::signal_poll();
         }
         while n >= 0 {
             if ec.signals_enabled != 0 {
                 // The main thread reports the signal and continues polling.
-                self.pending_signal = -1;
-                self.fire_in_another_thread = false;
+                self.fire_in_another_thread.store(false, Ordering::Release);
                 report_signal(ec, n)?;
-                n = self.pending_signal;
+                n = self.pending_signal.swap(-1, Ordering::AcqRel);
                 if n < 0 {
                     n = signalstate::signal_poll();
                 }
@@ -628,8 +638,8 @@ impl CheckSignalAction {
                 // interp_signal.py — do not consume a process signal
                 // on a worker.  Keep it on the shared CheckSignalAction and
                 // arm the main EC's registered ticker for prompt delivery.
-                self.pending_signal = n;
-                self.fire_in_another_thread = true;
+                self.pending_signal.store(n, Ordering::Release);
+                self.fire_in_another_thread.store(true, Ordering::Release);
                 signalstate::rearm_ticker();
                 break;
             }
@@ -803,7 +813,7 @@ fn report_wakeup_fd_error(ec: &mut ExecutionContext, errno_val: i32) {
 impl AsyncActionOps for CheckSignalAction {
     /// interp_signal.py `perform`.
     fn perform(
-        &mut self,
+        &self,
         ec: &mut ExecutionContext,
         _frame: *mut PyFrame,
     ) -> Result<AsyncActionControl, crate::PyError> {
@@ -823,7 +833,14 @@ impl AsyncActionOps for CheckSignalAction {
                 pyre_object::gc_roots::shadow_stack_get(msg_slot),
             ));
         }
-        self.poll_for_signals(ec)?;
+        // `interp_signal.py _poll_for_signals` reports only on the
+        // signal-enabled execution context. With the GIL off, a worker must
+        // not consume the process pending set: the C handler has already
+        // armed the ticker for the main thread. With the GIL on, retain the
+        // upstream worker poll/stash/rearm path used by `_after_thread_switch`.
+        if !majit_gc::rgil::gil_disabled() || ec.signals_enabled != 0 {
+            self.poll_for_signals(ec)?;
+        }
         Ok(AsyncActionControl::Continue)
     }
 
@@ -876,7 +893,7 @@ pub fn install_signal_handling(ec: &mut ExecutionContext) {
         // moduledef.py:64-66 — construct and register the one signal action
         // owned by the process object space.
         let action: &'static mut CheckSignalAction = Box::leak(CheckSignalAction::new(ec.space()));
-        action.register_periodic_action(ec.actionflag.shared_mut(), false);
+        ec.actionflag.register_periodic_action(action, false);
         // CheckSignalAction.startup — register after a GIL switch so a
         // signal seen on a worker rearms the main ticker promptly.
         majit_gc::rgil::invoke_after_thread_switch(CheckSignalAction::after_thread_switch);

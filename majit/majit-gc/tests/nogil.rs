@@ -489,6 +489,244 @@ fn nonmoving_alloc_collects_at_threshold(type_id: u32) {
     );
 }
 
+fn critical_sections_suspend_while_detached() {
+    let lock = Arc::new(parking_lot::ReentrantMutex::new(()));
+    let (detached_tx, detached_rx) = std::sync::mpsc::channel();
+    let (released_tx, released_rx) = std::sync::mpsc::channel();
+    let (resumed_tx, resumed_rx) = std::sync::mpsc::channel();
+    let (checked_tx, checked_rx) = std::sync::mpsc::channel();
+
+    let owner = {
+        let lock = lock.clone();
+        thread::spawn(move || {
+            register_worker();
+            let guard = lock.lock();
+            std::mem::forget(guard);
+            let word = Arc::as_ptr(&lock) as usize;
+            majit_gc::critical_section::note_acquired(word);
+
+            let blocked = gc_sync::before_external_block();
+            detached_tx.send(()).unwrap();
+            released_rx.recv().unwrap();
+            drop(blocked);
+            assert!(lock.is_owned_by_current_thread());
+            resumed_tx.send(()).unwrap();
+            checked_rx.recv().unwrap();
+
+            majit_gc::critical_section::note_released(word);
+            unsafe { lock.force_unlock() };
+            gc_sync::gc_thread_die();
+        })
+    };
+    let contender = {
+        let lock = lock.clone();
+        thread::spawn(move || {
+            detached_rx.recv().unwrap();
+            let guard = lock.lock();
+            drop(guard);
+            released_tx.send(()).unwrap();
+            resumed_rx.recv().unwrap();
+            assert!(lock.try_lock().is_none());
+            checked_tx.send(()).unwrap();
+        })
+    };
+
+    owner.join().unwrap();
+    contender.join().unwrap();
+}
+
+fn critical_sections_resume_in_order_with_recursion() {
+    let first = Arc::new(parking_lot::ReentrantMutex::new(()));
+    let second = Arc::new(parking_lot::ReentrantMutex::new(()));
+    let (detached_tx, detached_rx) = std::sync::mpsc::channel();
+    let (second_held_tx, second_held_rx) = std::sync::mpsc::channel();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+
+    let owner = {
+        let first = first.clone();
+        let second = second.clone();
+        thread::spawn(move || {
+            register_worker();
+            let first_word = Arc::as_ptr(&first) as usize;
+            let second_word = Arc::as_ptr(&second) as usize;
+            for _ in 0..2 {
+                let guard = first.lock();
+                std::mem::forget(guard);
+                majit_gc::critical_section::note_acquired(first_word);
+            }
+            let guard = second.lock();
+            std::mem::forget(guard);
+            majit_gc::critical_section::note_acquired(second_word);
+
+            let blocked = gc_sync::before_external_block();
+            detached_tx.send(()).unwrap();
+            second_held_rx.recv().unwrap();
+            resume_tx.send(()).unwrap();
+            drop(blocked);
+            assert!(first.is_owned_by_current_thread());
+            assert!(second.is_owned_by_current_thread());
+
+            majit_gc::critical_section::note_released(second_word);
+            unsafe { second.force_unlock() };
+            for _ in 0..2 {
+                majit_gc::critical_section::note_released(first_word);
+                unsafe { first.force_unlock() };
+            }
+            gc_sync::gc_thread_die();
+        })
+    };
+    let contender = {
+        let first = first.clone();
+        let second = second.clone();
+        thread::spawn(move || {
+            detached_rx.recv().unwrap();
+            let second_guard = second.lock();
+            second_held_tx.send(()).unwrap();
+            resume_rx.recv().unwrap();
+            thread::sleep(Duration::from_millis(20));
+            let first_guard = first.lock();
+            drop(first_guard);
+            drop(second_guard);
+        })
+    };
+
+    owner.join().unwrap();
+    contender.join().unwrap();
+}
+
+fn nested_external_block_suspends_callback_stripe() {
+    let first = Arc::new(parking_lot::ReentrantMutex::new(()));
+    let second = Arc::new(parking_lot::ReentrantMutex::new(()));
+    let (outer_detached_tx, outer_detached_rx) = std::sync::mpsc::channel();
+    let (first_released_tx, first_released_rx) = std::sync::mpsc::channel();
+    let (nested_detached_tx, nested_detached_rx) = std::sync::mpsc::channel();
+    let (second_released_tx, second_released_rx) = std::sync::mpsc::channel();
+    let (nested_resumed_tx, nested_resumed_rx) = std::sync::mpsc::channel();
+    let (second_checked_tx, second_checked_rx) = std::sync::mpsc::channel();
+    let (outer_resumed_tx, outer_resumed_rx) = std::sync::mpsc::channel();
+    let (first_checked_tx, first_checked_rx) = std::sync::mpsc::channel();
+
+    let owner = {
+        let first = first.clone();
+        let second = second.clone();
+        thread::spawn(move || {
+            register_worker();
+            let first_word = Arc::as_ptr(&first) as usize;
+            let second_word = Arc::as_ptr(&second) as usize;
+            let first_guard = first.lock();
+            std::mem::forget(first_guard);
+            majit_gc::critical_section::note_acquired(first_word);
+
+            let outer = gc_sync::before_external_block();
+            outer_detached_tx.send(()).unwrap();
+            first_released_rx.recv().unwrap();
+            let callback = gc_sync::enter_external_callback();
+            let second_guard = second.lock();
+            std::mem::forget(second_guard);
+            majit_gc::critical_section::note_acquired(second_word);
+
+            let nested = gc_sync::before_external_block();
+            nested_detached_tx.send(()).unwrap();
+            second_released_rx.recv().unwrap();
+            drop(nested);
+            assert!(second.is_owned_by_current_thread());
+            nested_resumed_tx.send(()).unwrap();
+            second_checked_rx.recv().unwrap();
+
+            assert!(majit_gc::critical_section::note_released(second_word));
+            unsafe { second.force_unlock() };
+            drop(callback);
+            drop(outer);
+            assert!(first.is_owned_by_current_thread());
+            outer_resumed_tx.send(()).unwrap();
+            first_checked_rx.recv().unwrap();
+
+            assert!(majit_gc::critical_section::note_released(first_word));
+            unsafe { first.force_unlock() };
+            gc_sync::gc_thread_die();
+        })
+    };
+    let contender = thread::spawn(move || {
+        outer_detached_rx.recv().unwrap();
+        drop(first.lock());
+        first_released_tx.send(()).unwrap();
+
+        nested_detached_rx.recv().unwrap();
+        drop(second.lock());
+        second_released_tx.send(()).unwrap();
+        nested_resumed_rx.recv().unwrap();
+        assert!(second.try_lock().is_none());
+        second_checked_tx.send(()).unwrap();
+
+        outer_resumed_rx.recv().unwrap();
+        assert!(first.try_lock().is_none());
+        first_checked_tx.send(()).unwrap();
+    });
+
+    owner.join().unwrap();
+    contender.join().unwrap();
+}
+
+fn critical_section_fork_reset_discards_ownership() {
+    let lock = parking_lot::ReentrantMutex::new(());
+    let guard = lock.lock();
+    let word = &lock as *const parking_lot::ReentrantMutex<()> as usize;
+    majit_gc::critical_section::note_acquired(word);
+    majit_gc::critical_section::after_fork_child();
+    assert!(!majit_gc::critical_section::note_released(word));
+    drop(guard);
+}
+
+fn critical_section_wait_releases_new_stripe_before_resume() {
+    let first = Arc::new(parking_lot::ReentrantMutex::new(()));
+    let second = Arc::new(parking_lot::ReentrantMutex::new(()));
+    let (second_held_tx, second_held_rx) = std::sync::mpsc::channel();
+    let (detached_tx, detached_rx) = std::sync::mpsc::channel();
+    let (waited_tx, waited_rx) = std::sync::mpsc::channel();
+
+    let owner = {
+        let first = first.clone();
+        let second = second.clone();
+        thread::spawn(move || {
+            register_worker();
+            let guard = first.lock();
+            std::mem::forget(guard);
+            let word = Arc::as_ptr(&first) as usize;
+            majit_gc::critical_section::note_acquired(word);
+            second_held_rx.recv().unwrap();
+            assert!(second.try_lock().is_none());
+            {
+                let _blocked = gc_sync::before_external_block();
+                detached_tx.send(()).unwrap();
+                majit_gc::critical_section::wait_until_unlocked(&second);
+                assert!(!second.is_owned_by_current_thread());
+                waited_tx.send(()).unwrap();
+            }
+            assert!(first.is_owned_by_current_thread());
+            let guard = second.try_lock().expect("contender released both stripes");
+            drop(guard);
+            majit_gc::critical_section::note_released(word);
+            unsafe { first.force_unlock() };
+            gc_sync::gc_thread_die();
+        })
+    };
+    let contender = thread::spawn(move || {
+        let second_guard = second.lock();
+        second_held_tx.send(()).unwrap();
+        detached_rx.recv().unwrap();
+        let first_guard = first.lock();
+        drop(second_guard);
+        waited_rx.recv().unwrap();
+        // The owner may be resuming and waiting for first. It must already
+        // have released second, so this opposite-order acquire can finish.
+        let second_guard = second.lock();
+        drop(second_guard);
+        drop(first_guard);
+    });
+    owner.join().unwrap();
+    contender.join().unwrap();
+}
+
 fn with_watchdog(seconds: u64, f: impl FnOnce()) {
     let done = Arc::new(AtomicBool::new(false));
     let watchdog = {
@@ -544,6 +782,40 @@ fn gil_disabled_nonmoving_alloc_collects_at_threshold() {
     let _serial = lock_nogil();
     let (simple, _) = install_gc();
     with_watchdog(15, || nonmoving_alloc_collects_at_threshold(simple));
+}
+
+#[test]
+fn gil_disabled_detach_suspends_critical_sections() {
+    let _serial = lock_nogil();
+    let _ = install_gc();
+    with_watchdog(15, critical_sections_suspend_while_detached);
+}
+
+#[test]
+fn gil_disabled_resume_reacquires_in_order_with_recursion() {
+    let _serial = lock_nogil();
+    let _ = install_gc();
+    with_watchdog(15, critical_sections_resume_in_order_with_recursion);
+}
+
+#[test]
+fn gil_disabled_nested_detach_suspends_callback_stripe() {
+    let _serial = lock_nogil();
+    let _ = install_gc();
+    with_watchdog(15, nested_external_block_suspends_callback_stripe);
+}
+
+#[test]
+fn critical_section_after_fork_discards_held_stack() {
+    let _serial = lock_nogil();
+    critical_section_fork_reset_discards_ownership();
+}
+
+#[test]
+fn gil_disabled_wait_releases_new_stripe_before_resume() {
+    let _serial = lock_nogil();
+    let _ = install_gc();
+    with_watchdog(15, critical_section_wait_releases_new_stripe_before_resume);
 }
 
 #[test]
