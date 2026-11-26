@@ -1753,7 +1753,14 @@ pub enum OpKind {
         base: crate::flowspace::model::Variable,
         index: crate::flowspace::model::Variable,
         field: FieldDescriptor,
-        value: crate::flowspace::model::Variable,
+        /// RPython `setinteriorfield_gc(p, i, x, descr)` where `x` is an
+        /// `AbstractValue` — either a `Variable` (register operand) or a
+        /// `Constant` (inline literal).  `LinkArg::Value`/`Const` mirrors
+        /// that union so a constant can stay inline as the stored value
+        /// instead of being hoisted into a separate `ConstInt -> register`
+        /// materialisation.  `rewrite_op_setinteriorfield` passes `v_value`
+        /// through (`jtransform.py`).
+        value: LinkArg,
         item_ty: ValueType,
         array_type_id: Option<String>,
         /// ARRAY lltype (`rewrite_op_setinteriorfield`

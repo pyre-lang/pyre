@@ -862,7 +862,7 @@ pub(crate) fn remap_op_kind(
             base: remap_var(base),
             index: remap_var(index),
             field: field.clone(),
-            value: remap_var(value),
+            value: value.map_value(remap_var),
             item_ty: item_ty.clone(),
             array_type_id: array_type_id.clone(),
             array: array.clone(),
@@ -1369,7 +1369,16 @@ pub fn op_variable_refs(kind: &OpKind) -> Vec<crate::flowspace::model::Variable>
         OpKind::InteriorFieldRead { base, index, .. } => vec![clone_var(base), clone_var(index)],
         OpKind::InteriorFieldWrite {
             base, index, value, ..
-        } => vec![clone_var(base), clone_var(index), clone_var(value)],
+        } => {
+            // `setinteriorfield_gc` stores either a register operand or an
+            // inline constant; only a `Variable` value contributes an SSA
+            // reference (a `Const` literal carries no defining op).
+            let mut refs = vec![clone_var(base), clone_var(index)];
+            if let Some(var) = value.as_variable() {
+                refs.push(clone_var(var));
+            }
+            refs
+        }
         OpKind::InteriorPtrExpose { base, .. } => vec![clone_var(base)],
         OpKind::StoreThroughPtr { ptr, value, .. } => vec![clone_var(ptr), clone_var(value)],
         OpKind::LoadThroughPtr { ptr, .. } => vec![clone_var(ptr)],

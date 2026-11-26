@@ -3312,11 +3312,38 @@ impl AssemblerEncode for Assembler {
                 state.code.push(reg);
                 argcodes.push(kc);
                 // `rewrite_op_setinteriorfield` passes `v_value` through;
-                // the op stores a register (`ArrayWrite`'s variable arm).
-                // `setinteriorfield_gc_*` is not in `USE_C_FORM` (`assembler.py`).
-                let (reg, value_kind) = self.lookup_reg_with_kind_var(value, regallocs);
-                state.code.push(reg);
-                argcodes.push(value_kind);
+                // a Variable is a register; a Constant is encoded like
+                // `setfield_gc` (`assembler.py` `emit_const`).
+                // `setinteriorfield_gc_*` is not in `USE_C_FORM`
+                // (`assembler.py`), so an int constant takes a pool `i`
+                // slot (`setinteriorfield_gc_i/riid`), never the short
+                // `c` byte.
+                let value_kind = match value {
+                    crate::model::LinkArg::Value(var) => {
+                        let (reg, kc) = self.lookup_reg_with_kind_var(var, regallocs);
+                        state.code.push(reg);
+                        argcodes.push(kc);
+                        kc
+                    }
+                    crate::model::LinkArg::Const(c) => {
+                        let kind = crate::flatten::constant_kind(c);
+                        if kind == 'i' {
+                            let (byte, argcode) = self.emit_const_i_from_const_allow_short(
+                                &c.value,
+                                use_c_form("setinteriorfield_gc_i"),
+                                state,
+                                callcontrol,
+                            );
+                            state.code.push(byte);
+                            argcodes.push(argcode);
+                        } else {
+                            let byte = self.emit_const(&c.value, kind, state, callcontrol);
+                            state.code.push(byte);
+                            argcodes.push(kind);
+                        }
+                        kind
+                    }
+                };
                 let descr = interiorfield_bh_descr(
                     callcontrol,
                     array_type_id,
@@ -17447,7 +17474,7 @@ mod tests {
                 base: base.clone(),
                 index: index.clone(),
                 field: FieldDescriptor::new("p", Some("Point".into())),
-                value: value.clone(),
+                value: crate::model::LinkArg::Value(value.clone()),
                 item_ty: ValueType::Ref(None),
                 array_type_id: Some("Vec<Point>".into()),
                 array: Some(test_point_array()),

@@ -2680,7 +2680,7 @@ fn emit_setinteriorfield(
     };
     let index = materialize(out, block, &op.args[1]);
     let field = interior_field_descriptor(&array, &field_name_of(&op.args[2]));
-    let value = materialize(out, block, &op.args[3]);
+    let value = linkarg_from_hlvalue(&op.args[3]);
     out.push_op_var(
         block,
         OpKind::InteriorFieldWrite {

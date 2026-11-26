@@ -1006,10 +1006,10 @@ impl<'a> Lowering<'a> {
 
     /// `(*add).field = value` for a recorded struct-field `ptr::add`.
     ///
-    /// `InteriorFieldWrite.value` is a [`Variable`]. A pooled
-    /// `LinkArg::Const` (`field_write_inline_const`) is materialised with
-    /// [`link_arg_as_alias_op`] first. An unpooled constant is an error,
-    /// not a `FieldWrite` of the item pointer.
+    /// `InteriorFieldWrite.value` is a [`LinkArg`] like
+    /// [`crate::model::OpKind::FieldWrite`]: `rewrite_op_setinteriorfield`
+    /// passes `v_value` through, so a pooled `LinkArg::Const`
+    /// (`field_write_inline_const`) stays a Constant operand.
     pub(in crate::front::mir) fn emit_interior_field_write(
         &mut self,
         mir_bb: usize,
@@ -1027,32 +1027,13 @@ impl<'a> Lowering<'a> {
         let array = self.interior_alias_array(&alias);
         let base = self.interior_header_base(bb_id, &alias, array.as_ref())?;
         let index = self.realias_operand(Some(alias.index_local), alias.index_var);
-        let value_var = match &value {
-            LinkArg::Value(var) => var.clone(),
-            LinkArg::Const(_) => {
-                let op = link_arg_as_alias_op(&value, &item_ty).ok_or_else(|| {
-                    LowerError::Unsupported(format!(
-                        "bb{mir_bb}: interior field write constant is not a pooled \
-                         int, bool, or float"
-                    ))
-                })?;
-                let var = self
-                    .graph
-                    .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-                self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-                    result: Some(var.clone()),
-                    kind: op,
-                });
-                var
-            }
-        };
         self.graph.block_mut(bb_id).operations.push(SpaceOperation {
             result: None,
             kind: OpKind::InteriorFieldWrite {
                 base,
                 index,
                 field,
-                value: value_var,
+                value,
                 item_ty,
                 array_type_id: Some(alias.array_type_id.clone()),
                 array,

@@ -4432,7 +4432,13 @@ pub fn translate_op(
         } => {
             let base_hl = lookup_operand(value_map, base, op, "base")?;
             let index_hl = lookup_operand(value_map, index, op, "index")?;
-            let value_hl = lookup_operand(value_map, value, op, "value")?;
+            // The stored value is an `AbstractValue` — a `Variable`
+            // (resolve through the SSA map) or an inline `Constant`
+            // (carries its own value), mirroring `Hlvalue` directly.
+            let value_hl = match value {
+                crate::model::LinkArg::Value(var) => lookup_operand(value_map, var, op, "value")?,
+                crate::model::LinkArg::Const(c) => Hlvalue::Constant(c.clone()),
+            };
             let result = resolve_result_hlvalue(op, value_map)?;
             let elem_var = Hlvalue::Variable(Variable::new());
             Ok(vec![
@@ -17520,7 +17526,7 @@ mod tests {
                 base: vars[1].clone(),
                 index: vars[2].clone(),
                 field: crate::model::FieldDescriptor::new("y", Some("Point".into())),
-                value: vars[3].clone(),
+                value: crate::model::LinkArg::Value(vars[3].clone()),
                 item_ty: ValueType::Int,
                 array_type_id: None,
                 array: None,

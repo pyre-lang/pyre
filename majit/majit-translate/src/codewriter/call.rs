@@ -19454,7 +19454,7 @@ fn effect_transduce_op(
             let index = effect_materialize(out, block, &op.args[1]);
             let field_name = effect_field_name(&op.args[2]);
             let owner_root = effect_interior_owner(&base);
-            let value = effect_materialize(out, block, &op.args[3]);
+            let value = effect_linkarg(&op.args[3]);
             let item_ty = effect_interior_field_lltype(&base, &field_name)
                 .and_then(|lltype| effect_value_type_from_lltype(&lltype))
                 .unwrap_or_else(|| match &op.args[3] {
@@ -35532,8 +35532,8 @@ mod tests {
     }
 
     /// `writeanalyze.py WriteAnalyzer.analyze_simple_operation`:
-    /// `setinteriorfield` is an interior write; Constant values are
-    /// materialised into a Variable.
+    /// `setinteriorfield` is an interior write; Constant values stay
+    /// `LinkArg::Const` like `setfield`.
     #[test]
     fn effect_graph_setinteriorfield_is_interior_field_write() {
         use crate::translator::rtyper::lltypesystem::lltype::{Array, LowLevelType, Ptr, Struct};
@@ -36870,7 +36870,7 @@ mod tests {
                 base,
                 index,
                 field: crate::model::FieldDescriptor::new("v", Some("x".into())),
-                value,
+                value: LinkArg::Value(value),
                 item_ty: ValueType::Int,
                 array_type_id: Some(array_type_id_of_lltype(&array)),
                 array: Some(array),

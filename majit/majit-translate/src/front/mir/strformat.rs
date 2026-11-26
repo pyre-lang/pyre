@@ -2488,7 +2488,7 @@ pub(in crate::front::mir) fn op_reads_var(
         OpKind::InteriorFieldRead { base, index, .. } => is(base) || is(index),
         OpKind::InteriorFieldWrite {
             base, index, value, ..
-        } => is(base) || is(index) || is(value),
+        } => is(base) || is(index) || arg_is(value),
         OpKind::InteriorPtrExpose { base, .. } => is(base),
         OpKind::StoreThroughPtr { ptr, value, .. } => is(ptr) || is(value),
         OpKind::LoadThroughPtr { ptr, .. } => is(ptr),

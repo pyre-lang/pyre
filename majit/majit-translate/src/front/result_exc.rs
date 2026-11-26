@@ -4150,7 +4150,14 @@ pub(crate) fn op_operand_vars(kind: &OpKind) -> Vec<Variable> {
         }
         OpKind::InteriorFieldWrite {
             base, index, value, ..
-        } => vec![base.clone(), index.clone(), value.clone()],
+        } => {
+            // An inline-const value references no Variable.
+            let mut refs = vec![base.clone(), index.clone()];
+            if let Some(v) = value.as_variable() {
+                refs.push(v.clone());
+            }
+            refs
+        }
         OpKind::InteriorPtrExpose { base, .. } => vec![base.clone()],
         OpKind::StoreThroughPtr { ptr, value, .. } => vec![ptr.clone(), value.clone()],
         OpKind::LoadThroughPtr { ptr, .. } => vec![ptr.clone()],

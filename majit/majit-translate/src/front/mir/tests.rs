@@ -289,7 +289,7 @@ fn os_path_family_tuple_field_is_owned_header_ref() {
 
 use super::{no_tombstoned_leaves, scalar_replace_named_struct_aggregates};
 
-use crate::flowspace::model::Variable;
+use crate::flowspace::model::{ConstValue, Variable};
 
 use crate::model::{
     CallTarget, FieldDescriptor, FunctionGraph, LinkArg, OpKind, SpaceOperation, ValueType,
@@ -46758,9 +46758,9 @@ fn deref_store_of_fieldless_enum_field_emits_field_writes() {
 }
 
 /// A signed field constant stays a pooled int. `field_write_inline_const`
-/// hands `LinkArg::Const` to the write, and `link_arg_as_alias_op`
-/// materialises `ConstInt` because `InteriorFieldWrite.value` is a
-/// Variable. The return assign is a second `ConstInt`.
+/// hands `LinkArg::Const` to the write, and `rewrite_op_setinteriorfield`
+/// keeps that `Constant` as the `InteriorFieldWrite` value. The return
+/// assign is a `ConstInt`.
 #[test]
 fn interior_field_write_of_const_int() {
     let i64_ty = interior_i64();
@@ -46824,7 +46824,7 @@ fn interior_field_write_of_const_int() {
             _ => None,
         })
         .collect();
-    assert_eq!(consts.len(), 2, "ops={ops:?}");
+    assert_eq!(consts.len(), 1, "ops={ops:?}");
     let OpKind::InteriorFieldWrite {
         value,
         field,
@@ -46843,7 +46843,10 @@ fn interior_field_write_of_const_int() {
     };
     assert_eq!(field.name, "y");
     assert_eq!(array_type_id.as_deref(), Some("GcArray<Point>"));
-    assert_eq!(value, consts[0]);
+    assert!(
+        matches!(value, LinkArg::Const(c) if matches!(c.value, ConstValue::Int(7))),
+        "setinteriorfield keeps the constant, got {value:?}"
+    );
 }
 
 /// Two value reads of one `ptr::add` are two interior reads. The

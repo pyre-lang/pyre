@@ -473,7 +473,7 @@ fn rewrite_one_store(
                     base: v_ptr,
                     index: v_index,
                     field: FieldDescriptor::new(field, None),
-                    value: value.clone(),
+                    value: LinkArg::Value(value.clone()),
                     item_ty,
                     array_type_id,
                     array: parent_array(&ip.ll_ptrtype.PARENTTYPE),
@@ -695,7 +695,7 @@ fn rewrite_one_field_write(
                 base: v_ptr,
                 index: v_index,
                 field: field.clone(),
-                value: value.expect_variable().clone(),
+                value: value.clone(),
                 item_ty: ty.clone(),
                 array_type_id: parent.as_ref().and_then(array_type_id_from_parent),
                 array: parent.as_ref().and_then(parent_array),
@@ -1896,6 +1896,98 @@ mod tests {
             })
             .collect();
         assert_eq!(writes, vec!["value".to_string()]);
+        assert!(graph.iter_block_ops().all(|(_, op)| {
+            !matches!(
+                &op.kind,
+                OpKind::FieldWrite { field, .. } if field.owner_root.as_deref() == Some("Entry")
+            )
+        }));
+    }
+
+    /// `InteriorPtrRepr.rtype_setattr` / `rewrite_op_setinteriorfield`
+    /// pass a `Constant` value through; a FieldWrite of an Interior-backed
+    /// base with `LinkArg::Const` rewrites to InteriorFieldWrite carrying
+    /// that constant.
+    #[test]
+    fn element_field_write_of_const_int_keeps_constant_operand() {
+        use crate::flowspace::model::Constant;
+        use crate::model::FieldDescriptor;
+
+        let mut graph = FunctionGraph::new("take_slot_const");
+        let entry = graph.startblock;
+        let input = |graph: &mut FunctionGraph, name: &str, ty: ValueType| {
+            graph
+                .push_op_var(
+                    entry,
+                    OpKind::Input {
+                        name: name.into(),
+                        ty,
+                        class_root: None,
+                    },
+                    true,
+                )
+                .unwrap()
+        };
+        let entries = input(&mut graph, "entries", ValueType::Ref(None));
+        let index = input(&mut graph, "i", ValueType::Int);
+        graph.push_inputarg_var(entry, entries.clone());
+        graph.push_inputarg_var(entry, index.clone());
+        let interior = graph
+            .push_op_var(
+                entry,
+                OpKind::New {
+                    owner: "Interior".into(),
+                    owner_id: None,
+                },
+                true,
+            )
+            .unwrap();
+        stamp_interior_concretetype(&interior);
+        let write = |graph: &mut FunctionGraph, name: &str, stored: Variable, ty: ValueType| {
+            graph.push_op_var(
+                entry,
+                OpKind::FieldWrite {
+                    base: interior.clone(),
+                    field: FieldDescriptor::new(name, Some("Interior".into())),
+                    value: LinkArg::Value(stored),
+                    ty,
+                },
+                false,
+            )
+        };
+        write(&mut graph, "ptr", entries, ValueType::Ref(None));
+        write(&mut graph, "index", index, ValueType::Int);
+        graph.push_op_var(
+            entry,
+            OpKind::FieldWrite {
+                base: interior,
+                field: FieldDescriptor::new("value", Some("Entry".into())),
+                value: LinkArg::Const(Constant::new(ConstValue::Int(1))),
+                ty: ValueType::Int,
+            },
+            false,
+        );
+        graph.set_return(entry, None);
+        rewrite_store_through_ptr(&mut graph, &HashMap::new(), &|_| false);
+        let writes: Vec<_> = graph
+            .iter_block_ops()
+            .filter_map(|(_, op)| match &op.kind {
+                OpKind::InteriorFieldWrite { field, value, .. } => {
+                    Some((field.name.clone(), value.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(writes.len(), 1, "one InteriorFieldWrite");
+        assert_eq!(writes[0].0, "value");
+        assert!(
+            matches!(
+                &writes[0].1,
+                LinkArg::Const(c) if matches!(c.value, ConstValue::Int(1))
+            ),
+            "constant must stay a Constant operand, got {:?}",
+            writes[0].1
+        );
         assert!(graph.iter_block_ops().all(|(_, op)| {
             !matches!(
                 &op.kind,
