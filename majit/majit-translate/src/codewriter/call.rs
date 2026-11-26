@@ -6312,26 +6312,21 @@ impl CallControl {
     /// FunDecl identity onto its own harvest spelling when harvest is
     /// free (`rffi.llexternal` graphless header). A harvest occupant is
     /// another funcobj (`Bookkeeper.getdesc`); do not bind this identity
-    /// onto it, and do not occupy a later Type-split Method key. Collect
-    /// emits identity then harvest first; the first non-identity spelling
-    /// of this FunDecl is `harvest_path_for_fun_decl`. When harvest is
-    /// occupied, identity still names this residual as its own header.
+    /// onto it, and do not occupy a later Type-split Method key. Harvest
+    /// is `harvest_path_for_fun_decl` carried on the stub record. When
+    /// harvest equals identity, occupy identity and not a later
+    /// Type-split. When harvest is occupied, identity still names this
+    /// residual as its own header.
     pub(crate) fn publish_residual_fun_decl_identities(&mut self) {
         let n = self.unsafe_fn_stubs.len();
         let mut seen = HashSet::new();
         for i in 0..n {
-            let Some(identity) = self.unsafe_fn_stubs[i].5.clone() else {
+            let Some((identity, harvest)) = self.unsafe_fn_stubs[i].5.clone() else {
                 continue;
             };
             if !seen.insert(identity.clone()) {
                 continue;
             }
-            let harvest = self.unsafe_fn_stubs[i..]
-                .iter()
-                .filter(|spec| spec.5.as_ref() == Some(&identity))
-                .map(|spec| CallPath::from_segments(spec.0.iter().cloned()))
-                .find(|path| path != &identity)
-                .unwrap_or_else(|| identity.clone());
             self.publish_one_residual_fun_decl_identity(identity, harvest);
         }
     }
@@ -19604,7 +19599,7 @@ mod tests {
             Some("i64".to_string()),
             None,
             None,
-            Some(identity.clone()),
+            Some((identity.clone(), harvest.clone())),
             None,
         )];
         cc.publish_residual_fun_decl_identities();
@@ -19649,7 +19644,7 @@ mod tests {
                 Some("i64".to_string()),
                 None,
                 None,
-                Some(identity.clone()),
+                Some((identity.clone(), harvest.clone())),
                 None,
             ),
             (
@@ -19658,7 +19653,7 @@ mod tests {
                 Some("i64".to_string()),
                 None,
                 None,
-                Some(identity.clone()),
+                Some((identity.clone(), harvest.clone())),
                 None,
             ),
             (
@@ -19667,7 +19662,7 @@ mod tests {
                 Some("i64".to_string()),
                 None,
                 None,
-                Some(identity.clone()),
+                Some((identity.clone(), harvest.clone())),
                 None,
             ),
         ];
@@ -19684,6 +19679,49 @@ mod tests {
         assert!(
             !cc.function_graphs().names_funcobj(&type_split),
             "must not occupy the Type-split Method key"
+        );
+    }
+
+    /// When identity equals harvest, a later Type-split row is not this
+    /// residual's harvest. Do not first-writer occupy it.
+    #[test]
+    fn publish_residual_identity_eq_harvest_does_not_occupy_type_split() {
+        let identity = CallPath::from_segments(["parent", "f"]);
+        let type_split = CallPath::from_segments(["Owner", "f"]);
+        let mut cc = CallControl::new();
+        let sig = Signature::new(vec!["x".to_string()], None, None);
+        cc.unsafe_fn_stubs = vec![
+            (
+                identity.segments.clone(),
+                sig.clone(),
+                Some("i64".to_string()),
+                None,
+                None,
+                Some((identity.clone(), identity.clone())),
+                None,
+            ),
+            (
+                type_split.segments.clone(),
+                sig,
+                Some("i64".to_string()),
+                None,
+                None,
+                Some((identity.clone(), identity.clone())),
+                None,
+            ),
+        ];
+        cc.publish_residual_fun_decl_identities();
+        assert!(
+            cc.function_graphs().names_funcobj(&identity),
+            "identity==harvest still publishes this residual as its own header"
+        );
+        assert_eq!(
+            cc.function_graphs().canonical_path(&identity).segments,
+            identity.segments
+        );
+        assert!(
+            !cc.function_graphs().names_funcobj(&type_split),
+            "must not occupy a free Type-split when identity equals harvest"
         );
     }
 

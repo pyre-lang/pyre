@@ -1128,17 +1128,16 @@ impl CallRegistry {
     /// `materialize_residual_inst`, does not invoke `getdesc`, and
     /// does not fall back to leaf-match.
     pub fn lookup_existing(&self, key: &FunctionPathKey) -> Option<Rc<FunctionEntry>> {
-        for spelling in crate::local_crates::call_registry_funcobj_spellings(key.segments()) {
-            let spelling_key = key.with_segments(spelling);
-            if let Some(entry) = self.lookup_registered(&spelling_key) {
-                return Some(entry);
-            }
+        if let Some(entry) = self.lookup_registered(key) {
+            return Some(entry);
         }
         // `populate_call_registry_from_call_graphs` dedupes by
         // `canonical_dedup_key`, stripping a leading `crate` / local /
         // harvested foreign-body crate root. A callsite that still
         // spells the crate-qualified path must hit the same
         // FunctionDesc (`bookkeeper.getdesc` identity on the callable).
+        // A strip-hit is this funcobj only when the occupant already
+        // records this exact identity.
         let stripped = {
             let fields = self.bookkeeper.struct_fields.borrow();
             let callables = fields
@@ -1149,7 +1148,14 @@ impl CallRegistry {
         };
         if let Some(stripped) = stripped {
             let stripped_key = key.with_segments(stripped);
-            if let Some(entry) = self.lookup_registered(&stripped_key) {
+            if let Some(entry) = self.lookup_registered(&stripped_key)
+                && entry
+                    .function_desc
+                    .borrow()
+                    .funcobj_keys
+                    .iter()
+                    .any(|segs| segs.as_slice() == key.segments())
+            {
                 return Some(entry);
             }
         }
@@ -1193,8 +1199,24 @@ impl CallRegistry {
         if let Some(entry) = self.lookup_existing(key) {
             return Some(entry);
         }
-        if let Some(stripped) = crate::local_crates::strip_alias_crate_prefix(key.segments()) {
+        // Callsites share the crate-stripped FunctionDesc
+        // (`bookkeeper.py getdesc`). `lookup_existing` is identity-strict
+        // and refuses a strip-hit whose occupant does not record this
+        // exact identity; the callsite path still uses the parent strip
+        // (`strip_alias_crate_prefix_with`).
+        let stripped = {
+            let fields = self.bookkeeper.struct_fields.borrow();
+            let callables = fields
+                .as_ref()
+                .map(|reg| reg.foreign_callables.as_slice())
+                .unwrap_or(&[]);
+            crate::local_crates::strip_alias_crate_prefix_with(key.segments(), callables)
+        };
+        if let Some(stripped) = stripped {
             let stripped_key = key.with_segments(stripped);
+            if let Some(entry) = self.lookup_registered(&stripped_key) {
+                return Some(entry);
+            }
             if let Some(entry) = self.describe_or_materialize_residual_inst(&stripped_key) {
                 return Some(entry);
             }
@@ -1918,6 +1940,31 @@ mod tests {
             "lookup_existing must not create a registry entry"
         );
         assert!(registry.is_empty());
+    }
+
+    /// A crate-prefixed identity that is not registered must not bind to
+    /// a stripped occupant of another callable (`Bookkeeper.getdesc`).
+    #[test]
+    fn lookup_existing_strip_does_not_bind_other_callable() {
+        crate::local_crates::with_local_crate_root("c", || {
+            let bk = Rc::new(Bookkeeper::new());
+            let registry = CallRegistry::new(bk);
+            let occupant = registry.get_or_register(
+                FunctionPathKey::from_segments(["mod", "f"]),
+                signature(&["x"]),
+            );
+            let query = FunctionPathKey::from_segments(["c", "mod", "f"]);
+            assert!(
+                registry.lookup_existing(&query).is_none(),
+                "unregistered crate-prefixed identity must not hit another callable's stripped occupant"
+            );
+            assert!(Rc::ptr_eq(
+                &occupant,
+                &registry
+                    .lookup_registered(&FunctionPathKey::from_segments(["mod", "f"]))
+                    .expect("occupant stays")
+            ));
+        });
     }
 
     #[test]
