@@ -970,10 +970,12 @@ unsafe fn bytes_dict_storage_custom_trace(
 }
 
 /// `rordereddict.py` `GcStruct("dicttable")` for a set: every live
-/// `ObjectKey.obj`. `ObjectKey.hash` is identity-stable across a move, so
-/// rewriting `obj` keeps the bucket index. The set body only forwards the
-/// `items` pointer; a box `clear` has detached stays reachable from the
-/// shadow stack and from the remembered set (`set_items_write_barrier`).
+/// `ObjectKey` pointer word. The digest lives in `Entry.f_hash`
+/// (`ll_hash_from_cache`) and is content-derived (`space.hash_w`), so
+/// rewriting the pointer after a young-gen move keeps the bucket. The set
+/// body only forwards the `items` pointer; a box `clear` has detached stays
+/// reachable from the shadow stack and from the remembered set
+/// (`set_items_write_barrier`).
 unsafe fn set_items_storage_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
     let storage = &mut *(obj_addr as *mut pyre_object::setobject::SetItemsStorage);
     f(storage.entries_slot() as *mut majit_ir::GcRef);

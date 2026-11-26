@@ -408,6 +408,7 @@ pub fn build_ll_listslice_startonly_graph(
                 name: param.to_string(),
                 ty,
                 class_root: None,
+                param: None,
             },
             var.clone(),
         );
@@ -477,6 +478,7 @@ pub fn build_ll_listslice_minusone_graph(
             name: "l1".to_string(),
             ty: ValueType::Ref(None),
             class_root: None,
+            param: None,
         },
         l1.clone(),
     );
@@ -587,6 +589,7 @@ pub fn build_ll_listslice_rangeto_graph(
                 name: param.to_string(),
                 ty,
                 class_root: None,
+                param: None,
             },
             var.clone(),
         );
@@ -687,6 +690,7 @@ pub fn build_ll_listslice_startstop_graph(
                 name: param.to_string(),
                 ty,
                 class_root: None,
+                param: None,
             },
             var.clone(),
         );
@@ -1110,6 +1114,7 @@ mod tests {
                 name: "args_w".into(),
                 ty: ValueType::Ref(None),
                 class_root: Some(OBJECT_REF_SLICE_CLASS_ROOT.into()),
+                param: None,
             },
             args.clone(),
         );
@@ -1126,6 +1131,7 @@ mod tests {
                 name: "w_obj".into(),
                 ty: ValueType::Ref(None),
                 class_root: Some("PyObject".into()),
+                param: None,
             },
             other.clone(),
         );

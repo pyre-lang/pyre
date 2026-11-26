@@ -17508,6 +17508,7 @@ fn empty_str_concat_helper_aborts_before_the_unwired_op_is_dispatched() {
                 name: "lhs".into(),
                 ty: ValueType::Ref(None),
                 class_root: None,
+                param: None,
             },
             true,
         )
@@ -17519,6 +17520,7 @@ fn empty_str_concat_helper_aborts_before_the_unwired_op_is_dispatched() {
                 name: "rhs".into(),
                 ty: ValueType::Ref(None),
                 class_root: None,
+                param: None,
             },
             true,
         )

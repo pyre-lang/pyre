@@ -180,6 +180,7 @@ pub fn build_ll_minmax_graph(name: &str, is_max: bool, value_ty: &ValueType) -> 
                 name: param.to_string(),
                 ty: value_ty.clone(),
                 class_root: None,
+                param: None,
             },
             var.clone(),
         );

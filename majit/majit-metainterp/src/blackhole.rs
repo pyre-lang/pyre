@@ -5908,6 +5908,7 @@ mod tests {
                         name: "x".into(),
                         ty: ValueType::Int,
                         class_root: None,
+                        param: None,
                     },
                     true,
                 )

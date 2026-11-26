@@ -305,6 +305,7 @@ mod tests {
                     name: "value".to_string(),
                     ty: ValueType::Str,
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -378,6 +379,7 @@ mod tests {
                     name: "neg".to_string(),
                     ty: ValueType::Bool,
                     class_root: None,
+                    param: None,
                 },
                 true,
             )

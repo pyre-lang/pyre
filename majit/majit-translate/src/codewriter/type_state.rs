@@ -1460,6 +1460,7 @@ mod tests {
                     name: name.into(),
                     ty,
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -2691,6 +2692,7 @@ mod tests {
             name: "code".into(),
             ty: ValueType::Ref(Some("CodeObject".into())),
             class_root: Some("CodeObject".into()),
+            param: None,
         };
         assert_eq!(
             authoritative_result_type_from_op(&op, &raw),

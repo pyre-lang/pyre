@@ -4747,6 +4747,7 @@ fn flavor_raw_struct_borrow_is_int_banked_with_class_root() {
                 name,
                 ty,
                 class_root,
+                ..
             } if name == "subject" => Some((ty.clone(), class_root.clone())),
             _ => None,
         })
@@ -17971,6 +17972,7 @@ fn stamp_option_method_inputs(
                 name,
                 ty,
                 class_root,
+                ..
             } => Some((name.clone(), ty.clone(), class_root.clone())),
             _ => None,
         })
@@ -24910,6 +24912,51 @@ fn field_row_declared_gc_pointer_is_gcref() {
     assert_eq!(got, (*GCREF).clone());
 }
 
+/// A pointee that is both `GcType` (`note_declared_gc_name`) and classed
+/// (`record_struct_id` `class_identity`) is `rclass.py`
+/// `InstanceRepr.lowleveltype` (`OBJECTPTR`), not `llmemory.py` `GCREF`.
+/// `lltype.py` `SomePtr.getattr` of that ITEM field stays SomePtr.
+#[test]
+fn field_row_declared_gc_and_classed_pointer_is_objectptr() {
+    use crate::annotator::model::{SomeString, SomeValue};
+    use crate::flowspace::model::{ConstValue, Constant};
+    use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+    use crate::translator::rtyper::rclass::OBJECTPTR;
+
+    let mut reg = crate::front::StructFieldRegistry::default();
+    reg.note_declared_gc_name("owner::GcInst");
+    note_class_identity(&mut reg, "owner::GcInst");
+    let got = super::field_row_lltype(&reg, "*mut owner::GcInst", &mut field_row_visited())
+        .expect("classed declared-GC pointer field");
+    assert_eq!(got, OBJECTPTR.clone());
+
+    let mut reg = slot_block_registry("*mut owner::GcInst");
+    reg.note_declared_gc_name("owner::GcInst");
+    note_class_identity(&mut reg, "owner::GcInst");
+    let s = super::struct_item_flexible_gcarray_block_annotation(
+        &reg,
+        "storage::SlotBlock",
+        "[storage::Slot; 0]",
+    )
+    .expect("classed declared-GC ITEM field intern");
+    let SomeValue::Ptr(ptr) = s else {
+        panic!("must intern SomePtr(GcArray), got {s:?}")
+    };
+    let mut s_attr = SomeString::new(false, false);
+    s_attr.inner.base.const_box = Some(Constant::new(ConstValue::byte_str("value")));
+    let s_value = ptr
+        .getattr(&SomeValue::String(s_attr))
+        .expect("GcArray ITEM getattr value");
+    let SomeValue::Ptr(p) = &s_value else {
+        panic!("OBJECTPTR ITEM field getattr stays SomePtr(OBJECTPTR), got {s_value:?}")
+    };
+    assert_eq!(
+        LowLevelType::from(p.ll_ptrtype.clone()),
+        *OBJECTPTR,
+        "OBJECTPTR ITEM field getattr stays SomePtr(OBJECTPTR), got {s_value:?}"
+    );
+}
+
 #[test]
 fn field_row_str_family_pointer_is_strptr_ahead_of_declared_gc_and_classed() {
     use crate::translator::rtyper::lltypesystem::rstr::STRPTR;
@@ -24930,6 +24977,176 @@ fn field_row_str_family_pointer_is_strptr_ahead_of_declared_gc_and_classed() {
     )
     .expect("BytesBlock pointer field");
     assert_eq!(got, *STRPTR);
+}
+
+/// A by-value `#[repr(transparent)]` one-field newtype over a pointer,
+/// used as a field of a GcArray ITEM struct, intern's as the inner
+/// field's lltype (`rordereddict.py` `get_ll_dict`; `lltype.py`
+/// `_interior_ptr._expose` of a Ptr field). A `#[repr(C)]` two-field
+/// struct in the same position stays a nested inline Struct.
+#[test]
+fn field_row_transparent_by_value_pointer_matches_inner_lltype() {
+    use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+    use crate::translator::rtyper::rclass::OBJECTPTR;
+
+    let raw_object = serde_json::json!({"RawPtr": [adt_node(0), "Mut"]});
+    let bool_ty = serde_json::json!({"Scalar": "Bool"});
+    let i64 = serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}});
+    let llbc = llbc_with_types(
+        "fixture",
+        vec![
+            type_decl_struct(0, &["pyre_object", "pyobject", "PyObject"], vec![]),
+            interior_struct(
+                1,
+                &["fixture", "TransparentKey"],
+                &[("inner", raw_object.clone())],
+                8,
+                &[0],
+                true,
+            ),
+            interior_c_struct(
+                2,
+                &["fixture", "PackedKey"],
+                &[("hash", i64), ("obj", raw_object.clone())],
+                16,
+                &[0, 8],
+                false,
+            ),
+            type_decl_struct(
+                3,
+                &["fixture", "TransparentItem"],
+                vec![
+                    serde_json::json!({
+                        "name": "key",
+                        "ty": adt_node(1),
+                        "attr_info": null
+                    }),
+                    serde_json::json!({
+                        "name": "f_valid",
+                        "ty": bool_ty,
+                        "attr_info": null
+                    }),
+                ],
+            ),
+            type_decl_struct(
+                4,
+                &["fixture", "PackedItem"],
+                vec![
+                    serde_json::json!({
+                        "name": "key",
+                        "ty": adt_node(2),
+                        "attr_info": null
+                    }),
+                    serde_json::json!({
+                        "name": "f_valid",
+                        "ty": bool_ty,
+                        "attr_info": null
+                    }),
+                ],
+            ),
+        ],
+        vec![],
+    );
+    let (_, _, mut fields, _, _, _, _, _) = super::derive_program_metadata(
+        &llbc,
+        &super::harvest_declared_gc_facts(&llbc).gc_struct_ids(),
+        super::no_immutable_fields(),
+        &std::collections::HashSet::new(),
+        &[],
+    );
+    // Harvest records class identity for `pyobject::PyObject`
+    // (`record_struct_id`). Seed declared-GC as production does: a
+    // classed instance field is `rclass.py` `InstanceRepr.lowleveltype`
+    // (`OBJECTPTR`), not `llmemory.py` `GCREF`. The wrapper still
+    // intern's as the inner (`rordereddict.py` `get_ll_dict`).
+    fields.note_declared_gc_name("pyobject::PyObject");
+
+    let inner = fields
+        .transparent_inner_field("TransparentKey")
+        .or_else(|| fields.transparent_inner_field("fixture::TransparentKey"))
+        .expect("transparent wrapper records its inner field layout");
+    assert!(
+        crate::front::typestr::peel_pointer_prefix(&inner)
+            .is_some_and(|pointee| pointee.contains("PyObject")),
+        "transparent inner is the pointer, got {inner}"
+    );
+    assert!(
+        fields.transparent_inner_field("PackedKey").is_none(),
+        "repr(C) two-field key is not a transparent inner"
+    );
+
+    let packed_key_ty = fields
+        .field_type("PackedItem", "key")
+        .or_else(|| fields.field_type("fixture::PackedItem", "key"))
+        .expect("PackedItem.key harvest");
+    assert!(
+        packed_key_ty.contains("PackedKey"),
+        "repr(C) two-field key stays the nested struct spelling, got {packed_key_ty}"
+    );
+
+    let inner_ll = super::field_row_lltype(&fields, &inner, &mut field_row_visited())
+        .expect("bare inner field-row lltype");
+    assert_eq!(
+        inner_ll,
+        OBJECTPTR.clone(),
+        "harvested classed PyObject intern's OBJECTPTR (`InstanceRepr.lowleveltype`)"
+    );
+    let transparent_ll =
+        super::field_row_lltype(&fields, "TransparentKey", &mut field_row_visited())
+            .or_else(|| {
+                super::field_row_lltype(
+                    &fields,
+                    "fixture::TransparentKey",
+                    &mut field_row_visited(),
+                )
+            })
+            .expect("transparent wrapper field-row lltype");
+    assert_eq!(
+        transparent_ll, inner_ll,
+        "by-value transparent newtype intern's as the inner field lltype, inner={inner}"
+    );
+
+    let mut visited = std::collections::HashSet::new();
+    let transparent_item =
+        super::raw_struct_array_item_lltype(&fields, "TransparentItem", &mut visited)
+            .or_else(|| {
+                super::raw_struct_array_item_lltype(
+                    &fields,
+                    "fixture::TransparentItem",
+                    &mut visited,
+                )
+            })
+            .expect("TransparentItem ITEM struct");
+    let LowLevelType::Struct(st) = transparent_item else {
+        panic!("ITEM must be Struct, got {transparent_item:?}");
+    };
+    assert_eq!(
+        st.getattr_field_type("key"),
+        Some(inner_ll),
+        "GcArray ITEM key of a transparent pointer newtype equals the inner field lltype"
+    );
+
+    let mut visited = std::collections::HashSet::new();
+    let packed_item = super::raw_struct_array_item_lltype(&fields, "PackedItem", &mut visited)
+        .or_else(|| {
+            super::raw_struct_array_item_lltype(&fields, "fixture::PackedItem", &mut visited)
+        })
+        .expect("PackedItem ITEM struct");
+    let LowLevelType::Struct(st) = packed_item else {
+        panic!("ITEM must be Struct, got {packed_item:?}");
+    };
+    match st.getattr_field_type("key") {
+        Some(LowLevelType::Struct(inner)) => {
+            assert!(
+                inner._name.contains("PackedKey"),
+                "repr(C) two-field key stays a nested Struct, got {}",
+                inner._name
+            );
+            assert!(inner.getattr_field_type("hash").is_some());
+            assert!(inner.getattr_field_type("obj").is_some());
+        }
+        other => panic!("repr(C) two-field key must stay a nested Struct, got {other:?}"),
+    }
 }
 
 #[test]

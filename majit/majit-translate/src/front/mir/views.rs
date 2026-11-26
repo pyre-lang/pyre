@@ -5188,6 +5188,16 @@ pub(in crate::front::mir) fn pair_len_shadows(
     mark_dict_method_str_view_keys(graph_name, body, llbc, &mut str_views);
     let dyn_fat_pairs = dyn_fat_pair_locals(body, llbc);
     let block_u8 = bytes_block_chars_view_locals(body, llbc);
+    // A const `[u8; N]` byte-string literal and its Ref / Unsize aliases
+    // are one `Ptr(STR)` word (`rstr.py` `AbstractStringRepr.rtype_getitem`
+    // / `ll_stritem_nonneg`). `body_owner_view_locals` treats Unsize of
+    // `&[u8; N]` as a window def and would plant a length shadow; merge
+    // after that census so the Unsize dest stays a STR view.
+    for (i, marked) in const_byte_str_view_locals(body, llbc).iter().enumerate() {
+        if *marked {
+            str_views[i] = true;
+        }
+    }
     let len_shadow = pair_len_shadows_of(
         &body.locals,
         llbc,
@@ -7683,6 +7693,638 @@ fn array_aggregate_operands(rvalue: &Rvalue) -> Option<&[Operand]> {
         return None;
     }
     Some(operands.as_slice())
+}
+
+/// UTF-8 text of an all-const `[u8; N]` Array aggregate (`b"..."` inlined
+/// as `Rvalue::Aggregate`). `None` when the element is not `u8`, an
+/// operand is not a byte constant, or the bytes are not valid UTF-8.
+///
+/// The element type is read from the Aggregate kind (`{"Array": [u8, N, …]}`)
+/// first so a Deduplicated dest whose array length is a const-table id
+/// still folds. `tyref_raw_array_parts` is not required: a Charon array
+/// length `{"Deduplicated": id}` is a const-expr id, and a failed parse of
+/// `N` must not leave the literal as an uninitialised local.
+/// `rstr.py` `AbstractStringRepr.rtype_getitem` / `ll_stritem_nonneg` take
+/// a Constant string; `descr_repr` indexes that table with a variable `n`.
+/// Only a dest whose copy-component is single-assignment and immutable
+/// is marked (`lltype.py` `_ptr.__setitem__`; `framestate.py`
+/// `FrameState.union`).
+pub(in crate::front::mir) fn const_u8_array_aggregate_text(
+    llbc: &Llbc,
+    rvalue: &Rvalue,
+    dest_ty: &TyRef,
+) -> Option<String> {
+    let Rvalue::Aggregate(kind, operands) = rvalue else {
+        return None;
+    };
+    if aggregate_ctor_name(kind) != "Array" {
+        return None;
+    }
+    if operands.is_empty() {
+        return None;
+    }
+    if !const_u8_array_element_is_u8(llbc, kind, dest_ty, operands) {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(operands.len());
+    for op in operands {
+        let Operand::Const(value) = op else {
+            return None;
+        };
+        bytes.push(const_operand_u8(llbc, value)?);
+    }
+    String::from_utf8(bytes).ok()
+}
+
+fn json_ty_is_u8(node: &serde_json::Value, llbc: &Llbc) -> bool {
+    json_ty_scalar_element_spelling(node, llbc).as_deref() == Some("u8")
+}
+
+fn tyref_is_u8_array(ty: &TyRef, llbc: &Llbc) -> bool {
+    let Some(node) = tyref_node(ty, llbc).and_then(|n| strip_ty_indirections(n, llbc)) else {
+        return false;
+    };
+    json_ty_is_u8_array(node, llbc)
+}
+
+fn json_ty_is_u8_array(node: &serde_json::Value, llbc: &Llbc) -> bool {
+    node.get("Array")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|array| array.first())
+        .is_some_and(|item| json_ty_is_u8(item, llbc))
+}
+
+fn json_ty_is_u8_slice(node: &serde_json::Value, llbc: &Llbc) -> bool {
+    node.get("Slice")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|array| array.first())
+        .is_some_and(|item| json_ty_is_u8(item, llbc))
+}
+
+/// Dest type of a member Cast that may stay in the const-byte-string copy
+/// relation: the declared type still has element type `u8`.
+/// `[u8; N]`, `&[u8; N]`, `&[u8]`, `*const/*mut [u8; N]`, `*const/*mut [u8]`,
+/// `*const/*mut u8`. A Cast to `[i8; N]` / `*const [i8; N]` does not
+/// (`rptr.py` `PtrRepr.rtype_getitem` reads the pointer's target element).
+fn tyref_has_u8_element(ty: &TyRef, llbc: &Llbc) -> bool {
+    let Some(node) = tyref_node(ty, llbc).and_then(|n| strip_ty_indirections(n, llbc)) else {
+        return false;
+    };
+    if json_ty_is_u8_array(node, llbc) {
+        return true;
+    }
+    let pointee = match (node.get("Ref"), node.get("RawPtr")) {
+        (Some(reference), _) => reference.as_array().and_then(|arr| arr.get(1)),
+        (None, Some(raw)) => raw.as_array().and_then(|arr| arr.first()),
+        (None, None) => return false,
+    };
+    let Some(pointee) = pointee.and_then(|p| strip_ty_indirections(p, llbc)) else {
+        return false;
+    };
+    json_ty_is_u8(pointee, llbc)
+        || json_ty_is_u8_array(pointee, llbc)
+        || json_ty_is_u8_slice(pointee, llbc)
+}
+
+fn const_expr_ty_is_u8(llbc: &Llbc, value: &serde_json::Value) -> bool {
+    llbc.const_expr_ty(value)
+        .is_some_and(|ty| json_ty_is_u8(ty, llbc))
+}
+
+fn const_u8_array_element_is_u8(
+    llbc: &Llbc,
+    kind: &serde_json::Value,
+    dest_ty: &TyRef,
+    operands: &[Operand],
+) -> bool {
+    if let Some(item) = kind
+        .get("Array")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|array| array.first())
+        && json_ty_is_u8(item, llbc)
+    {
+        return true;
+    }
+    if tyref_is_u8_array(dest_ty, llbc) {
+        return true;
+    }
+    match operands.first() {
+        Some(Operand::Const(value)) => const_expr_ty_is_u8(llbc, value),
+        _ => false,
+    }
+}
+
+fn const_operand_u8(llbc: &Llbc, value: &serde_json::Value) -> Option<u8> {
+    match decode_constant(llbc, value).ok()? {
+        DecodedConst::Int(n) => u8::try_from(n).ok(),
+        DecodedConst::UInt(n) => u8::try_from(n).ok(),
+        _ => None,
+    }
+}
+
+fn place_local_or_deref(place: &Place) -> Option<usize> {
+    match &place.kind {
+        PlaceKind::Local(i) => Some(*i as usize),
+        PlaceKind::Projection(inner, ProjectionElem::Atom(atom)) if atom == "Deref" => {
+            place_local_or_deref(inner)
+        }
+        _ => None,
+    }
+}
+
+/// Source local of a Use / Cast / Unsize / Ref / RawPtr copy of a
+/// whole local or `*local`. A `UnaryOp` is a copy only when the operator
+/// is `{"Cast": ...}` and `dest_ty` still has element type `u8`
+/// (`tyref_has_u8_element`); that covers Unsize of `&[u8; N]` as `&[u8]`
+/// and RawPtr casts to `*const/*mut u8 | [u8; N] | [u8]`. `Not` / `Neg`
+/// / `PtrMetadata` / a Cast to `[i8; N]` are not (`rptr.py`
+/// `PtrRepr.rtype_getitem`). `Rvalue::Cast` uses the same dest-type
+/// rule. The census grows along this relation (`rstr.py`
+/// `AbstractStringRepr` aliases a Constant string).
+fn rvalue_copy_source_local(llbc: &Llbc, rvalue: &Rvalue, dest_ty: &TyRef) -> Option<usize> {
+    let op = match rvalue {
+        Rvalue::Use(op, _) => op,
+        Rvalue::UnaryOp(kind, op)
+            if unary_op_is_cast(kind) && tyref_has_u8_element(dest_ty, llbc) =>
+        {
+            op
+        }
+        Rvalue::Cast(_, op, _) if tyref_has_u8_element(dest_ty, llbc) => op,
+        Rvalue::Ref { place, .. } | Rvalue::RawPtr { place, .. } => {
+            return place_local_or_deref(place);
+        }
+        _ => return None,
+    };
+    match op {
+        Operand::Copy(place) | Operand::Move(place) => place_local_or_deref(place),
+        Operand::Const(_) => None,
+    }
+}
+
+fn rvalue_copies_const_byte_str(
+    llbc: &Llbc,
+    rvalue: &Rvalue,
+    dest_ty: &TyRef,
+    mark: &[bool],
+) -> bool {
+    rvalue_copy_source_local(llbc, rvalue, dest_ty)
+        .is_some_and(|src| mark.get(src).copied().unwrap_or(false))
+}
+
+fn place_is_member_whole(place: &Place, component: &[bool]) -> bool {
+    place_local_or_deref(place).is_some_and(|src| component.get(src).copied().unwrap_or(false))
+}
+
+fn place_mentions_member_storage(place: &Place, component: &[bool]) -> bool {
+    place_root_local(place).is_some_and(|src| component.get(src).copied().unwrap_or(false))
+}
+
+fn place_peel_deref(place: &Place) -> &Place {
+    match &place.kind {
+        PlaceKind::Projection(inner, ProjectionElem::Atom(atom)) if atom == "Deref" => {
+            place_peel_deref(inner)
+        }
+        _ => place,
+    }
+}
+
+fn projection_elem_index_offset(elem: &ProjectionElem) -> Option<Operand> {
+    let ProjectionElem::Tagged(v) = elem else {
+        return None;
+    };
+    let offset = v.as_object()?.get("Index")?.get("offset")?;
+    serde_json::from_value(offset.clone()).ok()
+}
+
+/// Index / PtrMetadata of a whole member or `*member`, with a trailing
+/// Deref of the byte element (`rstr.py` `ll_stritem_nonneg`). A
+/// `ConstantIndex` is not lowered as an element read (`resolve_place_as`
+/// handles tagged `Index` only), so it is not whitelisted: the use taints
+/// the component and the array keeps array lowering.
+fn place_is_allowed_index_or_len_read(place: &Place, component: &[bool]) -> bool {
+    let peeled = place_peel_deref(place);
+    match &peeled.kind {
+        PlaceKind::Projection(inner, elem) if projection_elem_is_index(elem) => {
+            place_is_member_whole(inner, component)
+        }
+        PlaceKind::Projection(inner, ProjectionElem::Atom(atom)) if atom == "PtrMetadata" => {
+            place_is_member_whole(inner, component)
+        }
+        _ => false,
+    }
+}
+
+fn place_index_offsets_disallowed(place: &Place, component: &[bool]) -> bool {
+    let mut current = place;
+    loop {
+        match &current.kind {
+            PlaceKind::Projection(inner, elem) => {
+                if let Some(offset) = projection_elem_index_offset(elem)
+                    && operand_has_disallowed_member_use(&offset, component)
+                {
+                    return true;
+                }
+                current = inner;
+            }
+            _ => return false,
+        }
+    }
+}
+
+fn place_has_disallowed_member_use(place: &Place, component: &[bool]) -> bool {
+    if place_index_offsets_disallowed(place, component) {
+        return true;
+    }
+    if place_is_allowed_index_or_len_read(place, component) {
+        return false;
+    }
+    place_mentions_member_storage(place, component)
+}
+
+fn operand_has_disallowed_member_use(op: &Operand, component: &[bool]) -> bool {
+    match op {
+        Operand::Const(_) => false,
+        Operand::Copy(place) | Operand::Move(place) => {
+            place_has_disallowed_member_use(place, component)
+        }
+    }
+}
+
+fn unary_op_is_ptr_metadata(kind: &serde_json::Value) -> bool {
+    kind.as_str() == Some("PtrMetadata") || kind.get("PtrMetadata").is_some()
+}
+
+/// `Len` / UnaryOp `PtrMetadata` of a whole member or `*member` is an
+/// allowed length read; any other place through those ops taints.
+fn len_place_has_disallowed_member_use(place: &Place, component: &[bool]) -> bool {
+    if place_is_member_whole(place, component) {
+        false
+    } else {
+        place_has_disallowed_member_use(place, component)
+    }
+}
+
+/// Member uses that are not a copy into a member local, an index/Len
+/// read, or PtrMetadata of the member. A `&` / `&raw` here is already
+/// not an Assign to a member dest (`lltype.py` `_ptr.__setattr__` /
+/// `_ptr.__setitem__`).
+fn rvalue_has_disallowed_member_use(rvalue: &Rvalue, component: &[bool]) -> bool {
+    match rvalue {
+        Rvalue::Use(op, _) | Rvalue::Cast(_, op, _) | Rvalue::ShallowInitBox(op, _) => {
+            operand_has_disallowed_member_use(op, component)
+        }
+        Rvalue::UnaryOp(kind, op) if unary_op_is_ptr_metadata(kind) => match op {
+            Operand::Copy(place) | Operand::Move(place) => {
+                len_place_has_disallowed_member_use(place, component)
+            }
+            Operand::Const(_) => false,
+        },
+        Rvalue::UnaryOp(_, op) => operand_has_disallowed_member_use(op, component),
+        Rvalue::BinaryOp(_, lhs, rhs) => {
+            operand_has_disallowed_member_use(lhs, component)
+                || operand_has_disallowed_member_use(rhs, component)
+        }
+        Rvalue::Ref { place, .. } | Rvalue::RawPtr { place, .. } => {
+            place_mentions_member_storage(place, component)
+                || place_index_offsets_disallowed(place, component)
+        }
+        Rvalue::Aggregate(_, ops) => ops
+            .iter()
+            .any(|op| operand_has_disallowed_member_use(op, component)),
+        Rvalue::Discriminant(place) => place_has_disallowed_member_use(place, component),
+        Rvalue::Len(place) => len_place_has_disallowed_member_use(place, component),
+        Rvalue::Repeat { operand, .. } => operand_has_disallowed_member_use(operand, component),
+        Rvalue::NullaryOp(_, _) | Rvalue::Unknown => false,
+    }
+}
+
+fn assign_is_allowed_member_copy(
+    llbc: &Llbc,
+    dest: &Place,
+    rvalue: &Rvalue,
+    component: &[bool],
+) -> bool {
+    let PlaceKind::Local(dest_local) = dest.kind else {
+        return false;
+    };
+    if !component.get(dest_local as usize).copied().unwrap_or(false) {
+        return false;
+    }
+    const_u8_array_aggregate_text(llbc, rvalue, &dest.ty).is_some()
+        || rvalue_copies_const_byte_str(llbc, rvalue, &dest.ty, component)
+}
+
+fn const_byte_str_component_tainted(
+    body: &Unstructured,
+    llbc: &Llbc,
+    forward: &[bool],
+    component: &[bool],
+    mutably_borrowed: &[usize],
+    projected: &bit_set::BitSet,
+    multi: &std::collections::HashSet<usize>,
+) -> bool {
+    let n = component.len();
+    for local in 0..n {
+        if !component[local] {
+            continue;
+        }
+        if mutably_borrowed.contains(&local)
+            || projected.contains(local)
+            || multi.contains(&local)
+            || is_parameter_local(body, local)
+        {
+            return true;
+        }
+    }
+    for (bb_idx, bb) in body.body().iter().enumerate() {
+        if !forward.get(bb_idx).copied().unwrap_or(false) {
+            continue;
+        }
+        for st in &bb.statements {
+            match st.stmt_kind_ref() {
+                Ok(StmtKind::Assign(dest, rvalue)) => {
+                    if place_index_offsets_disallowed(dest, component) {
+                        return true;
+                    }
+                    if let PlaceKind::Local(dest_local) = dest.kind {
+                        let dest_local = dest_local as usize;
+                        if component.get(dest_local).copied().unwrap_or(false)
+                            && !assign_is_allowed_member_copy(llbc, dest, rvalue, component)
+                        {
+                            return true;
+                        }
+                    }
+                    if assign_is_allowed_member_copy(llbc, dest, rvalue, component) {
+                        continue;
+                    }
+                    if rvalue_has_disallowed_member_use(rvalue, component) {
+                        return true;
+                    }
+                }
+                Ok(StmtKind::Assert(assert)) => {
+                    if operand_has_disallowed_member_use(&assert.cond, component) {
+                        return true;
+                    }
+                }
+                Ok(
+                    StmtKind::StorageLive(_)
+                    | StmtKind::StorageDead(_)
+                    | StmtKind::PlaceMention(_)
+                    | StmtKind::Borrowck(_)
+                    | StmtKind::Unknown,
+                ) => {}
+                Err(_) => {}
+            }
+        }
+        match bb.term_ref(llbc) {
+            Ok(TermKind::Call { call, .. }) => {
+                if place_index_offsets_disallowed(&call.dest, component) {
+                    return true;
+                }
+                if let PlaceKind::Local(dest) = call.dest.kind
+                    && component.get(dest as usize).copied().unwrap_or(false)
+                {
+                    return true;
+                }
+                if call
+                    .args
+                    .iter()
+                    .any(|op| operand_has_disallowed_member_use(op, component))
+                {
+                    return true;
+                }
+            }
+            Ok(TermKind::Switch { discr, .. }) => {
+                if operand_has_disallowed_member_use(discr, component) {
+                    return true;
+                }
+            }
+            Ok(TermKind::Assert { assert, .. }) => {
+                if operand_has_disallowed_member_use(&assert.cond, component) {
+                    return true;
+                }
+            }
+            Ok(TermKind::Return) => {
+                if component.first().copied().unwrap_or(false) {
+                    return true;
+                }
+            }
+            Ok(TermKind::Drop { .. })
+            | Ok(TermKind::Goto { .. })
+            | Ok(TermKind::UnwindResume)
+            | Ok(TermKind::UnwindTerminate)
+            | Ok(TermKind::Abort(_))
+            | Ok(TermKind::Panic { .. })
+            | Ok(TermKind::UndefinedBehavior)
+            | Ok(TermKind::Unknown)
+            | Err(_) => {}
+        }
+    }
+    false
+}
+
+/// Locals defined by a const `[u8; N]` byte-string aggregate, plus every
+/// local that receives a Use / Ref / RawPtr / `*local` copy of a member,
+/// or a `UnaryOp`/`Rvalue::Cast` whose operator is `{"Cast": ...}` and
+/// whose dest type still has element type `u8`. The Unsize dest of
+/// `&[u8; N]` as `&[u8]` is included so it does not take a window length
+/// shadow. A Cast to a non-`u8` element type, and `Not` / `Neg` /
+/// `PtrMetadata`, are not copies (`rptr.py` `PtrRepr.rtype_getitem`).
+///
+/// Promotion is decided for the whole copy-component before lowering: if
+/// any member is mutably borrowed, has a projected store, is assigned
+/// more than once, is the destination of a non-member copy, or has a
+/// use that is not a member copy / index / Len / PtrMetadata read (a
+/// field store, a Call argument, an Aggregate operand, a ConstantIndex,
+/// a Return of the member), no member is marked (`rstr.py`
+/// `AbstractStringRepr`; `lltype.py` `_ptr.__setattr__` / `_ptr.__setitem__`;
+/// `framestate.py` `FrameState.union`). A value that may meet array
+/// storage is never a Constant string.
+pub(in crate::front::mir) fn const_byte_str_view_locals(
+    body: &Unstructured,
+    llbc: &Llbc,
+) -> Vec<bool> {
+    let n = body.locals.locals.len();
+    let forward = forward_reachable_mask(llbc, body);
+    let mut is_root = vec![false; n];
+    let mut recv: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for (bb_idx, bb) in body.body().iter().enumerate() {
+        if !forward.get(bb_idx).copied().unwrap_or(false) {
+            continue;
+        }
+        for st in &bb.statements {
+            let Ok(StmtKind::Assign(place, rvalue)) = st.stmt_kind_ref() else {
+                continue;
+            };
+            let PlaceKind::Local(dest) = place.kind else {
+                continue;
+            };
+            let dest = dest as usize;
+            if dest >= n {
+                continue;
+            }
+            if const_u8_array_aggregate_text(llbc, rvalue, &place.ty).is_some() {
+                is_root[dest] = true;
+            }
+            if let Some(src) = rvalue_copy_source_local(llbc, rvalue, &place.ty)
+                && src < n
+                && !recv[src].contains(&dest)
+            {
+                recv[src].push(dest);
+            }
+        }
+    }
+    let mutably_borrowed = compute_mutably_borrowed_locals(llbc, body);
+    let projected = compute_projected_store_roots(llbc, body, &forward);
+    let multi = compute_multi_assigned_locals(llbc, body);
+    let mut clean = vec![false; n];
+    let mut tainted = vec![false; n];
+    for root in 0..n {
+        if !is_root[root] {
+            continue;
+        }
+        let mut component = vec![false; n];
+        let mut work = vec![root];
+        component[root] = true;
+        let mut i = 0;
+        while i < work.len() {
+            let cur = work[i];
+            for &dest in &recv[cur] {
+                if dest < n && !component[dest] {
+                    component[dest] = true;
+                    work.push(dest);
+                }
+            }
+            i += 1;
+        }
+        if const_byte_str_component_tainted(
+            body,
+            llbc,
+            &forward,
+            &component,
+            &mutably_borrowed,
+            &projected,
+            &multi,
+        ) {
+            for local in 0..n {
+                if component[local] {
+                    tainted[local] = true;
+                }
+            }
+        } else {
+            for local in 0..n {
+                if component[local] {
+                    clean[local] = true;
+                }
+            }
+        }
+    }
+    let mut mark = vec![false; n];
+    for local in 0..n {
+        mark[local] = clean[local] && !tainted[local];
+    }
+    mark
+}
+
+impl<'a> Lowering<'a> {
+    /// Dest is in the const-byte-string census: its copy-component is
+    /// single-assignment and immutable (`rstr.py` `AbstractStringRepr`).
+    pub(in crate::front::mir) fn dest_is_const_str_storage(&self, dest_local: usize) -> bool {
+        self.const_byte_str_locals
+            .get(dest_local)
+            .copied()
+            .unwrap_or(false)
+    }
+
+    /// Bind dest as the Constant string `text`.
+    /// `rstr.py` `AbstractStringRepr.rtype_getitem` / `ll_stritem_nonneg`;
+    /// `descr_repr` indexes that Constant with a variable nibble.
+    /// Dest must be in the census.
+    pub(in crate::front::mir) fn bind_const_u8_array_str(
+        &mut self,
+        mir_bb: usize,
+        dest_local: usize,
+        text: &str,
+    ) {
+        if !self.dest_is_const_str_storage(dest_local) {
+            return;
+        }
+        let bb_id = self.emit_bb(mir_bb);
+        let var = emit_str_const(&mut self.graph, bb_id, text);
+        if !self.string_byte_view_locals.contains(&dest_local) {
+            self.string_byte_view_locals.push(dest_local);
+        }
+        self.local_var[dest_local] = Some(LocalValue::One(var));
+        self.positional_aggregate_locals.remove(&dest_local);
+    }
+
+    /// Whole-local or Deref-of-local of a const `[u8; N]` STR view.
+    /// Index / Field projections are getitem, not an alias of the Constant
+    /// (`rstr.py` `ll_stritem_nonneg`).
+    pub(in crate::front::mir) fn place_const_byte_str_alias(&self, place: &Place) -> Option<usize> {
+        match &place.kind {
+            PlaceKind::Local(i) => {
+                let i = *i as usize;
+                self.const_byte_str_locals
+                    .get(i)
+                    .copied()
+                    .unwrap_or(false)
+                    .then_some(i)
+            }
+            PlaceKind::Projection(inner, ProjectionElem::Atom(atom)) if atom == "Deref" => {
+                self.place_const_byte_str_alias(inner)
+            }
+            _ => None,
+        }
+    }
+
+    /// Source local of a Ref / Use / Unsize copy of a const byte-string STR.
+    pub(in crate::front::mir) fn const_byte_str_alias_source(
+        &self,
+        rvalue: &Rvalue,
+    ) -> Option<usize> {
+        match rvalue {
+            Rvalue::Use(op, _) | Rvalue::Cast(_, op, _) => match op {
+                Operand::Copy(place) | Operand::Move(place) => {
+                    self.place_const_byte_str_alias(place)
+                }
+                Operand::Const(_) => None,
+            },
+            Rvalue::UnaryOp(kind, op) if unary_op_is_cast(kind) => match op {
+                Operand::Copy(place) | Operand::Move(place) => {
+                    self.place_const_byte_str_alias(place)
+                }
+                Operand::Const(_) => None,
+            },
+            Rvalue::Ref { place, .. } | Rvalue::RawPtr { place, .. } => {
+                self.place_const_byte_str_alias(place)
+            }
+            _ => None,
+        }
+    }
+
+    /// Alias dest to the bound Constant string `src`.
+    /// `rstr.py` `ll_stritem_nonneg`; `&s` of a Constant string is that string.
+    /// Dest must be in the census: a member of a tainted copy-component
+    /// keeps array lowering (`lltype.py` `_ptr.__setitem__`).
+    pub(in crate::front::mir) fn alias_const_byte_str_view(
+        &mut self,
+        dest_local: usize,
+        src: usize,
+    ) -> bool {
+        if !self.dest_is_const_str_storage(dest_local) {
+            return false;
+        }
+        let Some(value) = self.local_var.get(src).cloned().flatten() else {
+            return false;
+        };
+        self.local_var[dest_local] = Some(value);
+        if !self.string_byte_view_locals.contains(&dest_local) {
+            self.string_byte_view_locals.push(dest_local);
+        }
+        self.positional_aggregate_locals.remove(&dest_local);
+        true
+    }
 }
 
 /// Whole-local copy component of `start` (undirected).

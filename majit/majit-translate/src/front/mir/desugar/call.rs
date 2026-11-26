@@ -2120,19 +2120,16 @@ impl<'a> Lowering<'a> {
                     return Ok(());
                 }
                 // Blanket `ToString::to_string` (`alloc::string::<Impl>::to_string`)
-                // for a non-string receiver is `str(value)` (`ll_str` /
-                // `ll_chr2str` / `ll_int2dec`). A string-family receiver is
-                // the identity arm below. A missing receiver type still
-                // takes this arm: the dest is `String`, and identity would
-                // alias a non-string header. A Float receiver is excluded:
-                // `rfloat.py` `FloatRepr.ll_str` / `floatobject.py`
-                // `float_repr` residualizes through
+                // is `str(value)`: `unaryop.py` `SomeObject.str` annotates a
+                // fresh `SomeString()`; `rmodel.py` `Repr.rtype_str` emits
+                // `gendirectcall(self.ll_str, v)` (`rstr.py`
+                // `AbstractStringRepr.ll_str` for a string). A missing
+                // receiver type still takes this arm: the dest is `String`.
+                // A Float receiver is excluded: `rfloat.py` `FloatRepr.ll_str`
+                // / `floatobject.py` `float_repr` residualizes through
                 // `rfloat_call::repr_residual_path`.
                 if args.len() == 1
                     && self.is_to_string_path(&reg)
-                    && !first_arg_ty
-                        .as_ref()
-                        .is_some_and(|ty| tyref_is_string_family(ty, self.llbc))
                     && !first_arg_ty.as_ref().is_some_and(|ty| {
                         to_string_receiver_is_float(
                             ty,
@@ -2162,15 +2159,13 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
-                // `<str|String as ToString>::to_string`, `Wtf8::to_wtf8_buf`,
-                // `<str>::to_owned`, and a string-family `Clone::clone` on a
-                // string-family receiver — each an owned copy of a value that
-                // is already the immutable rpy_string in the lifted model, so
-                // alias the destination to the receiver instead of emitting an
-                // unregistered clone/to_owned/to_string.
+                // `Wtf8::to_wtf8_buf`, `<str>::to_owned`, and a string-family
+                // `Clone::clone` on a string-family receiver — each an owned
+                // copy of a value that is already the immutable rpy_string in
+                // the lifted model, so alias the destination to the receiver
+                // instead of emitting an unregistered clone/to_owned.
                 if args.len() == 1
-                    && (self.is_to_string_identity(&reg, first_arg_ty.as_ref())
-                        || self.is_string_clone_identity(&reg, first_arg_ty.as_ref())
+                    && (self.is_string_clone_identity(&reg, first_arg_ty.as_ref())
                         || self.is_copy_scalar_or_thin_ptr_clone(&reg, first_arg_ty.as_ref()))
                     // A `Wtf8::to_wtf8_buf` that defines a proven mutable
                     // accumulator is not the ordinary immutable-string copy
@@ -7327,12 +7322,14 @@ impl<'a> Lowering<'a> {
                 let mut args = splice_pair_lens(args, pair_lens);
                 if let Some((trait_root, method_name)) = indirect {
                     // `SetStrategy::{add,remove,has_key}` take
-                    // `(&self, w_set, ObjectKey)`. The flow graph drops the
-                    // ZST `&self` and leaves `ObjectKey` as one pointer, so
-                    // the residual words are `(w_set, &ObjectKey)`. The vtable
-                    // slot is the rustc method, which reads those words as
-                    // `self` and `w_set`. Call the word trampoline that
-                    // matches the residual instead. Do not recast the
+                    // `(&self, w_set, ObjectKey, hash)`. The flow graph drops
+                    // the ZST `&self`. `ObjectKey` is one pointer
+                    // (`rordereddict.py get_ll_dict` DICTKEY = OBJECTPTR);
+                    // the digest is the third residual word (`ll_hash_from_cache`).
+                    // The residual words are `(w_set, ObjectKey, hash)`. The
+                    // vtable slot is the rustc method, which would read those
+                    // words as `self` and `w_set`. Call the word trampoline
+                    // that matches the residual instead. Do not recast the
                     // receiver before this trampoline. Inside the trampoline
                     // the vtable call is the operation itself, so it stays
                     // an `indirect_call` for the effect analysis (the
@@ -7351,13 +7348,13 @@ impl<'a> Lowering<'a> {
                         .unwrap_or(self.graph.name.as_str());
                     if trait_root == "SetStrategy"
                         && matches!(method_name.as_str(), "add" | "remove" | "has_key")
-                        && (args.len() == 2 || args.len() == 3)
+                        && (args.len() == 3 || args.len() == 4)
                         && current_fn != trampoline_path
                     {
-                        let key_args = if args.len() == 3 {
-                            vec![args[1].clone(), args[2].clone()]
+                        let key_args = if args.len() == 4 {
+                            vec![args[1].clone(), args[2].clone(), args[3].clone()]
                         } else {
-                            vec![args[0].clone(), args[1].clone()]
+                            vec![args[0].clone(), args[1].clone(), args[2].clone()]
                         };
                         OpKind::Call {
                             target: CallTarget::function_path(["pyre_object", "setobject", leaf]),
@@ -10195,15 +10192,17 @@ impl<'a> Lowering<'a> {
         // Only a body this LLBC extracted can be copied here. An Opaque
         // import is the same function object in the defining crate
         // (`bookkeeper.py` `getdesc`); enqueue on that crate's queue.
-        // Two identity bodies are the exception and `declare_spec`
+        // Two synthetic bodies are the exception and `declare_spec`
         // builds them (`FunctionDesc.getuniquegraph`):
         //   * the reflexive `impl<T> From<T> for T`
         //   * `ToString::to_string` whose substituted receiver is
-        //     string-family (`rstr.py` / `rbuiltin.py` `rtype_builtin_str`)
+        //     string-family (`unaryop.py` `SomeObject.str`,
+        //     `rmodel.py` `Repr.rtype_str`,
+        //     `rstr.py` `AbstractStringRepr.ll_str`)
         let path = fd.item_meta.name_path();
         if !crate::front::clause_spec::decl_has_unstructured_body(fd)
             && !fun_decl_is_reflexive_from(self.llbc, fd)
-            && !fun_decl_to_string_is_string_identity(self.llbc, fd, generics)
+            && !fun_decl_to_string_is_string_str(self.llbc, fd, generics)
         {
             return self.enqueue_cross_crate_spec(fd, generics, &path);
         }

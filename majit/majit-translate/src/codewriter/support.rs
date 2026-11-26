@@ -846,6 +846,7 @@ pub(crate) fn seed_split_portal_input_ops(
                 name: var.name_prefix(),
                 ty,
                 class_root,
+                param: None,
             },
         });
     }
@@ -1148,6 +1149,7 @@ pub fn gc_identity_helper_graph(
                 name: "x".into(),
                 ty: ValueType::Ref(None),
                 class_root: None,
+                param: None,
             },
             true,
         )

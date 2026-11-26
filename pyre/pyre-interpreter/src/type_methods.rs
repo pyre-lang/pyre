@@ -6707,10 +6707,11 @@ pub(crate) fn dict_store_checked(
 
 /// Hash `item` with it rooted, then look it up with `probe`.
 ///
-/// A user `__hash__` is a collection point and [`ObjectKey`] caches the element
-/// pointer, so hashing inside the key build (`object_key_for_checked`) captures
-/// the pre-move pointer — the reason `object_key_hashed` exists. The element is
-/// rooted across the hash and reloaded, matching the add path
+/// A user `__hash__` is a collection point. Hashing inside the key build
+/// (`object_key_for_checked`) captures the pre-move pointer — the reason
+/// `object_key_hashed` exists. The digest is the `*_with_hash` argument
+/// (`ll_dict_*_with_hash` / `ll_hash_from_cache`). The element is rooted
+/// across the hash and reloaded, matching the add path
 /// (`builtin_set_add_items`).
 ///
 /// The set is rooted too: `CONTAINS_OP` pops the container off the operand
@@ -6723,6 +6724,7 @@ unsafe fn set_lookup_checked(
     probe: unsafe fn(
         PyObjectRef,
         pyre_object::dictmultiobject::ObjectKey,
+        i64,
     ) -> Result<bool, pyre_object::dictmultiobject::DictKeyError>,
 ) -> Result<bool, crate::PyError> {
     let _roots = pyre_object::gc_roots::push_roots();
@@ -6736,9 +6738,8 @@ unsafe fn set_lookup_checked(
         })?;
     let key = pyre_object::dictmultiobject::object_key_hashed(
         pyre_object::gc_roots::shadow_stack_get(sp),
-        hash,
     );
-    probe(pyre_object::gc_roots::shadow_stack_get(sp + 1), key)
+    probe(pyre_object::gc_roots::shadow_stack_get(sp + 1), key, hash)
         .map_err(|_| crate::baseobjspace::take_pending_hash_error())
 }
 
@@ -7267,8 +7268,8 @@ fn dict_update1_dict_dict(w_dict: PyObjectRef, w_data: PyObjectRef) -> Result<()
                     .then(|| pyre_object::dictmultiobject::w_dict_nth_hashed_key(source_now, i))
                     .flatten();
                 let Some((k, v)) = (match hashed {
-                    Some(key) => pyre_object::dictmultiobject::w_dict_nth_value(source_now, i)
-                        .map(|v| (key.obj, v)),
+                    Some((key, _)) => pyre_object::dictmultiobject::w_dict_nth_value(source_now, i)
+                        .map(|v| (key.0, v)),
                     None => pyre_object::dictmultiobject::w_dict_nth_item(source_now, i),
                 }) else {
                     break;
@@ -7297,15 +7298,15 @@ fn dict_update1_dict_dict_store(
     dict: PyObjectRef,
     mut k: PyObjectRef,
     v: PyObjectRef,
-    hashed: Option<pyre_object::dictmultiobject::ObjectKey>,
+    hashed: Option<(pyre_object::dictmultiobject::ObjectKey, i64)>,
 ) -> Result<(), crate::PyError> {
     unsafe {
         match hashed {
             // A key `__eq__` run by the store can collect, so the key the
             // error path names is the rooted word read back after it, as in
             // `dict_store_checked`.
-            Some(key) => pyre_object::with_roots!(k =>
-                pyre_object::dictmultiobject::w_dict_store_hashed_checked(dict, k, v, key.hash)
+            Some((_, hash)) => pyre_object::with_roots!(k =>
+                pyre_object::dictmultiobject::w_dict_store_hashed_checked(dict, k, v, hash)
             )
             .map_err(|_| crate::baseobjspace::take_pending_dict_key_error(k)),
             None => dict_store_checked(dict, k, v),

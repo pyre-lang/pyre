@@ -6043,6 +6043,7 @@ pub(crate) fn effect_graph_from_search_helper(graph: &FunctionGraph) -> ModelGra
                 name,
                 ty,
                 class_root: None,
+                param: None,
             },
             var,
         );

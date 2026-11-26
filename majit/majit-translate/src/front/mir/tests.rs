@@ -16848,6 +16848,547 @@ fn raw_unicode_value_storage_field_write_emits_a_class_cast() {
     );
 }
 
+fn is_cast_instance_to_base_ptr(kind: &OpKind) -> bool {
+    matches!(
+        kind,
+        OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            ..
+        } if segments.last().map(String::as_str) == Some("cast_instance_to_base_ptr")
+    )
+}
+
+fn field_store_value_var<'a>(ops: &'a [&SpaceOperation], name: &str) -> Option<&'a Variable> {
+    ops.iter().find_map(|op| match &op.kind {
+        OpKind::FieldWrite { field, value, .. } if field.name == name => value.as_variable(),
+        OpKind::InteriorFieldWrite { field, value, .. } if field.name == name => Some(value),
+        _ => None,
+    })
+}
+
+fn graph_cast_instance_to_base_ptr_results<'a>(ops: &'a [&SpaceOperation]) -> Vec<&'a Variable> {
+    ops.iter()
+        .filter(|op| is_cast_instance_to_base_ptr(&op.kind))
+        .filter_map(|op| op.result.as_ref())
+        .collect()
+}
+
+/// `fn f(entry: *mut Entry, p: *mut PyObject) { (*entry).value = p; }`
+/// with `Entry` the ITEM of a declared-GC `{length, [Entry; 0]}` wrapper.
+/// The `value` row is `OBJECTPTR` (`field_row_lltype`); mix-level store
+/// is `cast_instance_to_base_ptr` (`annlowlevel.py`).
+fn harvested_entry_value_store_llbc() -> Llbc {
+    let classed = interior_adt(0);
+    let entry = interior_adt(1);
+    let classed_ptr = interior_raw_mut(classed);
+    let entry_ptr = interior_raw_mut(entry.clone());
+    let usize_ty = interior_usize();
+    let unit = serde_json::json!({"Tuple": []});
+    let classed_decl = interior_struct(
+        0,
+        &["pyre_object", "pyobject", "PyObject"],
+        &[("pad", interior_i64())],
+        8,
+        &[0],
+        false,
+    );
+    let entry_decl = interior_struct(
+        1,
+        &["fixture", "Entry"],
+        &[
+            ("hash", usize_ty.clone()),
+            ("key", classed_ptr.clone()),
+            ("value", classed_ptr.clone()),
+        ],
+        24,
+        &[0, 8, 16],
+        false,
+    );
+    let entries_decl = interior_struct(
+        2,
+        &["fixture", "GcEntries"],
+        &[
+            ("length", usize_ty.clone()),
+            ("items", interior_array_zero(entry.clone())),
+        ],
+        8,
+        &[0, 8],
+        false,
+    );
+    let caller = interior_caller(
+        "store_entry_value",
+        2,
+        vec![entry_ptr.clone(), classed_ptr.clone()],
+        unit.clone(),
+        vec![
+            interior_local(0, None, &unit),
+            interior_local(1, Some("entry"), &entry_ptr),
+            interior_local(2, Some("p"), &classed_ptr),
+        ],
+        vec![interior_bb(
+            vec![interior_assign(
+                interior_field(1, &entry_ptr, &entry, &classed_ptr, 2),
+                interior_use(interior_place(2, &classed_ptr)),
+            )],
+            interior_return(),
+        )],
+    );
+    llbc_with_declared_gc(
+        "fixture",
+        vec![classed_decl, entry_decl, entries_decl],
+        vec![caller],
+        &[0, 2],
+    )
+}
+
+/// A harvested `GcArray` ITEM `OBJECTPTR` field store emits
+/// `cast_instance_to_base_ptr` as the stored operand (`annlowlevel.py`).
+/// Phase-A setattr is the census gate of the live graphs; this harness
+/// asserts the op shape.
+#[test]
+fn harvested_entry_objectptr_field_store_emits_cast_instance_to_base_ptr() {
+    let llbc = harvested_entry_value_store_llbc();
+    let program = crate::test_support::build_semantic_program_from_llbc(&llbc)
+        .expect("build semantic program for harvested Entry value store");
+    let graph = program
+        .functions
+        .iter()
+        .find(|f| f.name == "store_entry_value")
+        .unwrap_or_else(|| {
+            panic!(
+                "store_entry_value in {:?}",
+                program
+                    .functions
+                    .iter()
+                    .map(|f| f.name.as_str())
+                    .collect::<Vec<_>>()
+            )
+        })
+        .graph();
+    let ops = graph_ops(graph);
+    let wraps = graph_cast_instance_to_base_ptr_results(&ops);
+    assert_eq!(
+        wraps.len(),
+        1,
+        "store of a classed *mut PyObject into Entry.value emits one cast_instance_to_base_ptr; graph={}",
+        graph.dump()
+    );
+    let stored = field_store_value_var(&ops, "value").expect("FieldWrite/InteriorFieldWrite value");
+    assert_eq!(
+        stored,
+        wraps[0],
+        "the stored operand is the cast_instance_to_base_ptr result; graph={}",
+        graph.dump()
+    );
+}
+
+/// `fn f(entry: *mut Entry) -> *mut Class { (*entry).value }` with `Entry`
+/// the ITEM of a declared-GC `{length, [Entry; 0]}` wrapper. Mix-level
+/// load is `__cast_instance_intrinsic` (`annlowlevel.py`
+/// `cast_base_ptr_to_instance`).
+fn harvested_entry_value_load_llbc(classed_path: &[&str], fn_name: &str) -> Llbc {
+    let classed = interior_adt(0);
+    let entry = interior_adt(1);
+    let classed_ptr = interior_raw_mut(classed);
+    let entry_ptr = interior_raw_mut(entry.clone());
+    let usize_ty = interior_usize();
+    let classed_decl = interior_struct(0, classed_path, &[("pad", interior_i64())], 8, &[0], false);
+    let entry_decl = interior_struct(
+        1,
+        &["fixture", "Entry"],
+        &[
+            ("hash", usize_ty.clone()),
+            ("key", classed_ptr.clone()),
+            ("value", classed_ptr.clone()),
+        ],
+        24,
+        &[0, 8, 16],
+        false,
+    );
+    let entries_decl = interior_struct(
+        2,
+        &["fixture", "GcEntries"],
+        &[
+            ("length", usize_ty.clone()),
+            ("items", interior_array_zero(entry.clone())),
+        ],
+        8,
+        &[0, 8],
+        false,
+    );
+    let caller = interior_caller(
+        fn_name,
+        1,
+        vec![entry_ptr.clone()],
+        classed_ptr.clone(),
+        vec![
+            interior_local(0, None, &classed_ptr),
+            interior_local(1, Some("entry"), &entry_ptr),
+        ],
+        vec![interior_bb(
+            vec![interior_assign(
+                interior_place(0, &classed_ptr),
+                interior_use(interior_field(1, &entry_ptr, &entry, &classed_ptr, 2)),
+            )],
+            interior_return(),
+        )],
+    );
+    llbc_with_declared_gc(
+        "fixture",
+        vec![classed_decl, entry_decl, entries_decl],
+        vec![caller],
+        &[0, 2],
+    )
+}
+
+fn harvested_objectptr_field_load_cast<'a>(
+    ops: &'a [&SpaceOperation],
+    field_name: &str,
+) -> Option<(&'a str, &'a Variable)> {
+    let mut field_res: Option<&'a Variable> = None;
+    for op in ops {
+        match &op.kind {
+            OpKind::FieldRead { field, .. } | OpKind::InteriorFieldRead { field, .. }
+                if field.name == field_name =>
+            {
+                field_res = op.result.as_ref();
+            }
+            OpKind::Call { args, .. } => {
+                if let Some(root) = crate::model::cast_instance_root(&op.kind)
+                    && let Some(src) = field_res
+                    && args.first().and_then(LinkArg::as_variable) == Some(src)
+                {
+                    return Some((root, op.result.as_ref()?));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn assert_harvested_entry_value_load_cast(
+    fn_name: &str,
+    classed_path: &[&str],
+    expected_leaf: &str,
+) {
+    let llbc = harvested_entry_value_load_llbc(classed_path, fn_name);
+    let program =
+        crate::test_support::build_semantic_program_from_llbc(&llbc).unwrap_or_else(|err| {
+            panic!("build semantic program for harvested Entry value load {fn_name}: {err}")
+        });
+    let graph = program
+        .functions
+        .iter()
+        .find(|f| f.name == fn_name)
+        .unwrap_or_else(|| {
+            panic!(
+                "{fn_name} in {:?}",
+                program
+                    .functions
+                    .iter()
+                    .map(|f| f.name.as_str())
+                    .collect::<Vec<_>>()
+            )
+        })
+        .graph();
+    let ops = graph_ops(graph);
+    let (root, _) = harvested_objectptr_field_load_cast(&ops, "value").unwrap_or_else(|| {
+        panic!(
+            "load of harvested OBJECTPTR Entry.value emits __cast_instance_intrinsic of the FieldRead; graph={}",
+            graph.dump()
+        )
+    });
+    assert_eq!(
+        majit_ir::descr::class_root_leaf(root),
+        expected_leaf,
+        "cast root is the dest class, not a name-keyed PyObject; root={root:?} graph={}",
+        graph.dump()
+    );
+}
+
+/// Direct `x = (*entry).value` into a `*mut PyObject` local.
+#[test]
+fn harvested_entry_objectptr_field_load_emits_cast_instance() {
+    assert_harvested_entry_value_load_cast(
+        "load_entry_value",
+        &["pyre_object", "pyobject", "PyObject"],
+        "PyObject",
+    );
+}
+
+/// Same load whose classed pointee is not PyObject: the cast root is
+/// that class (`tyref_class_root_with`), never a `"pyobject::PyObject"`
+/// name key.
+#[test]
+fn harvested_entry_objectptr_field_load_cast_root_is_dest_class() {
+    assert_harvested_entry_value_load_cast(
+        "load_entry_other",
+        &["fixture", "OtherObj"],
+        "OtherObj",
+    );
+}
+
+/// `fn f(h: &mut Holder, p: *mut PyObject) { h.value = p; }` — Holder is a
+/// high-level instance (declared GC, not a harvested low-level struct).
+/// Mix-level `cast_instance_to_base_ptr` is not emitted.
+fn high_level_holder_value_store_llbc() -> Llbc {
+    let classed = interior_adt(0);
+    let holder = interior_adt(1);
+    let classed_ptr = interior_raw_mut(classed);
+    let holder_ref = serde_json::json!({"Ref": ["Erased", holder.clone(), "Mut"]});
+    let unit = serde_json::json!({"Tuple": []});
+    let classed_decl = interior_struct(
+        0,
+        &["pyre_object", "pyobject", "PyObject"],
+        &[("pad", interior_i64())],
+        8,
+        &[0],
+        false,
+    );
+    let holder_decl = interior_struct(
+        1,
+        &["fixture", "Holder"],
+        &[("value", classed_ptr.clone())],
+        8,
+        &[0],
+        false,
+    );
+    let caller = interior_caller(
+        "store_holder_value",
+        2,
+        vec![holder_ref.clone(), classed_ptr.clone()],
+        unit.clone(),
+        vec![
+            interior_local(0, None, &unit),
+            interior_local(1, Some("h"), &holder_ref),
+            interior_local(2, Some("p"), &classed_ptr),
+        ],
+        vec![interior_bb(
+            vec![interior_assign(
+                interior_field(1, &holder_ref, &holder, &classed_ptr, 0),
+                interior_use(interior_place(2, &classed_ptr)),
+            )],
+            interior_return(),
+        )],
+    );
+    llbc_with_declared_gc(
+        "fixture",
+        vec![classed_decl, holder_decl],
+        vec![caller],
+        &[0, 1],
+    )
+}
+
+#[test]
+fn high_level_instance_attr_store_has_no_cast_instance_to_base_ptr() {
+    let llbc = high_level_holder_value_store_llbc();
+    let program = crate::test_support::build_semantic_program_from_llbc(&llbc)
+        .expect("build semantic program for high-level Holder store");
+    let graph = program
+        .functions
+        .iter()
+        .find(|f| f.name == "store_holder_value")
+        .unwrap_or_else(|| {
+            panic!(
+                "store_holder_value in {:?}",
+                program
+                    .functions
+                    .iter()
+                    .map(|f| f.name.as_str())
+                    .collect::<Vec<_>>()
+            )
+        })
+        .graph();
+    let ops = graph_ops(graph);
+    assert!(
+        graph_cast_instance_to_base_ptr_results(&ops).is_empty(),
+        "high-level instance attr store must not emit cast_instance_to_base_ptr; graph={}",
+        graph.dump()
+    );
+    assert!(
+        field_store_value_var(&ops, "value").is_some(),
+        "the store is FieldWrite/InteriorFieldWrite value; graph={}",
+        graph.dump()
+    );
+}
+
+/// `fn f(p: *mut Point, n: i64) { (*p).y = n; }` — integer field, no mix-level cast.
+fn integer_field_store_llbc() -> Llbc {
+    let i64_ty = interior_i64();
+    let point = interior_adt(0);
+    let point_ptr = interior_raw_mut(point.clone());
+    let unit = serde_json::json!({"Tuple": []});
+    let point_decl = interior_struct(
+        0,
+        &["fixture", "Point"],
+        &[("x", i64_ty.clone()), ("y", i64_ty.clone())],
+        16,
+        &[0, 8],
+        false,
+    );
+    let caller = interior_caller(
+        "store_point_y",
+        2,
+        vec![point_ptr.clone(), i64_ty.clone()],
+        unit.clone(),
+        vec![
+            interior_local(0, None, &unit),
+            interior_local(1, Some("p"), &point_ptr),
+            interior_local(2, Some("n"), &i64_ty),
+        ],
+        vec![interior_bb(
+            vec![interior_assign(
+                interior_field(1, &point_ptr, &point, &i64_ty, 1),
+                interior_use(interior_place(2, &i64_ty)),
+            )],
+            interior_return(),
+        )],
+    );
+    llbc_with_types("fixture", vec![point_decl], vec![caller])
+}
+
+#[test]
+fn integer_field_store_has_no_cast_instance_to_base_ptr() {
+    let llbc = integer_field_store_llbc();
+    let program = crate::test_support::build_semantic_program_from_llbc(&llbc)
+        .expect("build semantic program for integer field store");
+    let graph = program
+        .functions
+        .iter()
+        .find(|f| f.name == "store_point_y")
+        .unwrap_or_else(|| {
+            panic!(
+                "store_point_y in {:?}",
+                program
+                    .functions
+                    .iter()
+                    .map(|f| f.name.as_str())
+                    .collect::<Vec<_>>()
+            )
+        })
+        .graph();
+    let ops = graph_ops(graph);
+    assert!(
+        graph_cast_instance_to_base_ptr_results(&ops).is_empty(),
+        "integer field store must not emit cast_instance_to_base_ptr; graph={}",
+        graph.dump()
+    );
+    assert!(
+        field_store_value_var(&ops, "y").is_some(),
+        "the store is FieldWrite/InteriorFieldWrite y; graph={}",
+        graph.dump()
+    );
+}
+
+/// `fn f(entry: *mut Entry) { (*entry).value = 1i64; }` — an integer Const
+/// into a harvested `OBJECTPTR` field is not an instance
+/// (`CastObjectToPtrEntry.specialize_call`).
+fn harvested_entry_objectptr_integer_const_store_llbc() -> Llbc {
+    let classed = interior_adt(0);
+    let entry = interior_adt(1);
+    let classed_ptr = interior_raw_mut(classed);
+    let entry_ptr = interior_raw_mut(entry.clone());
+    let usize_ty = interior_usize();
+    let i64_ty = interior_i64();
+    let unit = serde_json::json!({"Tuple": []});
+    let classed_decl = interior_struct(
+        0,
+        &["pyre_object", "pyobject", "PyObject"],
+        &[("pad", interior_i64())],
+        8,
+        &[0],
+        false,
+    );
+    let entry_decl = interior_struct(
+        1,
+        &["fixture", "Entry"],
+        &[
+            ("hash", usize_ty.clone()),
+            ("key", classed_ptr.clone()),
+            ("value", classed_ptr.clone()),
+        ],
+        24,
+        &[0, 8, 16],
+        false,
+    );
+    let entries_decl = interior_struct(
+        2,
+        &["fixture", "GcEntries"],
+        &[
+            ("length", usize_ty.clone()),
+            ("items", interior_array_zero(entry.clone())),
+        ],
+        8,
+        &[0, 8],
+        false,
+    );
+    let caller = interior_caller(
+        "store_entry_value_int_const",
+        1,
+        vec![entry_ptr.clone()],
+        unit.clone(),
+        vec![
+            interior_local(0, None, &unit),
+            interior_local(1, Some("entry"), &entry_ptr),
+        ],
+        vec![interior_bb(
+            vec![interior_assign(
+                interior_field(1, &entry_ptr, &entry, &classed_ptr, 2),
+                serde_json::json!({"Use": [interior_const_i64("1", &i64_ty), "No"]}),
+            )],
+            interior_return(),
+        )],
+    );
+    llbc_with_declared_gc(
+        "fixture",
+        vec![classed_decl, entry_decl, entries_decl],
+        vec![caller],
+        &[0, 2],
+    )
+}
+
+#[test]
+fn harvested_entry_objectptr_integer_const_field_write_is_unsupported() {
+    let llbc = harvested_entry_objectptr_integer_const_store_llbc();
+    let skipped = super::LoweringSkips::default();
+    let tomb = std::collections::HashSet::new();
+    let gc = super::harvest_declared_gc_facts(&llbc).gc_struct_ids();
+    let mut state = super::CrateLoweringState::new(
+        &llbc,
+        &tomb,
+        std::collections::HashMap::new(),
+        skipped.clone(),
+        &gc,
+        &std::collections::HashSet::new(),
+        None,
+        None,
+        crate::codewriter::call::StructLayoutTable::default(),
+    );
+    state.note_loaded_crate_bodies(&llbc);
+    let functions =
+        super::CrateLowering::new(&llbc, crate::HostStaticAddrs::default(), &[], &state)
+            .lower_all(None, None);
+    assert!(
+        functions.is_empty(),
+        "integer Const FieldWrite into harvested OBJECTPTR must not produce a graph"
+    );
+    let skipped = skipped.borrow();
+    let msg = skipped
+        .iter()
+        .find(|(name, _)| name.contains("store_entry_value_int_const"))
+        .map(|(_, m)| m.as_str())
+        .unwrap_or("");
+    assert!(
+        msg.contains("unsupported MIR") && msg.contains("cast_instance_to_base_ptr"),
+        "the body declines as Unsupported wrap, not a silent store; skipped={skipped:?}"
+    );
+    assert!(
+        msg.contains("value"),
+        "Unsupported must name the field store; skipped={skipped:?}"
+    );
+}
+
 #[test]
 fn utf8str_as_u8_add_of_chars_offset_aliases_the_header() {
     let llbc = header_as_u8_add_chars_offset_fun(&["pyre_object", "unicodeobject", "Utf8Str"]);
@@ -19252,8 +19793,9 @@ fn non_reflexive_from_fn_item_const_is_not_identity_spec() {
 }
 
 /// `opt.map(str::to_string)` shape: a `FnDef` constant of the blanket
-/// `impl<T: Display> ToString for T`. Direct calls alias
-/// (`is_to_string_identity`) when the receiver is string-family; a
+/// `impl<T: Display> ToString for T`. Direct calls lower to
+/// `UnaryOp "str"` (`unaryop.py` `SomeObject.str`, `rmodel.py`
+/// `Repr.rtype_str`, `rstr.py` `AbstractStringRepr.ll_str`); a
 /// fn-item value is `FunctionDesc.getuniquegraph` of that instantiation
 /// (`description.py` `specialize`, `bookkeeper.py` `getdesc`).
 fn to_string_fn_item_llbc(self_ty: serde_json::Value, to_string_generic: bool) -> Llbc {
@@ -19331,13 +19873,55 @@ fn to_string_fn_item_llbc(self_ty: serde_json::Value, to_string_generic: bool) -
                 serde_json::json!({"Use": [{"Const": [{
                     "FnDef": {
                         "kind": {"Fun": 1},
-                        "generics": fn_def_generics
+                        "generics": fn_def_generics.clone()
                     }
                 }, fn_ty.clone()]}, "No"]}),
             )],
             interior_return(),
         )],
     );
+    let concrete_recv = serde_json::json!({"Ref": ["Erased", self_ty.clone(), "Shared"]});
+    let call_types = if to_string_generic {
+        vec![self_ty.clone()]
+    } else {
+        vec![]
+    };
+    let call_to_string = serde_json::json!({
+        "def_id": 2,
+        "item_meta": interior_meta(&["fixture", "call_to_string"], true),
+        "signature": {
+            "is_unsafe": false,
+            "inputs": [concrete_recv.clone()],
+            "output": string_ty.clone()
+        },
+        "body": {
+            "Unstructured": {
+                "span": interior_span(),
+                "locals": {
+                    "arg_count": 1,
+                    "locals": [
+                        interior_local(0, None, &string_ty),
+                        interior_local(1, Some("s"), &concrete_recv)
+                    ]
+                },
+                "body": [
+                    interior_bb(
+                        vec![],
+                        interior_call_with_types(
+                            1,
+                            vec![interior_copy(interior_place(1, &concrete_recv))],
+                            interior_place(0, &string_ty),
+                            1,
+                            2,
+                            call_types,
+                        ),
+                    ),
+                    interior_bb(vec![], interior_return()),
+                    interior_bb(vec![], interior_unwind()),
+                ]
+            }
+        }
+    });
     let string_decl = serde_json::json!({
         "def_id": 0,
         "item_meta": {
@@ -19392,7 +19976,7 @@ fn to_string_fn_item_llbc(self_ty: serde_json::Value, to_string_generic: bool) -
     llbc_with_types_traits(
         "fixture",
         vec![string_decl],
-        vec![caller, to_string],
+        vec![caller, to_string, call_to_string],
         vec![trait_decl],
         vec![trait_impl],
     )
@@ -19403,7 +19987,7 @@ fn builtin_str_ty() -> serde_json::Value {
 }
 
 /// A `FnDef` constant of blanket `ToString::to_string` instantiated at
-/// `str` names the specialized identity graph, not the unregistered
+/// `str` names the specialized `str(arg0)` graph, not the unregistered
 /// generic template `to_string`.
 #[test]
 fn string_family_to_string_fn_item_const_registers_identity_spec() {
@@ -19421,8 +20005,8 @@ fn string_family_to_string_fn_item_const_registers_identity_spec() {
         "trait_refs": []
     });
     assert!(
-        super::fun_decl_to_string_is_string_identity(&llbc, to_string, &fn_def_generics),
-        "T = str is string-family; str(s) of a string is the string"
+        super::fun_decl_to_string_is_string_str(&llbc, to_string, &fn_def_generics),
+        "T = str is string-family; spec computes str(arg0)"
     );
     let program = crate::test_support::build_semantic_program_from_llbc(&llbc)
         .expect("build semantic program for string-family ToString fn-item");
@@ -19448,7 +20032,7 @@ fn string_family_to_string_fn_item_const_registers_identity_spec() {
     assert!(
         tail.last()
             .is_some_and(|leaf| leaf.starts_with("to_string__spec_")),
-        "fn-const names the specialized identity, not the generic template; tail={tail:?}"
+        "fn-const names the specialized str graph, not the generic template; tail={tail:?}"
     );
     assert_eq!(
         tail.last().map(String::as_str),
@@ -19471,13 +20055,20 @@ fn string_family_to_string_fn_item_const_registers_identity_spec() {
         });
     assert!(
         !residual_to_string,
-        "identity body has no residual to_string call; ops={:?}",
+        "str body has no residual to_string call; ops={:?}",
         graph_ops(spec.graph())
     );
+    assert_graph_is_str_of_arg0(spec.graph());
+    let direct = program
+        .functions
+        .iter()
+        .find(|f| f.name == "call_to_string")
+        .unwrap_or_else(|| panic!("expected call_to_string, functions={names:?}"));
+    assert_graph_is_str_of_arg0(direct.graph());
 }
 
-/// Blanket `ToString` of a non-string `Display` type is not identity:
-/// a FnDef constant of that `to_string` does not enqueue an identity spec.
+/// Blanket `ToString` of a non-string `Display` type is not string-str:
+/// a FnDef constant of that `to_string` does not enqueue a str spec.
 #[test]
 fn non_string_to_string_fn_item_const_is_not_identity_spec() {
     let i64_ty = interior_i64();
@@ -19494,7 +20085,7 @@ fn non_string_to_string_fn_item_const_is_not_identity_spec() {
         "trait_refs": []
     });
     assert!(
-        !super::fun_decl_to_string_is_string_identity(&llbc, to_string, &fn_def_generics),
+        !super::fun_decl_to_string_is_string_str(&llbc, to_string, &fn_def_generics),
         "T = i64 is outside the string family"
     );
     let program = crate::test_support::build_semantic_program_from_llbc(&llbc)
@@ -19504,7 +20095,62 @@ fn non_string_to_string_fn_item_const_is_not_identity_spec() {
         !names
             .iter()
             .any(|name| name.starts_with("to_string__spec_")),
-        "non-string ToString must not enqueue an identity spec; functions={names:?}"
+        "non-string ToString must not enqueue a str spec; functions={names:?}"
+    );
+}
+
+/// `str(arg0)` graph: one `UnaryOp "str"` on the first startblock
+/// inputarg, whose result is returned. An identity alias returns arg0
+/// with no `str` op.
+fn assert_graph_is_str_of_arg0(graph: &FunctionGraph) {
+    let arg0 = graph
+        .block(graph.startblock)
+        .inputargs
+        .first()
+        .unwrap_or_else(|| panic!("expected arg0; graph={graph:#?}"));
+    let str_ops: Vec<_> = graph
+        .blocks
+        .iter()
+        .flat_map(|b| &b.operations)
+        .filter(|op| matches!(&op.kind, OpKind::UnaryOp { op, .. } if op == "str"))
+        .collect();
+    assert_eq!(
+        str_ops.len(),
+        1,
+        "exactly one UnaryOp str; ops={:?}",
+        graph_ops(graph)
+    );
+    match &str_ops[0].kind {
+        OpKind::UnaryOp { operand, .. } => {
+            assert_eq!(
+                operand.id(),
+                arg0.id(),
+                "str operand is arg0; ops={:?}",
+                graph_ops(graph)
+            );
+        }
+        other => panic!("expected UnaryOp str, got {other:?}"),
+    }
+    let result = str_ops[0]
+        .result
+        .as_ref()
+        .unwrap_or_else(|| panic!("UnaryOp str has a result; ops={:?}", graph_ops(graph)));
+    let returned = graph
+        .blocks
+        .iter()
+        .find_map(|block| {
+            block
+                .exits
+                .iter()
+                .find_map(|link| (link.target == graph.returnblock).then(|| link.args.first()))
+        })
+        .flatten()
+        .and_then(LinkArg::as_variable);
+    assert_eq!(
+        returned.map(|v| v.id()),
+        Some(result.id()),
+        "returns the UnaryOp str result; ops={:?}",
+        graph_ops(graph)
     );
 }
 
@@ -20899,7 +21545,9 @@ fn interned_result_ok_payload_is_type_decl_identity_not_duplicate_leaf() {
 
 /// A `Result<ObjectKey, E>` sum shell intern's `Ok.__pos_0` as one GC
 /// pointer (`rtuple.py TupleRepr` / `rclass.py InstanceRepr` lowleveltype
-/// `Ptr(GcStruct)`). The field descr is FLAG_POINTER, one word, parent
+/// `Ptr(GcStruct)`). `ObjectKey` is `repr(transparent)` over `PyObjectRef`
+/// (`rordereddict.py get_ll_dict` DICTKEY = OBJECTPTR); the digest lives
+/// in `Entry.f_hash`. The field descr is FLAG_POINTER, one word, parent
 /// size two words (tag + payload).
 #[test]
 fn sum_shell_instance_payload_is_one_gc_pointer() {
@@ -20910,22 +21558,16 @@ fn sum_shell_instance_payload_is_one_gc_pointer() {
     let object_key = interior_struct(
         1,
         &["pyre_object", "dictmultiobject", "ObjectKey"],
-        &[
-            (
-                "hash",
-                serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}}),
-            ),
-            (
-                "obj",
-                serde_json::json!({"RawPtr": [
-                    {"Scalar": {"Integer": {"Unsigned": "U8"}}},
-                    "Mut"
-                ]}),
-            ),
-        ],
-        16,
-        &[0, 8],
-        false,
+        &[(
+            "__pos_0",
+            serde_json::json!({"RawPtr": [
+                {"Scalar": {"Integer": {"Unsigned": "U8"}}},
+                "Mut"
+            ]}),
+        )],
+        8,
+        &[0],
+        true,
     );
     let err = interior_struct(
         2,
@@ -20961,9 +21603,10 @@ fn sum_shell_instance_payload_is_one_gc_pointer() {
         "Ok.__pos_0 intern is Ptr(GcStruct); keys={keys:?}"
     );
     let payload = payload.unwrap();
+    let word = crate::layout::target_word_size();
     let known_structs: HashSet<String> = HashSet::from(["dictmultiobject::ObjectKey".to_string()]);
     let known_sizes: HashMap<String, usize> =
-        HashMap::from([("dictmultiobject::ObjectKey".to_string(), 16)]);
+        HashMap::from([("dictmultiobject::ObjectKey".to_string(), word)]);
     let layout = StructLayout::from_type_strings(
         &[
             ("__discriminant".to_string(), "i64".to_string()),
@@ -20975,7 +21618,6 @@ fn sum_shell_instance_payload_is_one_gc_pointer() {
         &HashMap::new(),
         &HashSet::new(),
     );
-    let word = crate::layout::target_word_size();
     let pos0 = layout
         .fields
         .iter()
@@ -22328,6 +22970,7 @@ fn map_or_niche_raw_struct_is_operands_agree() {
                 name: "self".into(),
                 ty: ValueType::Int,
                 class_root: Some("OwnedFd".into()),
+                param: None,
             },
             true,
         )
@@ -25306,6 +25949,7 @@ fn invert_of_int_as_branch_keeps_op_and_exit_order() {
                 name: "x".into(),
                 ty: ValueType::Int,
                 class_root: None,
+                param: None,
             },
             true,
         )
@@ -25386,6 +26030,7 @@ fn eq_int_const_bool_false_as_branch_is_not_peeled() {
                 name: "x".into(),
                 ty: ValueType::Int,
                 class_root: None,
+                param: None,
             },
             true,
         )
@@ -25482,6 +26127,7 @@ fn const_none_niche_switch_fuses_ptr_iszero_without_residual() {
                 name: "opt".into(),
                 ty: ValueType::Ref(Some("FrameDebugData".into())),
                 class_root: Some("FrameDebugData".into()),
+                param: None,
             },
             true,
         )
@@ -27295,6 +27941,7 @@ fn mut_ref_cell_try_dispatch_binary_special() {
             name,
             ty,
             class_root,
+            ..
         } = &op.kind
         else {
             continue;
@@ -27336,6 +27983,7 @@ fn normalize_exception_self_input_is_mut_ref_cell() {
             name,
             ty,
             class_root,
+            ..
         } = &op.kind
         else {
             continue;
@@ -32346,6 +32994,1752 @@ fn owned_buffer_borrowed_outside_append_stays_residual() {
     );
 }
 
+/// `descr_repr` walks `s[i]`. A leftover
+/// `core::slice::iter::<Impl>::into_iter` FunctionPath is the CallRegistry
+/// wall on `bytearray_repr_string.cachedgraph`.
+#[test]
+fn bytearray_repr_string_has_no_slice_into_iter() {
+    use crate::model::{CallTarget, LinkArg, OpKind};
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../target/llbc/pyre-interpreter.ullbc"
+    );
+    let llbc = crate::test_support::load_ullbc(path);
+    let graph = crate::test_support::lower_function(llbc, "bytearray_repr_string")
+        .expect("lower bytearray_repr_string");
+    let leftover: Vec<Vec<String>> = graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .filter_map(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } if segments.last().is_some_and(|leaf| leaf == "into_iter") => Some(segments.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        leftover.is_empty(),
+        "descr_repr's counted loop must not residualize into_iter; leftover={leftover:?} graph={}",
+        graph.dump()
+    );
+    let leftover_hex: Vec<Vec<String>> = graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .filter_map(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } if segments.last().is_some_and(|leaf| leaf == "HEX") => Some(segments.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        leftover_hex.is_empty(),
+        "digit table is a constant string index; leftover HEX={leftover_hex:?} graph={}",
+        graph.dump()
+    );
+    for op in graph.blocks.iter().flat_map(|block| &block.operations) {
+        let OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            args,
+            ..
+        } = &op.kind
+        else {
+            continue;
+        };
+        if segments.as_slice() != [crate::front::join_chars::LL_CHARPSIZE2STR] {
+            continue;
+        }
+        let cp = match args.first() {
+            Some(LinkArg::Value(v)) => v,
+            other => panic!(
+                "charpsize2str cp is a Variable, got {other:?}; graph={}",
+                graph.dump()
+            ),
+        };
+        assert!(
+            cp.concretetype()
+                .as_ref()
+                .is_some_and(super::lltype_is_ccharp),
+            "window copy slot 0 is CCHARP; ct={:?} graph={}",
+            cp.concretetype(),
+            graph.dump()
+        );
+    }
+}
+
+/// `b"0123"[i as usize]` is `rstr.py` `AbstractStringRepr.rtype_getitem` /
+/// `ll_stritem_nonneg` on a Constant string: `__str_const` plus
+/// `__string_byte_getitem`, not a residual slice index or Array ctor.
+#[test]
+fn const_byte_str_literal_index_is_strgetitem() {
+    use crate::model::{CallTarget, OpKind};
+
+    let u8_ty = window_u8();
+    let n = window_usize();
+    let array_len = serde_json::json!([
+        {"Integer": {"Unsigned": ["Usize", "4"]}},
+        n
+    ]);
+    let array_ty = serde_json::json!({"Array": [u8_ty.clone(), array_len, null]});
+    let array_ref = serde_json::json!({"Ref": ["Erased", array_ty.clone(), "Shared"]});
+    let shared = window_shared_slice();
+    let byte = |digits: &str| {
+        serde_json::json!({"Const": [
+            {"Integer": {"Unsigned": ["U8", digits]}},
+            u8_ty
+        ]})
+    };
+    let usize_lit = serde_json::json!({"Const": [
+        {"Integer": {"Unsigned": ["Usize", "4"]}},
+        n
+    ]});
+    let index_place = window_place(
+        serde_json::json!({"Projection": [
+            window_place(serde_json::json!({"Local": 4}), &shared),
+            {"Index": {
+                "offset": {"Read": window_place(serde_json::json!({"Local": 1}), &n)},
+                "from_end": false
+            }}
+        ]}),
+        &u8_ty,
+    );
+    let caller = serde_json::json!({
+        "def_id": 0,
+        "item_meta": window_meta(&["fixture", "const_byte_str_index"], true),
+        "signature": {"is_unsafe": false, "inputs": [n], "output": u8_ty},
+        "body": {"Unstructured": {
+            "span": window_span(),
+            "locals": {"arg_count": 1, "locals": [
+                window_local(0, &u8_ty),
+                window_local(1, &n),
+                window_local(2, &array_ty),
+                window_local(3, &array_ref),
+                window_local(4, &shared)
+            ]},
+            "body": [{
+                "statements": [
+                    {
+                        "span": window_span(),
+                        "kind": {"Assign": [
+                            window_place(serde_json::json!({"Local": 2}), &array_ty),
+                            {"Aggregate": [
+                                {"Array": [u8_ty.clone(), usize_lit.clone()]},
+                                [byte("48"), byte("49"), byte("50"), byte("51")]
+                            ]}
+                        ]}
+                    },
+                    {
+                        "span": window_span(),
+                        "kind": {"Assign": [
+                            window_place(serde_json::json!({"Local": 3}), &array_ref),
+                            {"Ref": {
+                                "place": window_place(serde_json::json!({"Local": 2}), &array_ty),
+                                "kind": "Shared",
+                                "ptr_metadata": null
+                            }}
+                        ]}
+                    },
+                    {
+                        "span": window_span(),
+                        "kind": {"Assign": [
+                            window_place(serde_json::json!({"Local": 4}), &shared),
+                            {"UnaryOp": [
+                                {"Cast": {"Unsize": [
+                                    array_ref.clone(),
+                                    shared.clone(),
+                                    {"Length": usize_lit}
+                                ]}},
+                                {"Move": window_place(serde_json::json!({"Local": 3}), &array_ref)}
+                            ]}
+                        ]}
+                    },
+                    {
+                        "span": window_span(),
+                        "kind": {"Assign": [
+                            window_place(serde_json::json!({"Local": 0}), &u8_ty),
+                            {"Use": [{"Read": index_place}, "No"]}
+                        ]}
+                    }
+                ],
+                "kind": "Regular",
+                "terminator": {"span": window_span(), "kind": "Return"}
+            }]
+        }}
+    });
+    let llbc = window_llbc(vec![], vec![caller]);
+    let graph = crate::test_support::lower_function(&llbc, "const_byte_str_index")
+        .expect("lower b\"0123\"[i as usize]");
+    let mut has_str_const = false;
+    let mut has_getitem = false;
+    let mut residual = Vec::new();
+    for op in window_graph_ops(&graph) {
+        match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } => {
+                if segments.first().map(String::as_str) == Some("__str_const")
+                    && segments.get(1).map(String::as_str) == Some("0123")
+                {
+                    has_str_const = true;
+                } else if segments.last().map(String::as_str) == Some("__string_byte_getitem") {
+                    has_getitem = true;
+                } else {
+                    residual.push(segments.clone());
+                }
+            }
+            OpKind::Call {
+                target: CallTarget::SyntheticTransparentCtor { name, .. },
+                ..
+            } if name == "Array" || majit_ir::descr::is_shaped_array_name(name) => {
+                residual.push(vec![name.clone()]);
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        has_str_const,
+        "digit table is __str_const \"0123\"; graph={}",
+        graph.dump()
+    );
+    assert!(
+        has_getitem,
+        "b\"0123\"[i] is __string_byte_getitem; graph={}",
+        graph.dump()
+    );
+    assert!(
+        residual.is_empty(),
+        "const byte-string index must not residualize a call; leftover={residual:?} graph={}",
+        graph.dump()
+    );
+}
+
+/// `let mut a = [65u8, 66]; a[0] = 67; a[1]` keeps array storage
+/// (`lltype.py` `_ptr.__setitem__`). A Constant string is immutable
+/// (`rstr.py` `AbstractStringRepr`).
+#[test]
+fn const_byte_str_mutated_array_keeps_array_lowering() {
+    use crate::model::{CallTarget, OpKind};
+
+    let u8_ty = window_u8();
+    let n = window_usize();
+    let array_len = serde_json::json!([
+        {"Integer": {"Unsigned": ["Usize", "2"]}},
+        n
+    ]);
+    let array_ty = serde_json::json!({"Array": [u8_ty.clone(), array_len, null]});
+    let byte = |digits: &str| {
+        serde_json::json!({"Const": [
+            {"Integer": {"Unsigned": ["U8", digits]}},
+            u8_ty
+        ]})
+    };
+    let usize_lit = |digits: &str| {
+        serde_json::json!({"Const": [
+            {"Integer": {"Unsigned": ["Usize", digits]}},
+            n
+        ]})
+    };
+    let index_place = |offset: &str| {
+        window_place(
+            serde_json::json!({"Projection": [
+                window_place(serde_json::json!({"Local": 1}), &array_ty),
+                {"Index": {
+                    "offset": usize_lit(offset),
+                    "from_end": false
+                }}
+            ]}),
+            &u8_ty,
+        )
+    };
+    let caller = serde_json::json!({
+        "def_id": 0,
+        "item_meta": window_meta(&["fixture", "const_byte_str_mutated"], true),
+        "signature": {"is_unsafe": false, "inputs": [], "output": u8_ty},
+        "body": {"Unstructured": {
+            "span": window_span(),
+            "locals": {"arg_count": 0, "locals": [
+                window_local(0, &u8_ty),
+                window_local(1, &array_ty)
+            ]},
+            "body": [{
+                "statements": [
+                    {
+                        "span": window_span(),
+                        "kind": {"Assign": [
+                            window_place(serde_json::json!({"Local": 1}), &array_ty),
+                            {"Aggregate": [
+                                {"Array": [u8_ty.clone(), usize_lit("2")]},
+                                [byte("65"), byte("66")]
+                            ]}
+                        ]}
+                    },
+                    {
+                        "span": window_span(),
+                        "kind": {"Assign": [
+                            index_place("0"),
+                            {"Use": [byte("67"), "No"]}
+                        ]}
+                    },
+                    {
+                        "span": window_span(),
+                        "kind": {"Assign": [
+                            window_place(serde_json::json!({"Local": 0}), &u8_ty),
+                            {"Use": [{"Read": index_place("1")}, "No"]}
+                        ]}
+                    }
+                ],
+                "kind": "Regular",
+                "terminator": {"span": window_span(), "kind": "Return"}
+            }]
+        }}
+    });
+    let llbc = window_llbc(vec![], vec![caller]);
+    let graph = crate::test_support::lower_function(&llbc, "const_byte_str_mutated")
+        .expect("lower mutated [u8; 2] index");
+    let mut has_str_const = false;
+    let mut has_getitem = false;
+    let mut has_array_ctor = false;
+    let mut has_array_write = false;
+    let mut has_array_read = false;
+    for op in window_graph_ops(&graph) {
+        match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } => {
+                if segments.first().map(String::as_str) == Some("__str_const") {
+                    has_str_const = true;
+                } else if segments.last().map(String::as_str) == Some("__string_byte_getitem") {
+                    has_getitem = true;
+                }
+            }
+            OpKind::Call {
+                target: CallTarget::SyntheticTransparentCtor { name, .. },
+                ..
+            } if name == "Array" || majit_ir::descr::is_shaped_array_name(name) => {
+                has_array_ctor = true;
+            }
+            OpKind::ArrayWrite { .. } => has_array_write = true,
+            OpKind::ArrayRead { .. } => has_array_read = true,
+            _ => {}
+        }
+    }
+    assert!(
+        !has_str_const,
+        "mutated [u8; 2] is not __str_const; graph={}",
+        graph.dump()
+    );
+    assert!(
+        !has_getitem,
+        "mutated [u8; 2] index is not __string_byte_getitem; graph={}",
+        graph.dump()
+    );
+    assert!(
+        has_array_ctor,
+        "mutated [u8; 2] keeps the Array ctor; graph={}",
+        graph.dump()
+    );
+    assert!(
+        has_array_write,
+        "a[0] = 67 is ArrayWrite; graph={}",
+        graph.dump()
+    );
+    assert!(has_array_read, "a[1] is ArrayRead; graph={}", graph.dump());
+}
+
+/// A local assigned a constant `[u8; 2]` on one branch and a non-constant
+/// `[u8; 2]` on the other is not a Constant string after the join
+/// (`framestate.py` `FrameState.union`).
+#[test]
+fn const_byte_str_join_with_nonconst_is_not_strgetitem() {
+    use crate::model::{CallTarget, OpKind};
+
+    let u8_ty = window_u8();
+    let n = window_usize();
+    let bool_ty = serde_json::json!({"Scalar": "Bool"});
+    let array_len = serde_json::json!([
+        {"Integer": {"Unsigned": ["Usize", "2"]}},
+        n
+    ]);
+    let array_ty = serde_json::json!({"Array": [u8_ty.clone(), array_len, null]});
+    let byte = |digits: &str| {
+        serde_json::json!({"Const": [
+            {"Integer": {"Unsigned": ["U8", digits]}},
+            u8_ty
+        ]})
+    };
+    let usize_lit = serde_json::json!({"Const": [
+        {"Integer": {"Unsigned": ["Usize", "2"]}},
+        n
+    ]});
+    let index_place = window_place(
+        serde_json::json!({"Projection": [
+            window_place(serde_json::json!({"Local": 4}), &array_ty),
+            {"Index": {
+                "offset": {"Const": [
+                    {"Integer": {"Unsigned": ["Usize", "0"]}},
+                    n
+                ]},
+                "from_end": false
+            }}
+        ]}),
+        &u8_ty,
+    );
+    let assign_const = serde_json::json!({
+        "span": window_span(),
+        "kind": {"Assign": [
+            window_place(serde_json::json!({"Local": 4}), &array_ty),
+            {"Aggregate": [
+                {"Array": [u8_ty.clone(), usize_lit.clone()]},
+                [byte("65"), byte("66")]
+            ]}
+        ]}
+    });
+    let assign_var = serde_json::json!({
+        "span": window_span(),
+        "kind": {"Assign": [
+            window_place(serde_json::json!({"Local": 4}), &array_ty),
+            {"Aggregate": [
+                {"Array": [u8_ty.clone(), usize_lit.clone()]},
+                [
+                    {"Read": window_place(serde_json::json!({"Local": 2}), &u8_ty)},
+                    {"Read": window_place(serde_json::json!({"Local": 3}), &u8_ty)}
+                ]
+            ]}
+        ]}
+    });
+    let caller = serde_json::json!({
+        "def_id": 0,
+        "item_meta": window_meta(&["fixture", "const_byte_str_join"], true),
+        "signature": {"is_unsafe": false, "inputs": [bool_ty, u8_ty, u8_ty], "output": u8_ty},
+        "body": {"Unstructured": {
+            "span": window_span(),
+            "locals": {"arg_count": 3, "locals": [
+                window_local(0, &u8_ty),
+                window_local(1, &bool_ty),
+                window_local(2, &u8_ty),
+                window_local(3, &u8_ty),
+                window_local(4, &array_ty)
+            ]},
+            "body": [
+                {
+                    "statements": [],
+                    "kind": "Regular",
+                    "terminator": {"span": window_span(), "kind": {"Switch": {
+                        "discr": {"Read": window_place(serde_json::json!({"Local": 1}), &bool_ty)},
+                        "targets": {"If": [1, 2]}
+                    }}}
+                },
+                {
+                    "statements": [assign_const],
+                    "kind": "Regular",
+                    "terminator": {"span": window_span(), "kind": {"Goto": {"target": 3}}}
+                },
+                {
+                    "statements": [assign_var],
+                    "kind": "Regular",
+                    "terminator": {"span": window_span(), "kind": {"Goto": {"target": 3}}}
+                },
+                {
+                    "statements": [{
+                        "span": window_span(),
+                        "kind": {"Assign": [
+                            window_place(serde_json::json!({"Local": 0}), &u8_ty),
+                            {"Use": [{"Read": index_place}, "No"]}
+                        ]}
+                    }],
+                    "kind": "Regular",
+                    "terminator": {"span": window_span(), "kind": "Return"}
+                }
+            ]
+        }}
+    });
+    let llbc = window_llbc(vec![], vec![caller]);
+    let graph = crate::test_support::lower_function(&llbc, "const_byte_str_join")
+        .expect("lower join of const and non-const [u8; 2]");
+    let mut has_getitem = false;
+    let mut has_str_const = false;
+    for op in window_graph_ops(&graph) {
+        if let OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            ..
+        } = &op.kind
+        {
+            if segments.first().map(String::as_str) == Some("__str_const") {
+                has_str_const = true;
+            }
+            if segments.last().map(String::as_str) == Some("__string_byte_getitem") {
+                has_getitem = true;
+            }
+        }
+    }
+    assert!(
+        !has_str_const,
+        "join dest of const and non-const [u8; 2] is not __str_const; graph={}",
+        graph.dump()
+    );
+    assert!(
+        !has_getitem,
+        "join of const and non-const [u8; 2] is not __string_byte_getitem; graph={}",
+        graph.dump()
+    );
+}
+
+/// `c = [65, 66]` (never rewritten), `r = &c` on one arm and `r = p`
+/// (parameter `&[u8; 2]`) on the other. The copy-component of `c`
+/// contains the multi-assigned `r`, so no member is a Constant string
+/// (`framestate.py` `FrameState.union`).
+#[test]
+fn const_byte_str_join_marked_alias_and_param_is_not_strgetitem() {
+    use crate::model::{CallTarget, OpKind};
+
+    let u8_ty = window_u8();
+    let n = window_usize();
+    let bool_ty = serde_json::json!({"Scalar": "Bool"});
+    let array_len = serde_json::json!([
+        {"Integer": {"Unsigned": ["Usize", "2"]}},
+        n
+    ]);
+    let array_ty = serde_json::json!({"Array": [u8_ty.clone(), array_len, null]});
+    let array_ref = serde_json::json!({"Ref": ["Erased", array_ty.clone(), "Shared"]});
+    let byte = |digits: &str| {
+        serde_json::json!({"Const": [
+            {"Integer": {"Unsigned": ["U8", digits]}},
+            u8_ty
+        ]})
+    };
+    let usize_lit = serde_json::json!({"Const": [
+        {"Integer": {"Unsigned": ["Usize", "2"]}},
+        n
+    ]});
+    let deref_r = window_place(
+        serde_json::json!({"Projection": [
+            window_place(serde_json::json!({"Local": 4}), &array_ref),
+            "Deref"
+        ]}),
+        &array_ty,
+    );
+    let index_place = window_place(
+        serde_json::json!({"Projection": [
+            deref_r,
+            {"Index": {
+                "offset": {"Const": [
+                    {"Integer": {"Unsigned": ["Usize", "0"]}},
+                    n
+                ]},
+                "from_end": false
+            }}
+        ]}),
+        &u8_ty,
+    );
+    let caller = serde_json::json!({
+        "def_id": 0,
+        "item_meta": window_meta(&["fixture", "const_byte_str_join_alias"], true),
+        "signature": {"is_unsafe": false, "inputs": [bool_ty, array_ref], "output": u8_ty},
+        "body": {"Unstructured": {
+            "span": window_span(),
+            "locals": {"arg_count": 2, "locals": [
+                window_local(0, &u8_ty),
+                window_local(1, &bool_ty),
+                window_local(2, &array_ref),
+                window_local(3, &array_ty),
+                window_local(4, &array_ref)
+            ]},
+            "body": [
+                {
+                    "statements": [{
+                        "span": window_span(),
+                        "kind": {"Assign": [
+                            window_place(serde_json::json!({"Local": 3}), &array_ty),
+                            {"Aggregate": [
+                                {"Array": [u8_ty.clone(), usize_lit]},
+                                [byte("65"), byte("66")]
+                            ]}
+                        ]}
+                    }],
+                    "kind": "Regular",
+                    "terminator": {"span": window_span(), "kind": {"Switch": {
+                        "discr": {"Read": window_place(serde_json::json!({"Local": 1}), &bool_ty)},
+                        "targets": {"If": [2, 1]}
+                    }}}
+                },
+                {
+                    "statements": [{
+                        "span": window_span(),
+                        "kind": {"Assign": [
+                            window_place(serde_json::json!({"Local": 4}), &array_ref),
+                            {"Use": [
+                                {"Read": window_place(serde_json::json!({"Local": 2}), &array_ref)},
+                                "No"
+                            ]}
+                        ]}
+                    }],
+                    "kind": "Regular",
+                    "terminator": {"span": window_span(), "kind": {"Goto": {"target": 3}}}
+                },
+                {
+                    "statements": [{
+                        "span": window_span(),
+                        "kind": {"Assign": [
+                            window_place(serde_json::json!({"Local": 4}), &array_ref),
+                            {"Ref": {
+                                "place": window_place(serde_json::json!({"Local": 3}), &array_ty),
+                                "kind": "Shared",
+                                "ptr_metadata": null
+                            }}
+                        ]}
+                    }],
+                    "kind": "Regular",
+                    "terminator": {"span": window_span(), "kind": {"Goto": {"target": 3}}}
+                },
+                {
+                    "statements": [{
+                        "span": window_span(),
+                        "kind": {"Assign": [
+                            window_place(serde_json::json!({"Local": 0}), &u8_ty),
+                            {"Use": [{"Read": index_place}, "No"]}
+                        ]}
+                    }],
+                    "kind": "Regular",
+                    "terminator": {"span": window_span(), "kind": {"Switch": {
+                        "discr": {"Read": window_place(serde_json::json!({"Local": 1}), &bool_ty)},
+                        "targets": {"If": [4, 5]}
+                    }}}
+                },
+                {
+                    "statements": [],
+                    "kind": "Regular",
+                    "terminator": {"span": window_span(), "kind": "Return"}
+                },
+                {
+                    "statements": [],
+                    "kind": "Regular",
+                    "terminator": {"span": window_span(), "kind": "Return"}
+                }
+            ]
+        }}
+    });
+    let llbc = window_llbc(vec![], vec![caller]);
+    let graph = crate::test_support::lower_function(&llbc, "const_byte_str_join_alias")
+        .expect("lower join of marked alias and unmarked param");
+    let mut has_getitem = false;
+    let mut has_str_const = false;
+    for op in window_graph_ops(&graph) {
+        if let OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            ..
+        } = &op.kind
+        {
+            if segments.first().map(String::as_str) == Some("__str_const") {
+                has_str_const = true;
+            }
+            if segments.last().map(String::as_str) == Some("__string_byte_getitem") {
+                has_getitem = true;
+            }
+        }
+    }
+    assert!(
+        !has_str_const,
+        "component of c contains multi-assigned r; no __str_const; graph={}",
+        graph.dump()
+    );
+    assert!(
+        !has_getitem,
+        "join of alias and param is not __string_byte_getitem; graph={}",
+        graph.dump()
+    );
+}
+
+/// `let a = [65u8, 66]; let mut b = a; let _ = &mut b; b[1]`. The unused
+/// mutable borrow taints the copy-component, so `a` keeps array storage
+/// (`lltype.py` `_ptr.__setitem__`). `Rvalue::Use` reuses the source
+/// Variable (`operation.rs`); the ArrayRead base is that array value.
+#[test]
+fn const_byte_str_copy_into_mutably_borrowed_keeps_array_lowering() {
+    use crate::model::{CallTarget, OpKind};
+    use crate::translator::rtyper::lltypesystem::rstr::STRPTR;
+
+    let u8_ty = window_u8();
+    let n = window_usize();
+    let array_len = serde_json::json!([
+        {"Integer": {"Unsigned": ["Usize", "2"]}},
+        n
+    ]);
+    let array_ty = serde_json::json!({"Array": [u8_ty.clone(), array_len, null]});
+    let array_mut = serde_json::json!({"Ref": ["Erased", array_ty.clone(), "Mut"]});
+    let byte = |digits: &str| {
+        serde_json::json!({"Const": [
+            {"Integer": {"Unsigned": ["U8", digits]}},
+            u8_ty
+        ]})
+    };
+    let usize_lit = |digits: &str| {
+        serde_json::json!({"Const": [
+            {"Integer": {"Unsigned": ["Usize", digits]}},
+            n
+        ]})
+    };
+    let b_index = window_place(
+        serde_json::json!({"Projection": [
+            window_place(serde_json::json!({"Local": 2}), &array_ty),
+            {"Index": {
+                "offset": usize_lit("1"),
+                "from_end": false
+            }}
+        ]}),
+        &u8_ty,
+    );
+    let caller = serde_json::json!({
+        "def_id": 0,
+        "item_meta": window_meta(&["fixture", "const_byte_str_copy_mutborrow"], true),
+        "signature": {"is_unsafe": false, "inputs": [], "output": u8_ty},
+        "body": {"Unstructured": {
+            "span": window_span(),
+            "locals": {"arg_count": 0, "locals": [
+                window_local(0, &u8_ty),
+                window_local(1, &array_ty),
+                window_local(2, &array_ty),
+                window_local(3, &array_mut)
+            ]},
+            "body": [{
+                "statements": [
+                    {
+                        "span": window_span(),
+                        "kind": {"Assign": [
+                            window_place(serde_json::json!({"Local": 1}), &array_ty),
+                            {"Aggregate": [
+                                {"Array": [u8_ty.clone(), usize_lit("2")]},
+                                [byte("65"), byte("66")]
+                            ]}
+                        ]}
+                    },
+                    {
+                        "span": window_span(),
+                        "kind": {"Assign": [
+                            window_place(serde_json::json!({"Local": 2}), &array_ty),
+                            {"Use": [
+                                {"Read": window_place(serde_json::json!({"Local": 1}), &array_ty)},
+                                "No"
+                            ]}
+                        ]}
+                    },
+                    {
+                        "span": window_span(),
+                        "kind": {"Assign": [
+                            window_place(serde_json::json!({"Local": 3}), &array_mut),
+                            {"Ref": {
+                                "place": window_place(serde_json::json!({"Local": 2}), &array_ty),
+                                "kind": "Mut",
+                                "ptr_metadata": null
+                            }}
+                        ]}
+                    },
+                    {
+                        "span": window_span(),
+                        "kind": {"Assign": [
+                            window_place(serde_json::json!({"Local": 0}), &u8_ty),
+                            {"Use": [{"Read": b_index}, "No"]}
+                        ]}
+                    }
+                ],
+                "kind": "Regular",
+                "terminator": {"span": window_span(), "kind": "Return"}
+            }]
+        }}
+    });
+    let llbc = window_llbc(vec![], vec![caller]);
+    let graph = crate::test_support::lower_function(&llbc, "const_byte_str_copy_mutborrow")
+        .expect("lower copy of const [u8; 2] into mutably borrowed storage");
+    let mut has_getitem = false;
+    let mut has_str_const = false;
+    let mut array_read_bases = Vec::new();
+    for op in window_graph_ops(&graph) {
+        match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } => {
+                if segments.first().map(String::as_str) == Some("__str_const") {
+                    has_str_const = true;
+                }
+                if segments.last().map(String::as_str) == Some("__string_byte_getitem") {
+                    has_getitem = true;
+                }
+            }
+            OpKind::ArrayRead { base, .. } => array_read_bases.push(base.clone()),
+            _ => {}
+        }
+    }
+    assert!(
+        !has_str_const,
+        "copy into mutably borrowed [u8; 2] is not __str_const; graph={}",
+        graph.dump()
+    );
+    assert!(
+        !has_getitem,
+        "copy into mutably borrowed [u8; 2] is not __string_byte_getitem; graph={}",
+        graph.dump()
+    );
+    assert_eq!(
+        array_read_bases.len(),
+        1,
+        "b[1] is one ArrayRead; graph={}",
+        graph.dump()
+    );
+    let base = &array_read_bases[0];
+    assert_ne!(
+        base.concretetype().as_ref(),
+        Some(&*STRPTR),
+        "ArrayRead base is array storage, not Ptr(STR); ct={:?} graph={}",
+        base.concretetype(),
+        graph.dump()
+    );
+    let mut producer_is_array = false;
+    for op in window_graph_ops(&graph) {
+        if op.result.as_ref() != Some(base) {
+            continue;
+        }
+        match &op.kind {
+            OpKind::Call {
+                target: CallTarget::SyntheticTransparentCtor { name, .. },
+                ..
+            } if name == "Array" || majit_ir::descr::is_shaped_array_name(name) => {
+                producer_is_array = true;
+            }
+            other => panic!(
+                "ArrayRead base producer is {other:?}; graph={}",
+                graph.dump()
+            ),
+        }
+    }
+    assert!(
+        producer_is_array,
+        "ArrayRead base is produced by the Array ctor; graph={}",
+        graph.dump()
+    );
+}
+
+/// `let a = [65u8, 66]; let mut b = a; b[0] = 67; b[1]`. The store
+/// taints the copy-component (`lltype.py` `_ptr.__setitem__`).
+#[test]
+fn const_byte_str_copy_then_store_keeps_array_lowering() {
+    use crate::model::{CallTarget, OpKind};
+
+    let u8_ty = window_u8();
+    let n = window_usize();
+    let array_len = serde_json::json!([
+        {"Integer": {"Unsigned": ["Usize", "2"]}},
+        n
+    ]);
+    let array_ty = serde_json::json!({"Array": [u8_ty.clone(), array_len, null]});
+    let byte = |digits: &str| {
+        serde_json::json!({"Const": [
+            {"Integer": {"Unsigned": ["U8", digits]}},
+            u8_ty
+        ]})
+    };
+    let usize_lit = |digits: &str| {
+        serde_json::json!({"Const": [
+            {"Integer": {"Unsigned": ["Usize", digits]}},
+            n
+        ]})
+    };
+    let b_index = |offset: &str| {
+        window_place(
+            serde_json::json!({"Projection": [
+                window_place(serde_json::json!({"Local": 2}), &array_ty),
+                {"Index": {
+                    "offset": usize_lit(offset),
+                    "from_end": false
+                }}
+            ]}),
+            &u8_ty,
+        )
+    };
+    let caller = serde_json::json!({
+        "def_id": 0,
+        "item_meta": window_meta(&["fixture", "const_byte_str_copy_store"], true),
+        "signature": {"is_unsafe": false, "inputs": [], "output": u8_ty},
+        "body": {"Unstructured": {
+            "span": window_span(),
+            "locals": {"arg_count": 0, "locals": [
+                window_local(0, &u8_ty),
+                window_local(1, &array_ty),
+                window_local(2, &array_ty)
+            ]},
+            "body": [{
+                "statements": [
+                    {
+                        "span": window_span(),
+                        "kind": {"Assign": [
+                            window_place(serde_json::json!({"Local": 1}), &array_ty),
+                            {"Aggregate": [
+                                {"Array": [u8_ty.clone(), usize_lit("2")]},
+                                [byte("65"), byte("66")]
+                            ]}
+                        ]}
+                    },
+                    {
+                        "span": window_span(),
+                        "kind": {"Assign": [
+                            window_place(serde_json::json!({"Local": 2}), &array_ty),
+                            {"Use": [
+                                {"Read": window_place(serde_json::json!({"Local": 1}), &array_ty)},
+                                "No"
+                            ]}
+                        ]}
+                    },
+                    {
+                        "span": window_span(),
+                        "kind": {"Assign": [
+                            b_index("0"),
+                            {"Use": [byte("67"), "No"]}
+                        ]}
+                    },
+                    {
+                        "span": window_span(),
+                        "kind": {"Assign": [
+                            window_place(serde_json::json!({"Local": 0}), &u8_ty),
+                            {"Use": [{"Read": b_index("1")}, "No"]}
+                        ]}
+                    }
+                ],
+                "kind": "Regular",
+                "terminator": {"span": window_span(), "kind": "Return"}
+            }]
+        }}
+    });
+    let llbc = window_llbc(vec![], vec![caller]);
+    let graph = crate::test_support::lower_function(&llbc, "const_byte_str_copy_store")
+        .expect("lower copy of const [u8; 2] then store");
+    let mut has_str_const = false;
+    for op in window_graph_ops(&graph) {
+        if let OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            ..
+        } = &op.kind
+            && segments.first().map(String::as_str) == Some("__str_const")
+        {
+            has_str_const = true;
+        }
+    }
+    assert!(
+        !has_str_const,
+        "copy then store is not __str_const; graph={}",
+        graph.dump()
+    );
+}
+
+/// `r = &c; (*r)[i]` of an immutable const `[u8; N]` is still
+/// `__string_byte_getitem` (`rstr.py` `ll_stritem_nonneg`). The
+/// copy-component rule does not disable the motivating literal case.
+#[test]
+fn const_byte_str_alias_index_is_strgetitem() {
+    use crate::model::{CallTarget, OpKind};
+
+    let u8_ty = window_u8();
+    let n = window_usize();
+    let array_len = serde_json::json!([
+        {"Integer": {"Unsigned": ["Usize", "2"]}},
+        n
+    ]);
+    let array_ty = serde_json::json!({"Array": [u8_ty.clone(), array_len, null]});
+    let array_ref = serde_json::json!({"Ref": ["Erased", array_ty.clone(), "Shared"]});
+    let byte = |digits: &str| {
+        serde_json::json!({"Const": [
+            {"Integer": {"Unsigned": ["U8", digits]}},
+            u8_ty
+        ]})
+    };
+    let usize_lit = serde_json::json!({"Const": [
+        {"Integer": {"Unsigned": ["Usize", "2"]}},
+        n
+    ]});
+    let deref_r = window_place(
+        serde_json::json!({"Projection": [
+            window_place(serde_json::json!({"Local": 3}), &array_ref),
+            "Deref"
+        ]}),
+        &array_ty,
+    );
+    let index_place = window_place(
+        serde_json::json!({"Projection": [
+            deref_r,
+            {"Index": {
+                "offset": {"Read": window_place(serde_json::json!({"Local": 1}), &n)},
+                "from_end": false
+            }}
+        ]}),
+        &u8_ty,
+    );
+    let caller = serde_json::json!({
+        "def_id": 0,
+        "item_meta": window_meta(&["fixture", "const_byte_str_alias_index"], true),
+        "signature": {"is_unsafe": false, "inputs": [n], "output": u8_ty},
+        "body": {"Unstructured": {
+            "span": window_span(),
+            "locals": {"arg_count": 1, "locals": [
+                window_local(0, &u8_ty),
+                window_local(1, &n),
+                window_local(2, &array_ty),
+                window_local(3, &array_ref)
+            ]},
+            "body": [{
+                "statements": [
+                    {
+                        "span": window_span(),
+                        "kind": {"Assign": [
+                            window_place(serde_json::json!({"Local": 2}), &array_ty),
+                            {"Aggregate": [
+                                {"Array": [u8_ty.clone(), usize_lit]},
+                                [byte("65"), byte("66")]
+                            ]}
+                        ]}
+                    },
+                    {
+                        "span": window_span(),
+                        "kind": {"Assign": [
+                            window_place(serde_json::json!({"Local": 3}), &array_ref),
+                            {"Ref": {
+                                "place": window_place(serde_json::json!({"Local": 2}), &array_ty),
+                                "kind": "Shared",
+                                "ptr_metadata": null
+                            }}
+                        ]}
+                    },
+                    {
+                        "span": window_span(),
+                        "kind": {"Assign": [
+                            window_place(serde_json::json!({"Local": 0}), &u8_ty),
+                            {"Use": [{"Read": index_place}, "No"]}
+                        ]}
+                    }
+                ],
+                "kind": "Regular",
+                "terminator": {"span": window_span(), "kind": "Return"}
+            }]
+        }}
+    });
+    let llbc = window_llbc(vec![], vec![caller]);
+    let graph = crate::test_support::lower_function(&llbc, "const_byte_str_alias_index")
+        .expect("lower r = &c; (*r)[i]");
+    let mut has_str_const = false;
+    let mut has_getitem = false;
+    for op in window_graph_ops(&graph) {
+        if let OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            ..
+        } = &op.kind
+        {
+            if segments.first().map(String::as_str) == Some("__str_const") {
+                has_str_const = true;
+            }
+            if segments.last().map(String::as_str) == Some("__string_byte_getitem") {
+                has_getitem = true;
+            }
+        }
+    }
+    assert!(
+        has_str_const,
+        "immutable alias of const [u8; 2] is __str_const; graph={}",
+        graph.dump()
+    );
+    assert!(
+        has_getitem,
+        "(*r)[i] of an immutable const [u8; 2] is __string_byte_getitem; graph={}",
+        graph.dump()
+    );
+}
+
+/// A Call whose destination is a projection of `a` (`a[i] = f()`) is a
+/// store to `a` (`lltype.py` `_ptr.__setitem__`). `lower_call` refuses a
+/// projection dest, so this fixture scans the mutated / const-byte-str
+/// census rather than a successful graph.
+#[test]
+fn const_byte_str_call_dest_projection_keeps_array_lowering() {
+    let u8_ty = window_u8();
+    let n = window_usize();
+    let array_len = serde_json::json!([
+        {"Integer": {"Unsigned": ["Usize", "2"]}},
+        n
+    ]);
+    let array_ty = serde_json::json!({"Array": [u8_ty.clone(), array_len, null]});
+    let byte = |digits: &str| {
+        serde_json::json!({"Const": [
+            {"Integer": {"Unsigned": ["U8", digits]}},
+            u8_ty
+        ]})
+    };
+    let usize_lit = serde_json::json!({"Const": [
+        {"Integer": {"Unsigned": ["Usize", "2"]}},
+        n
+    ]});
+    let dest = window_place(
+        serde_json::json!({"Projection": [
+            window_place(serde_json::json!({"Local": 1}), &array_ty),
+            {"Index": {
+                "offset": {"Const": [
+                    {"Integer": {"Unsigned": ["Usize", "0"]}},
+                    n
+                ]},
+                "from_end": false
+            }}
+        ]}),
+        &u8_ty,
+    );
+    let (unwind, ret) = window_unwind_and_return_blocks();
+    let callee = window_opaque_fun(1, &["fixture", "const_byte_elem"], vec![], u8_ty.clone());
+    let caller = serde_json::json!({
+        "def_id": 0,
+        "item_meta": window_meta(&["fixture", "const_byte_str_call_dest"], true),
+        "signature": {"is_unsafe": false, "inputs": [], "output": u8_ty},
+        "body": {"Unstructured": {
+            "span": window_span(),
+            "locals": {"arg_count": 0, "locals": [
+                window_local(0, &u8_ty),
+                window_local(1, &array_ty)
+            ]},
+            "body": [
+                {
+                    "statements": [{
+                        "span": window_span(),
+                        "kind": {"Assign": [
+                            window_place(serde_json::json!({"Local": 1}), &array_ty),
+                            {"Aggregate": [
+                                {"Array": [u8_ty.clone(), usize_lit]},
+                                [byte("65"), byte("66")]
+                            ]}
+                        ]}
+                    }],
+                    "kind": "Regular",
+                    "terminator": {"span": window_span(), "kind": {"Call": {
+                        "call": {
+                            "func": {"Regular": {
+                                "kind": {"Fun": 1},
+                                "generics": window_empty_generics()
+                            }},
+                            "args": [],
+                            "dest": dest.clone(),
+                            "target": 2,
+                            "on_unwind": 1
+                        },
+                        "dest": dest,
+                        "target": 2,
+                        "on_unwind": 1
+                    }}}
+                },
+                unwind,
+                ret
+            ]
+        }}
+    });
+    let llbc = window_llbc(vec![], vec![caller, callee]);
+    let fd = llbc
+        .local_fn("const_byte_str_call_dest")
+        .expect("call-dest fixture");
+    let body = fd.unstructured().expect("Unstructured body");
+    let marked = super::const_byte_str_view_locals(&body, &llbc);
+    assert!(
+        !marked.get(1).copied().unwrap_or(true),
+        "a with a Call dest projection is not a Constant string; marked={marked:?}"
+    );
+}
+
+fn const_byte_str_graph_has_str_const(graph: &crate::model::FunctionGraph) -> bool {
+    use crate::model::{CallTarget, OpKind};
+    window_graph_ops(graph).iter().any(|op| {
+        matches!(
+            &op.kind,
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } if segments.first().map(String::as_str) == Some("__str_const")
+        )
+    })
+}
+
+/// `out.bytes = a` after `a = [65u8, 66]`. The field store is not a
+/// member copy (`lltype.py` `_ptr.__setattr__`).
+#[test]
+fn const_byte_str_field_store_is_not_strconst() {
+    let u8_ty = window_u8();
+    let n = window_usize();
+    let array_len = serde_json::json!([
+        {"Integer": {"Unsigned": ["Usize", "2"]}},
+        n
+    ]);
+    let array_ty = serde_json::json!({"Array": [u8_ty.clone(), array_len, null]});
+    let holder_adt = serde_json::json!({
+        "Adt": {"id": 0, "builtin": null, "generics": window_empty_generics()}
+    });
+    let byte = |digits: &str| {
+        serde_json::json!({"Const": [
+            {"Integer": {"Unsigned": ["U8", digits]}},
+            u8_ty
+        ]})
+    };
+    let usize_lit = serde_json::json!({"Const": [
+        {"Integer": {"Unsigned": ["Usize", "2"]}},
+        n
+    ]});
+    let holder = serde_json::json!({
+        "def_id": 0,
+        "item_meta": window_meta(&["fixture", "ByteHolder"], true),
+        "kind": {"Struct": [{
+            "name": "bytes",
+            "ty": array_ty,
+            "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true}
+        }]}
+    });
+    let field_place = window_place(
+        serde_json::json!({"Projection": [
+            window_place(serde_json::json!({"Local": 2}), &holder_adt),
+            {"Field": [null, 0]}
+        ]}),
+        &array_ty,
+    );
+    let caller = serde_json::json!({
+        "def_id": 0,
+        "item_meta": window_meta(&["fixture", "const_byte_str_field_store"], true),
+        "signature": {"is_unsafe": false, "inputs": [], "output": u8_ty},
+        "body": {"Unstructured": {
+            "span": window_span(),
+            "locals": {"arg_count": 0, "locals": [
+                window_local(0, &u8_ty),
+                window_local(1, &array_ty),
+                window_local(2, &holder_adt),
+                window_local(3, &array_ty)
+            ]},
+            "body": [{
+                "statements": [
+                    {
+                        "span": window_span(),
+                        "kind": {"Assign": [
+                            window_place(serde_json::json!({"Local": 1}), &array_ty),
+                            {"Aggregate": [
+                                {"Array": [u8_ty.clone(), usize_lit.clone()]},
+                                [byte("65"), byte("66")]
+                            ]}
+                        ]}
+                    },
+                    {
+                        "span": window_span(),
+                        "kind": {"Assign": [
+                            window_place(serde_json::json!({"Local": 3}), &array_ty),
+                            {"Aggregate": [
+                                {"Array": [u8_ty.clone(), usize_lit]},
+                                [byte("0"), byte("0")]
+                            ]}
+                        ]}
+                    },
+                    {
+                        "span": window_span(),
+                        "kind": {"Assign": [
+                            window_place(serde_json::json!({"Local": 2}), &holder_adt),
+                            {"Aggregate": [
+                                {"Adt": [0, null, null]},
+                                [{"Read": window_place(serde_json::json!({"Local": 3}), &array_ty)}]
+                            ]}
+                        ]}
+                    },
+                    {
+                        "span": window_span(),
+                        "kind": {"Assign": [
+                            field_place,
+                            {"Use": [
+                                {"Read": window_place(serde_json::json!({"Local": 1}), &array_ty)},
+                                "No"
+                            ]}
+                        ]}
+                    },
+                    {
+                        "span": window_span(),
+                        "kind": {"Assign": [
+                            window_place(serde_json::json!({"Local": 0}), &u8_ty),
+                            {"Use": [byte("0"), "No"]}
+                        ]}
+                    }
+                ],
+                "kind": "Regular",
+                "terminator": {"span": window_span(), "kind": "Return"}
+            }]
+        }}
+    });
+    let llbc = window_llbc(vec![holder], vec![caller]);
+    let fd = llbc
+        .local_fn("const_byte_str_field_store")
+        .expect("field-store fixture");
+    let body = fd.unstructured().expect("Unstructured body");
+    let marked = super::const_byte_str_view_locals(&body, &llbc);
+    assert!(
+        !marked.get(1).copied().unwrap_or(true),
+        "a stored into out.bytes is not a Constant string; marked={marked:?}"
+    );
+    let graph = crate::test_support::lower_function(&llbc, "const_byte_str_field_store")
+        .expect("lower out.bytes = a");
+    assert!(
+        !const_byte_str_graph_has_str_const(&graph),
+        "field store of const [u8; 2] is not __str_const; graph={}",
+        graph.dump()
+    );
+}
+
+/// `f(&a)` after `a = [65u8, 66]`. The Call argument is array storage.
+#[test]
+fn const_byte_str_call_arg_is_not_strconst() {
+    let u8_ty = window_u8();
+    let n = window_usize();
+    let array_len = serde_json::json!([
+        {"Integer": {"Unsigned": ["Usize", "2"]}},
+        n
+    ]);
+    let array_ty = serde_json::json!({"Array": [u8_ty.clone(), array_len, null]});
+    let array_ref = serde_json::json!({"Ref": ["Erased", array_ty.clone(), "Shared"]});
+    let byte = |digits: &str| {
+        serde_json::json!({"Const": [
+            {"Integer": {"Unsigned": ["U8", digits]}},
+            u8_ty
+        ]})
+    };
+    let usize_lit = serde_json::json!({"Const": [
+        {"Integer": {"Unsigned": ["Usize", "2"]}},
+        n
+    ]});
+    let (unwind, ret) = window_unwind_and_return_blocks();
+    let callee = window_opaque_fun(
+        1,
+        &["fixture", "const_byte_str_take"],
+        vec![array_ref.clone()],
+        u8_ty.clone(),
+    );
+    let caller = serde_json::json!({
+        "def_id": 0,
+        "item_meta": window_meta(&["fixture", "const_byte_str_call_arg"], true),
+        "signature": {"is_unsafe": false, "inputs": [], "output": u8_ty},
+        "body": {"Unstructured": {
+            "span": window_span(),
+            "locals": {"arg_count": 0, "locals": [
+                window_local(0, &u8_ty),
+                window_local(1, &array_ty),
+                window_local(2, &array_ref)
+            ]},
+            "body": [
+                {
+                    "statements": [
+                        {
+                            "span": window_span(),
+                            "kind": {"Assign": [
+                                window_place(serde_json::json!({"Local": 1}), &array_ty),
+                                {"Aggregate": [
+                                    {"Array": [u8_ty.clone(), usize_lit]},
+                                    [byte("65"), byte("66")]
+                                ]}
+                            ]}
+                        },
+                        {
+                            "span": window_span(),
+                            "kind": {"Assign": [
+                                window_place(serde_json::json!({"Local": 2}), &array_ref),
+                                {"Ref": {
+                                    "place": window_place(serde_json::json!({"Local": 1}), &array_ty),
+                                    "kind": "Shared",
+                                    "ptr_metadata": null
+                                }}
+                            ]}
+                        }
+                    ],
+                    "kind": "Regular",
+                    "terminator": {"span": window_span(), "kind": {"Call": {
+                        "call": {
+                            "func": {"Regular": {
+                                "kind": {"Fun": 1},
+                                "generics": window_empty_generics()
+                            }},
+                            "args": [{"Read": window_place(serde_json::json!({"Local": 2}), &array_ref)}],
+                            "dest": window_place(serde_json::json!({"Local": 0}), &u8_ty),
+                            "target": 2,
+                            "on_unwind": 1
+                        },
+                        "dest": window_place(serde_json::json!({"Local": 0}), &u8_ty),
+                        "target": 2,
+                        "on_unwind": 1
+                    }}}
+                },
+                unwind,
+                ret
+            ]
+        }}
+    });
+    let llbc = window_llbc(vec![], vec![caller, callee]);
+    let fd = llbc
+        .local_fn("const_byte_str_call_arg")
+        .expect("call-arg fixture");
+    let body = fd.unstructured().expect("Unstructured body");
+    let marked = super::const_byte_str_view_locals(&body, &llbc);
+    assert!(
+        !marked.get(1).copied().unwrap_or(true),
+        "a passed as f(&a) is not a Constant string; marked={marked:?}"
+    );
+    let graph =
+        crate::test_support::lower_function(&llbc, "const_byte_str_call_arg").expect("lower f(&a)");
+    assert!(
+        !const_byte_str_graph_has_str_const(&graph),
+        "Call argument of const [u8; 2] is not __str_const; graph={}",
+        graph.dump()
+    );
+}
+
+/// `S { bytes: a }` after `a = [65u8, 66]`. The Aggregate operand is
+/// array storage (`lltype.py` `_ptr.__setattr__`).
+#[test]
+fn const_byte_str_aggregate_operand_is_not_strconst() {
+    let u8_ty = window_u8();
+    let n = window_usize();
+    let array_len = serde_json::json!([
+        {"Integer": {"Unsigned": ["Usize", "2"]}},
+        n
+    ]);
+    let array_ty = serde_json::json!({"Array": [u8_ty.clone(), array_len, null]});
+    let holder_adt = serde_json::json!({
+        "Adt": {"id": 0, "builtin": null, "generics": window_empty_generics()}
+    });
+    let byte = |digits: &str| {
+        serde_json::json!({"Const": [
+            {"Integer": {"Unsigned": ["U8", digits]}},
+            u8_ty
+        ]})
+    };
+    let usize_lit = serde_json::json!({"Const": [
+        {"Integer": {"Unsigned": ["Usize", "2"]}},
+        n
+    ]});
+    let holder = serde_json::json!({
+        "def_id": 0,
+        "item_meta": window_meta(&["fixture", "ByteHolderAgg"], true),
+        "kind": {"Struct": [{
+            "name": "bytes",
+            "ty": array_ty,
+            "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true}
+        }]}
+    });
+    let caller = serde_json::json!({
+        "def_id": 0,
+        "item_meta": window_meta(&["fixture", "const_byte_str_aggregate_operand"], true),
+        "signature": {"is_unsafe": false, "inputs": [], "output": u8_ty},
+        "body": {"Unstructured": {
+            "span": window_span(),
+            "locals": {"arg_count": 0, "locals": [
+                window_local(0, &u8_ty),
+                window_local(1, &array_ty),
+                window_local(2, &holder_adt)
+            ]},
+            "body": [{
+                "statements": [
+                    {
+                        "span": window_span(),
+                        "kind": {"Assign": [
+                            window_place(serde_json::json!({"Local": 1}), &array_ty),
+                            {"Aggregate": [
+                                {"Array": [u8_ty.clone(), usize_lit]},
+                                [byte("65"), byte("66")]
+                            ]}
+                        ]}
+                    },
+                    {
+                        "span": window_span(),
+                        "kind": {"Assign": [
+                            window_place(serde_json::json!({"Local": 2}), &holder_adt),
+                            {"Aggregate": [
+                                {"Adt": [0, null, null]},
+                                [{"Read": window_place(serde_json::json!({"Local": 1}), &array_ty)}]
+                            ]}
+                        ]}
+                    },
+                    {
+                        "span": window_span(),
+                        "kind": {"Assign": [
+                            window_place(serde_json::json!({"Local": 0}), &u8_ty),
+                            {"Use": [byte("0"), "No"]}
+                        ]}
+                    }
+                ],
+                "kind": "Regular",
+                "terminator": {"span": window_span(), "kind": "Return"}
+            }]
+        }}
+    });
+    let llbc = window_llbc(vec![holder], vec![caller]);
+    let fd = llbc
+        .local_fn("const_byte_str_aggregate_operand")
+        .expect("aggregate-operand fixture");
+    let body = fd.unstructured().expect("Unstructured body");
+    let marked = super::const_byte_str_view_locals(&body, &llbc);
+    assert!(
+        !marked.get(1).copied().unwrap_or(true),
+        "a used as S {{ bytes: a }} is not a Constant string; marked={marked:?}"
+    );
+    let graph = crate::test_support::lower_function(&llbc, "const_byte_str_aggregate_operand")
+        .expect("lower S { bytes: a }");
+    assert!(
+        !const_byte_str_graph_has_str_const(&graph),
+        "Aggregate operand of const [u8; 2] is not __str_const; graph={}",
+        graph.dump()
+    );
+}
+
+fn const_byte_str_graph_has_string_byte_getitem(graph: &crate::model::FunctionGraph) -> bool {
+    use crate::model::{CallTarget, OpKind};
+    window_graph_ops(graph).iter().any(|op| {
+        matches!(
+            &op.kind,
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } if segments.last().map(String::as_str) == Some("__string_byte_getitem")
+        )
+    })
+}
+
+/// `a = [195u8, 169]; p = &raw const a; q = p as *const [i8; 2]; (*q)[0]`.
+/// Charon emits the cast as `UnaryOp({"Cast": {"RawPtr": dest}})`
+/// (`rptr.py` `PtrRepr.rtype_getitem`).
+#[test]
+fn const_byte_str_i8_ptr_cast_is_not_strgetitem() {
+    let u8_ty = window_u8();
+    let i8_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "I8"}}});
+    let n = window_usize();
+    let array_len = serde_json::json!([
+        {"Integer": {"Unsigned": ["Usize", "2"]}},
+        n
+    ]);
+    let u8_array = serde_json::json!({"Array": [u8_ty.clone(), array_len.clone(), null]});
+    let i8_array = serde_json::json!({"Array": [i8_ty.clone(), array_len, null]});
+    let u8_raw = serde_json::json!({"RawPtr": [u8_array.clone(), "Const"]});
+    let i8_raw = serde_json::json!({"RawPtr": [i8_array.clone(), "Const"]});
+    let byte = |digits: &str| {
+        serde_json::json!({"Const": [
+            {"Integer": {"Unsigned": ["U8", digits]}},
+            u8_ty
+        ]})
+    };
+    let usize_lit = serde_json::json!({"Const": [
+        {"Integer": {"Unsigned": ["Usize", "2"]}},
+        n
+    ]});
+    let usize_zero = serde_json::json!({"Const": [
+        {"Integer": {"Unsigned": ["Usize", "0"]}},
+        n
+    ]});
+    let deref_q = window_place(
+        serde_json::json!({"Projection": [
+            window_place(serde_json::json!({"Local": 3}), &i8_raw),
+            "Deref"
+        ]}),
+        &i8_array,
+    );
+    let index_place = window_place(
+        serde_json::json!({"Projection": [
+            deref_q,
+            {"Index": {
+                "offset": usize_zero,
+                "from_end": false
+            }}
+        ]}),
+        &i8_ty,
+    );
+    let caller = serde_json::json!({
+        "def_id": 0,
+        "item_meta": window_meta(&["fixture", "const_byte_str_i8_ptr_cast"], true),
+        "signature": {"is_unsafe": true, "inputs": [], "output": i8_ty},
+        "body": {"Unstructured": {
+            "span": window_span(),
+            "locals": {"arg_count": 0, "locals": [
+                window_local(0, &i8_ty),
+                window_local(1, &u8_array),
+                window_local(2, &u8_raw),
+                window_local(3, &i8_raw)
+            ]},
+            "body": [{
+                "statements": [
+                    {
+                        "span": window_span(),
+                        "kind": {"Assign": [
+                            window_place(serde_json::json!({"Local": 1}), &u8_array),
+                            {"Aggregate": [
+                                {"Array": [u8_ty.clone(), usize_lit]},
+                                [byte("195"), byte("169")]
+                            ]}
+                        ]}
+                    },
+                    {
+                        "span": window_span(),
+                        "kind": {"Assign": [
+                            window_place(serde_json::json!({"Local": 2}), &u8_raw),
+                            {"RawPtr": {
+                                "place": window_place(serde_json::json!({"Local": 1}), &u8_array),
+                                "kind": "Const",
+                                "ptr_metadata": null
+                            }}
+                        ]}
+                    },
+                    {
+                        "span": window_span(),
+                        "kind": {"Assign": [
+                            window_place(serde_json::json!({"Local": 3}), &i8_raw),
+                            {"UnaryOp": [
+                                {"Cast": {"RawPtr": i8_raw.clone()}},
+                                {"Move": window_place(serde_json::json!({"Local": 2}), &u8_raw)}
+                            ]}
+                        ]}
+                    },
+                    {
+                        "span": window_span(),
+                        "kind": {"Assign": [
+                            window_place(serde_json::json!({"Local": 0}), &i8_ty),
+                            {"Use": [{"Read": index_place}, "No"]}
+                        ]}
+                    }
+                ],
+                "kind": "Regular",
+                "terminator": {"span": window_span(), "kind": "Return"}
+            }]
+        }}
+    });
+    let llbc = window_llbc(vec![], vec![caller]);
+    let fd = llbc
+        .local_fn("const_byte_str_i8_ptr_cast")
+        .expect("i8-cast fixture");
+    let body = fd.unstructured().expect("Unstructured body");
+    let marked = super::const_byte_str_view_locals(&body, &llbc);
+    assert!(
+        !marked.get(1).copied().unwrap_or(true),
+        "a after Cast to *const [i8; 2] is not a Constant string; marked={marked:?}"
+    );
+    let graph = crate::test_support::lower_function(&llbc, "const_byte_str_i8_ptr_cast")
+        .expect("lower p as *const [i8; 2]; (*q)[0]");
+    assert!(
+        !const_byte_str_graph_has_str_const(&graph),
+        "Cast of const [u8; 2] to *const [i8; 2] is not __str_const; graph={}",
+        graph.dump()
+    );
+    assert!(
+        !const_byte_str_graph_has_string_byte_getitem(&graph),
+        "(*q)[0] through *const [i8; 2] is not __string_byte_getitem; graph={}",
+        graph.dump()
+    );
+}
+
+/// ConstantIndex of a member flowing to a Call argument is not an
+/// element read (`rstr.py` `ll_stritem_nonneg`); the component stays array
+/// storage.
+#[test]
+fn const_byte_str_constant_index_call_arg_is_not_strconst() {
+    let u8_ty = window_u8();
+    let n = window_usize();
+    let array_len = serde_json::json!([
+        {"Integer": {"Unsigned": ["Usize", "2"]}},
+        n
+    ]);
+    let array_ty = serde_json::json!({"Array": [u8_ty.clone(), array_len, null]});
+    let byte = |digits: &str| {
+        serde_json::json!({"Const": [
+            {"Integer": {"Unsigned": ["U8", digits]}},
+            u8_ty
+        ]})
+    };
+    let usize_lit = serde_json::json!({"Const": [
+        {"Integer": {"Unsigned": ["Usize", "2"]}},
+        n
+    ]});
+    let const_index_place = window_place(
+        serde_json::json!({"Projection": [
+            window_place(serde_json::json!({"Local": 1}), &array_ty),
+            {"ConstantIndex": {
+                "offset": 0,
+                "min_length": 2,
+                "from_end": false
+            }}
+        ]}),
+        &u8_ty,
+    );
+    let (unwind, ret) = window_unwind_and_return_blocks();
+    let callee = window_opaque_fun(
+        1,
+        &["fixture", "const_byte_str_take_byte"],
+        vec![u8_ty.clone()],
+        u8_ty.clone(),
+    );
+    let caller = serde_json::json!({
+        "def_id": 0,
+        "item_meta": window_meta(&["fixture", "const_byte_str_constant_index_call_arg"], true),
+        "signature": {"is_unsafe": false, "inputs": [], "output": u8_ty},
+        "body": {"Unstructured": {
+            "span": window_span(),
+            "locals": {"arg_count": 0, "locals": [
+                window_local(0, &u8_ty),
+                window_local(1, &array_ty)
+            ]},
+            "body": [
+                {
+                    "statements": [
+                        {
+                            "span": window_span(),
+                            "kind": {"Assign": [
+                                window_place(serde_json::json!({"Local": 1}), &array_ty),
+                                {"Aggregate": [
+                                    {"Array": [u8_ty.clone(), usize_lit]},
+                                    [byte("65"), byte("66")]
+                                ]}
+                            ]}
+                        }
+                    ],
+                    "kind": "Regular",
+                    "terminator": {"span": window_span(), "kind": {"Call": {
+                        "call": {
+                            "func": {"Regular": {
+                                "kind": {"Fun": 1},
+                                "generics": window_empty_generics()
+                            }},
+                            "args": [{"Read": const_index_place}],
+                            "dest": window_place(serde_json::json!({"Local": 0}), &u8_ty),
+                            "target": 2,
+                            "on_unwind": 1
+                        },
+                        "dest": window_place(serde_json::json!({"Local": 0}), &u8_ty),
+                        "target": 2,
+                        "on_unwind": 1
+                    }}}
+                },
+                unwind,
+                ret
+            ]
+        }}
+    });
+    let llbc = window_llbc(vec![], vec![caller, callee]);
+    let fd = llbc
+        .local_fn("const_byte_str_constant_index_call_arg")
+        .expect("constant-index fixture");
+    let body = fd.unstructured().expect("Unstructured body");
+    let marked = super::const_byte_str_view_locals(&body, &llbc);
+    assert!(
+        !marked.get(1).copied().unwrap_or(true),
+        "a read by ConstantIndex into a Call argument is not a Constant string; marked={marked:?}"
+    );
+    let graph =
+        crate::test_support::lower_function(&llbc, "const_byte_str_constant_index_call_arg")
+            .expect("lower f(a[c]) ConstantIndex");
+    assert!(
+        !const_byte_str_graph_has_str_const(&graph),
+        "ConstantIndex of const [u8; 2] as Call argument is not __str_const; graph={}",
+        graph.dump()
+    );
+}
+
 /// RPython `AbstractStringBuilderRepr.rtype_method_append` accepts both a
 /// whole string and `SomeChar`.  `bytearray_repr_string` mixes
 /// `String::push_str` and `String::push(char)` in one loop, so omitting the
@@ -34132,6 +36526,7 @@ fn window_str_copy_is_str_not_result_charpsize2str() {
         let OpKind::Call {
             target: CallTarget::FunctionPath { segments, .. },
             result_ty,
+            args,
             ..
         } = &op.kind
         else {
@@ -34156,6 +36551,15 @@ fn window_str_copy_is_str_not_result_charpsize2str() {
                 dest.concretetype().as_ref(),
                 Some(&*STRPTR),
                 "window STR copy stamps rstr STRPTR; graph={}",
+                graph.dump()
+            );
+            let cp = args[0].as_variable().expect("ll_charpsize2str cp");
+            assert!(
+                cp.concretetype()
+                    .as_ref()
+                    .is_some_and(super::lltype_is_ccharp),
+                "ll_charpsize2str slot 0 is CCHARP; ct={:?} graph={}",
+                cp.concretetype(),
                 graph.dump()
             );
             str_copies += 1;
@@ -34186,6 +36590,624 @@ fn window_str_copy_is_str_not_result_charpsize2str() {
         Some("CCHARP"),
         "ll_charpsize2str cp Input class_root is CCHARP; helper={}",
         helper.dump()
+    );
+}
+
+/// Integer address word used as `charpsize2str` `cp` is `rffi.cast` /
+/// `cast_int_to_ptr(CCHARP, int)` at the producer (`rffi.py` `CCHARP`).
+/// `from_raw_parts(usize, usize)` then `from_utf8_unchecked` is the
+/// Integer-for-`cp` call shape: helper slot 0 is `SomePtr` of `CCHARP`.
+#[test]
+fn integer_cp_to_ll_charpsize2str_is_ccharp() {
+    use crate::model::{CallTarget, LinkArg, OpKind};
+
+    let shared = window_shared_slice();
+    let n = window_usize();
+    let str_ty = serde_json::json!({"Ref": ["Erased", {"Adt": {"builtin": "Str"}}, "Shared"]});
+    let (unwind, ret) = window_unwind_and_return_blocks();
+    let from_raw = window_opaque_fun(
+        1,
+        &["core", "slice", "raw", "from_raw_parts"],
+        vec![n.clone(), n.clone()],
+        shared.clone(),
+    );
+    let from_utf8 = window_opaque_fun(
+        2,
+        &["core", "str", "converts", "from_utf8_unchecked"],
+        vec![shared.clone()],
+        str_ty.clone(),
+    );
+    let caller = serde_json::json!({
+        "def_id": 0,
+        "item_meta": window_meta(&["fixture", "integer_cp_charpsize2str"], true),
+        "signature": {"is_unsafe": true, "inputs": [n, n], "output": str_ty},
+        "body": {"Unstructured": {
+            "span": window_span(),
+            "locals": {"arg_count": 2, "locals": [
+                window_local(0, &str_ty),
+                window_local(1, &n),
+                window_local(2, &n),
+                window_local(3, &shared)
+            ]},
+            "body": [
+                {
+                    "statements": [],
+                    "kind": "Regular",
+                    "terminator": {"span": window_span(), "kind": {"Call": {"call": {
+                        "func": {"Regular": {
+                            "kind": {"Fun": 1},
+                            "generics": window_empty_generics()
+                        }},
+                        "args": [
+                            {"Read": window_place(serde_json::json!({"Local": 1}), &n)},
+                            {"Read": window_place(serde_json::json!({"Local": 2}), &n)}
+                        ]}, "dest": window_place(serde_json::json!({"Local": 3}), &shared), "target": 2, "on_unwind": 1}}}
+                },
+                unwind,
+                {
+                    "statements": [],
+                    "kind": "Regular",
+                    "terminator": {"span": window_span(), "kind": {"Call": {"call": {
+                        "func": {"Regular": {
+                            "kind": {"Fun": 2},
+                            "generics": window_empty_generics()
+                        }},
+                        "args": [{"Read": window_place(serde_json::json!({"Local": 3}), &shared)}]}, "dest": window_place(serde_json::json!({"Local": 0}), &str_ty), "target": 3, "on_unwind": 1}}}
+                },
+                ret
+            ]
+        }}
+    });
+    let llbc = window_llbc(vec![], vec![caller, from_raw, from_utf8]);
+    let graph = crate::test_support::lower_function(&llbc, "integer_cp_charpsize2str")
+        .expect("lower Integer-for-cp from_raw_parts + from_utf8_unchecked");
+    let leafs = window_call_leafs(&graph);
+    assert!(
+        leafs.iter().any(|leaf| leaf == "cast_int_to_ptr"),
+        "Integer address is cast_int_to_ptr(CCHARP); leafs={leafs:?} graph={}",
+        graph.dump()
+    );
+    let mut copies = 0usize;
+    for op in graph.blocks.iter().flat_map(|block| &block.operations) {
+        let OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            args,
+            ..
+        } = &op.kind
+        else {
+            continue;
+        };
+        if segments.as_slice() != [crate::front::join_chars::LL_CHARPSIZE2STR] {
+            continue;
+        }
+        copies += 1;
+        assert_eq!(
+            args.len(),
+            2,
+            "charpsize2str(cp, size); graph={}",
+            graph.dump()
+        );
+        let cp = match &args[0] {
+            LinkArg::Value(v) => v,
+            other => panic!("cp is a Variable, got {other:?}; graph={}", graph.dump()),
+        };
+        assert!(
+            cp.concretetype()
+                .as_ref()
+                .is_some_and(super::lltype_is_ccharp),
+            "helper slot 0 is CCHARP SomePtr; ct={:?} graph={}",
+            cp.concretetype(),
+            graph.dump()
+        );
+    }
+    assert!(
+        copies >= 1,
+        "from_utf8_unchecked of an Integer window copies via ll_charpsize2str; leafs={leafs:?} graph={}",
+        graph.dump()
+    );
+    let helper = crate::front::join_chars::build_ll_charpsize2str_graph();
+    let cp_root = helper.blocks.iter().find_map(|block| {
+        block.operations.iter().find_map(|op| match &op.kind {
+            OpKind::Input {
+                name, class_root, ..
+            } if name == "cp" => class_root.clone(),
+            _ => None,
+        })
+    });
+    assert_eq!(
+        cp_root.as_deref(),
+        Some("CCHARP"),
+        "ll_charpsize2str slot 0 Input is CCHARP; helper={}",
+        helper.dump()
+    );
+}
+
+fn charpsize2str_vec_ty(vec_id: u64) -> serde_json::Value {
+    let u8_ty = window_u8();
+    serde_json::json!({
+        "Adt": {
+            "id": vec_id,
+            "builtin": null,
+            "generics": {
+                "regions": [],
+                "types": [u8_ty],
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }
+    })
+}
+
+fn charpsize2str_vec_decl(vec_id: u64) -> serde_json::Value {
+    serde_json::json!({
+        "def_id": vec_id,
+        "item_meta": window_meta(&["alloc", "vec", "Vec"], false),
+        "kind": {"Struct": []}
+    })
+}
+
+fn window_const_i8_ptr() -> serde_json::Value {
+    serde_json::json!({"RawPtr": [i8_ty(), "Const"]})
+}
+
+fn named_window_local(i: u64, name: &str, ty: &serde_json::Value) -> serde_json::Value {
+    serde_json::json!({"index": i, "name": name, "span": window_span(), "ty": ty})
+}
+
+fn lower_cp_arg_to_charpsize2str(
+    name: &str,
+    cp_ty: serde_json::Value,
+    type_decls: Vec<serde_json::Value>,
+    vec_id: u64,
+) -> crate::model::FunctionGraph {
+    let n = window_usize();
+    let vec_ty = charpsize2str_vec_ty(vec_id);
+    let (unwind, ret) = window_unwind_and_return_blocks();
+    let callee = window_opaque_fun(
+        1,
+        &["majit_rlib", "rffi", "buffer", "charpsize2str"],
+        vec![window_mut_u8_ptr(), n.clone()],
+        vec_ty.clone(),
+    );
+    let caller = serde_json::json!({
+        "def_id": 0,
+        "item_meta": window_meta(&["fixture", name], true),
+        "signature": {"is_unsafe": true, "inputs": [cp_ty, n], "output": vec_ty},
+        "body": {"Unstructured": {
+            "span": window_span(),
+            "locals": {"arg_count": 2, "locals": [
+                window_local(0, &vec_ty),
+                named_window_local(1, "cp", &cp_ty),
+                named_window_local(2, "n", &n)
+            ]},
+            "body": [
+                {
+                    "statements": [],
+                    "kind": "Regular",
+                    "terminator": {"span": window_span(), "kind": {"Call": {"call": {
+                        "func": {"Regular": {
+                            "kind": {"Fun": 1},
+                            "generics": window_empty_generics()
+                        }},
+                        "args": [
+                            {"Read": window_place(serde_json::json!({"Local": 1}), &cp_ty)},
+                            {"Read": window_place(serde_json::json!({"Local": 2}), &n)}
+                        ]}, "dest": window_place(serde_json::json!({"Local": 0}), &vec_ty), "target": 2, "on_unwind": 1}}}
+                },
+                unwind,
+                ret
+            ]
+        }}
+    });
+    let mut types = type_decls;
+    types.push(charpsize2str_vec_decl(vec_id));
+    let llbc = window_llbc(types, vec![caller, callee]);
+    crate::test_support::lower_function(&llbc, name)
+        .unwrap_or_else(|err| panic!("lower {name}: {err:?}"))
+}
+
+fn charpsize2str_call_cp(graph: &crate::model::FunctionGraph) -> crate::flowspace::model::Variable {
+    use crate::model::{CallTarget, LinkArg, OpKind};
+    for op in graph.blocks.iter().flat_map(|block| &block.operations) {
+        let OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            args,
+            ..
+        } = &op.kind
+        else {
+            continue;
+        };
+        let leaf = segments.last().map(String::as_str);
+        if leaf != Some("charpsize2str") && leaf != Some(crate::front::join_chars::LL_CHARPSIZE2STR)
+        {
+            continue;
+        }
+        return match args.first() {
+            Some(LinkArg::Value(v)) => v.clone(),
+            other => panic!(
+                "charpsize2str cp is a Variable, got {other:?}; graph={}",
+                graph.dump()
+            ),
+        };
+    }
+    panic!(
+        "expected a charpsize2str call; leafs={:?} graph={}",
+        window_call_leafs(graph),
+        graph.dump()
+    )
+}
+
+fn graph_input_named<'a>(
+    graph: &'a crate::model::FunctionGraph,
+    want: &str,
+) -> &'a crate::flowspace::model::Variable {
+    use crate::model::OpKind;
+    for op in graph.blocks.iter().flat_map(|block| &block.operations) {
+        if let OpKind::Input { name, .. } = &op.kind
+            && name == want
+        {
+            return op
+                .result
+                .as_ref()
+                .unwrap_or_else(|| panic!("Input {want} has a result; graph={}", graph.dump()));
+        }
+    }
+    panic!("expected Input {want}; graph={}", graph.dump())
+}
+
+fn call_producer_leaf(
+    graph: &crate::model::FunctionGraph,
+    var: &crate::flowspace::model::Variable,
+) -> Option<Vec<String>> {
+    use crate::model::{CallTarget, OpKind};
+    let (block_id, idx) = super::resolve_to_producer_op(graph, var)?;
+    let op = graph
+        .blocks
+        .iter()
+        .find(|block| block.id == block_id)
+        .and_then(|block| block.operations.get(idx))?;
+    match &op.kind {
+        OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            ..
+        } => Some(segments.clone()),
+        _ => None,
+    }
+}
+
+/// `fn f(cp: usize, n: usize)` passed as `charpsize2str`'s char pointer:
+/// `cast_int_to_ptr` result reaches the call; the Input stays an integer.
+#[test]
+fn usize_cp_to_charpsize2str_is_cast_int_to_ptr() {
+    let graph = lower_cp_arg_to_charpsize2str("usize_cp_charpsize2str", window_usize(), vec![], 0);
+    let input = graph_input_named(&graph, "cp");
+    assert!(
+        !input
+            .concretetype()
+            .as_ref()
+            .is_some_and(super::lltype_is_ccharp),
+        "usize Input is not stamped CCHARP; ct={:?} graph={}",
+        input.concretetype(),
+        graph.dump()
+    );
+    let cp = charpsize2str_call_cp(&graph);
+    assert_ne!(
+        cp,
+        *input,
+        "cast_int_to_ptr result reaches the call, not the Input; graph={}",
+        graph.dump()
+    );
+    assert!(
+        cp.concretetype()
+            .as_ref()
+            .is_some_and(super::lltype_is_ccharp),
+        "call cp is CCHARP; ct={:?} graph={}",
+        cp.concretetype(),
+        graph.dump()
+    );
+    let producer = call_producer_leaf(&graph, &cp);
+    assert_eq!(
+        producer.as_ref().and_then(|s| s.last()).map(String::as_str),
+        Some("cast_int_to_ptr"),
+        "cp producer is cast_int_to_ptr; producer={producer:?} graph={}",
+        graph.dump()
+    );
+}
+
+/// `fn f(cp: *const u8, n: usize)`: the Input is already CCHARP and
+/// reaches `charpsize2str` with no cast.
+#[test]
+fn raw_u8_cp_to_charpsize2str_is_the_input() {
+    let graph =
+        lower_cp_arg_to_charpsize2str("raw_u8_cp_charpsize2str", window_const_u8_ptr(), vec![], 0);
+    let input = graph_input_named(&graph, "cp");
+    assert!(
+        input
+            .concretetype()
+            .as_ref()
+            .is_some_and(super::lltype_is_ccharp),
+        "*const u8 Input is CCHARP; ct={:?} graph={}",
+        input.concretetype(),
+        graph.dump()
+    );
+    let cp = charpsize2str_call_cp(&graph);
+    assert_eq!(
+        cp,
+        *input,
+        "*const u8 Input reaches the call; graph={}",
+        graph.dump()
+    );
+    let producer = call_producer_leaf(&graph, &cp);
+    let producer_leaf = producer.as_ref().and_then(|s| s.last()).map(String::as_str);
+    assert!(
+        producer_leaf != Some("cast_int_to_ptr") && producer_leaf != Some("cast"),
+        "*const u8 Input is not recast; producer={producer_leaf:?} graph={}",
+        graph.dump()
+    );
+}
+
+fn i8_alias_decl() -> serde_json::Value {
+    type_decl_alias(0, &["fixture", "I8Alias"], i8_ty())
+}
+
+fn raw_const_i8_alias_ptr() -> serde_json::Value {
+    serde_json::json!({
+        "RawPtr": [{
+            "Adt": {"id": 0, "generics": window_empty_generics()}
+        }, "Const"]
+    })
+}
+
+fn charpsize2str_i8_cp_call_leafs(graph: &crate::model::FunctionGraph) -> Vec<Vec<String>> {
+    use crate::model::{CallTarget, OpKind};
+    graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .filter_map(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } => Some(segments.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// `fn f(cp: *const i8)` and `fn f(cp: *const I8Alias)` (`type I8Alias = i8`)
+/// emit the same ops: one `rffi.cast` (`ForceCastEntry`), not a stamp.
+#[test]
+fn raw_i8_cp_to_charpsize2str_is_rffi_cast_same_as_alias() {
+    let direct =
+        lower_cp_arg_to_charpsize2str("raw_i8_cp_charpsize2str", window_const_i8_ptr(), vec![], 0);
+    let aliased = lower_cp_arg_to_charpsize2str(
+        "raw_i8_alias_cp_charpsize2str",
+        raw_const_i8_alias_ptr(),
+        vec![i8_alias_decl()],
+        1,
+    );
+    for (label, graph) in [("direct *const i8", &direct), ("*const I8Alias", &aliased)] {
+        let input = graph_input_named(graph, "cp");
+        assert!(
+            !input
+                .concretetype()
+                .as_ref()
+                .is_some_and(super::lltype_is_ccharp),
+            "{label} Input is not stamped CCHARP; ct={:?} graph={}",
+            input.concretetype(),
+            graph.dump()
+        );
+        let cp = charpsize2str_call_cp(graph);
+        assert_ne!(
+            cp,
+            *input,
+            "{label} rffi.cast result reaches the call; graph={}",
+            graph.dump()
+        );
+        assert!(
+            cp.concretetype()
+                .as_ref()
+                .is_some_and(super::lltype_is_ccharp),
+            "{label} call cp is CCHARP; ct={:?} graph={}",
+            cp.concretetype(),
+            graph.dump()
+        );
+        let producer = call_producer_leaf(graph, &cp)
+            .unwrap_or_else(|| panic!("{label} cp has a Call producer; graph={}", graph.dump()));
+        assert_eq!(
+            producer.as_slice(),
+            ["rpython", "rtyper", "lltypesystem", "rffi", "cast"],
+            "{label} is one rffi.cast; producer={producer:?} graph={}",
+            graph.dump()
+        );
+        let leafs = window_call_leafs(graph);
+        assert!(
+            !leafs.iter().any(|leaf| leaf.as_str() == "cast_ptr_to_int"),
+            "{label} is not cast_ptr_to_int + cast_int_to_ptr; leafs={leafs:?} graph={}",
+            graph.dump()
+        );
+        assert!(
+            !leafs.iter().any(|leaf| leaf.as_str() == "cast_int_to_ptr"),
+            "{label} is not cast_int_to_ptr; leafs={leafs:?} graph={}",
+            graph.dump()
+        );
+    }
+    assert_eq!(
+        charpsize2str_i8_cp_call_leafs(&direct),
+        charpsize2str_i8_cp_call_leafs(&aliased),
+        "direct *const i8 and *const I8Alias emit the same Call sequence; \
+         direct={} aliased={}",
+        direct.dump(),
+        aliased.dump()
+    );
+}
+
+/// First Call whose path leaf is `leaf`, as Variables. Two CCHARP
+/// actuals live in one startblock Call so SSI renaming does not hide
+/// the Input producer (`resolve_to_producer_op` walks links that exist
+/// only after the predecessor terminator is emitted).
+fn call_args_for_leaf(
+    graph: &crate::model::FunctionGraph,
+    leaf: &str,
+) -> Vec<crate::flowspace::model::Variable> {
+    use crate::model::{CallTarget, LinkArg, OpKind};
+    for op in graph.blocks.iter().flat_map(|block| &block.operations) {
+        let OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            args,
+            ..
+        } = &op.kind
+        else {
+            continue;
+        };
+        if segments.last().map(String::as_str) != Some(leaf) {
+            continue;
+        }
+        return args
+            .iter()
+            .map(|arg| match arg {
+                LinkArg::Value(v) => v.clone(),
+                other => panic!(
+                    "{leaf} arg is a Variable, got {other:?}; graph={}",
+                    graph.dump()
+                ),
+            })
+            .collect();
+    }
+    panic!(
+        "{leaf} is called; leafs={:?} graph={}",
+        window_call_leafs(graph),
+        graph.dump()
+    );
+}
+
+/// `fn f(cp: &[u8], cp_len: *const i8)`: the generated length Input of
+/// `cp` is named `cp_len`, the same as the real pointer parameter.
+/// Classification uses the Input's recorded parameter position
+/// (`HighLevelOp.inputarg` / `args_v[arg]`), so the length word is
+/// `cast_int_to_ptr` and the pointer is one `rffi.cast`. Both uses are
+/// actuals of one startblock Call: a later-block Call would rename the
+/// Input onto a block inputarg before the predecessor Link exists.
+#[test]
+fn slice_cp_len_name_collision_classifies_by_position() {
+    use crate::model::{InputParam, OpKind};
+
+    let shared = window_shared_slice();
+    let cp_len_ty = window_const_i8_ptr();
+    let usize_ty = window_usize();
+    let i64_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}});
+    let (unwind, ret) = window_unwind_and_return_blocks();
+    let sink = window_opaque_fun(
+        1,
+        &["fixture", "sink"],
+        vec![window_mut_u8_ptr(), window_mut_u8_ptr()],
+        i64_ty.clone(),
+    );
+    let cp_place = window_place(serde_json::json!({"Local": 1}), &shared);
+    let len_place = window_place(
+        serde_json::json!({"Projection": [cp_place, "PtrMetadata"]}),
+        &usize_ty,
+    );
+    let caller = serde_json::json!({
+        "def_id": 0,
+        "item_meta": window_meta(&["fixture", "slice_cp_len_collision"], true),
+        "signature": {
+            "is_unsafe": true,
+            "inputs": [shared, cp_len_ty],
+            "output": i64_ty
+        },
+        "body": {"Unstructured": {
+            "span": window_span(),
+            "locals": {"arg_count": 2, "locals": [
+                window_local(0, &i64_ty),
+                named_window_local(1, "cp", &shared),
+                named_window_local(2, "cp_len", &cp_len_ty)
+            ]},
+            "body": [
+                {
+                    "statements": [],
+                    "kind": "Regular",
+                    "terminator": {"span": window_span(), "kind": {"Call": {"call": {
+                        "func": {"Regular": {
+                            "kind": {"Fun": 1},
+                            "generics": window_empty_generics()
+                        }},
+                        "args": [
+                            {"Read": len_place},
+                            {"Read": window_place(serde_json::json!({"Local": 2}), &cp_len_ty)}
+                        ]}, "dest": window_place(serde_json::json!({"Local": 0}), &i64_ty), "target": 2, "on_unwind": 1}}}
+                },
+                unwind,
+                ret
+            ]
+        }}
+    });
+    let llbc = window_llbc(vec![], vec![caller, sink]);
+    let graph = crate::test_support::lower_function(&llbc, "slice_cp_len_collision")
+        .unwrap_or_else(|err| panic!("lower slice_cp_len_collision: {err:?}"));
+
+    let start_inputs: Vec<_> = graph
+        .block(graph.startblock)
+        .operations
+        .iter()
+        .filter_map(|op| match &op.kind {
+            OpKind::Input { name, param, .. } => Some((name.as_str(), *param, op.result.as_ref()?)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        start_inputs
+            .iter()
+            .map(|(name, param, _)| (*name, *param))
+            .collect::<Vec<_>>(),
+        vec![
+            ("cp", Some(InputParam::Data(1))),
+            ("cp_len", Some(InputParam::Length(1))),
+            ("cp_len", Some(InputParam::Whole(2))),
+        ],
+        "Inputs record parameter position, not name; graph={}",
+        graph.dump()
+    );
+    let length_word = start_inputs[1].2;
+    let real_cp_len = start_inputs[2].2;
+
+    let args = call_args_for_leaf(&graph, "sink");
+    assert_eq!(
+        args.len(),
+        2,
+        "sink takes two CCHARP actuals; leafs={:?} graph={}",
+        window_call_leafs(&graph),
+        graph.dump()
+    );
+    assert_ne!(
+        args[0],
+        *length_word,
+        "length word goes through cast_int_to_ptr, not in place; graph={}",
+        graph.dump()
+    );
+    assert_eq!(
+        call_producer_leaf(&graph, &args[0])
+            .as_ref()
+            .and_then(|s| s.last())
+            .map(String::as_str),
+        Some("cast_int_to_ptr"),
+        "slice length used as CCHARP is cast_int_to_ptr; producer={:?} graph={}",
+        call_producer_leaf(&graph, &args[0]),
+        graph.dump()
+    );
+    assert_ne!(
+        args[1],
+        *real_cp_len,
+        "real cp_len goes through rffi.cast, not in place; graph={}",
+        graph.dump()
+    );
+    let real_producer = call_producer_leaf(&graph, &args[1])
+        .unwrap_or_else(|| panic!("real cp_len has a Call producer; graph={}", graph.dump()));
+    assert_eq!(
+        real_producer.as_slice(),
+        ["rpython", "rtyper", "lltypesystem", "rffi", "cast"],
+        "real *const i8 cp_len is one rffi.cast; producer={real_producer:?} graph={}",
+        graph.dump()
     );
 }
 
@@ -49941,6 +52963,7 @@ fn w_str_from_storage_payload_len_is_strlen() {
                 name,
                 ty,
                 class_root,
+                ..
             } => Some((name.clone(), format!("{ty:?}"), class_root.clone())),
             _ => None,
         })

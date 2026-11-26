@@ -189,7 +189,7 @@ pub unsafe fn w_dict_store_identity_strategy(
 /// `dictmultiobject.py AbstractTypedStrategy.switch_to_object_strategy`
 /// instantiation for IdentityDictStrategy — `wrap` is identity (`:26-27`), so
 /// the migration ports each `IdentityKey(obj)` into
-/// `ObjectKey { hash: hash_w(obj), obj }` without rewrapping keys.
+/// `ObjectKey(obj)` with `hash_w(obj)` stored in `Entry.f_hash`.
 ///
 /// Residualised (`@dont_look_inside`, `rlib/jit.py`) for the reason
 /// `dictmultiobject::w_dict_switch_int_to_object_strategy` is: the body is
@@ -215,10 +215,10 @@ pub unsafe fn w_dict_switch_identity_to_object_strategy(w_dict: PyObjectRef) {
     let mut next = 0;
     while let Some(i) = old.next_valid_slot(next) {
         let k = old.get_slot(i).unwrap().0.0;
-        let object_key = crate::dictmultiobject::object_key_for(k);
+        let (object_key, hash) = crate::dictmultiobject::object_key_for(k);
         let v = *old.get_slot(i).unwrap().1;
-        hashes.push(object_key.hash);
-        roots.publish(&[object_key.obj, v]);
+        hashes.push(hash);
+        roots.publish(&[object_key.0, v]);
         next = i + 1;
     }
     // Box the empty `RDict` before insert. A stack array would be unrooted
@@ -231,7 +231,7 @@ pub unsafe fn w_dict_switch_identity_to_object_strategy(w_dict: PyObjectRef) {
     for (i, &hash) in hashes.iter().enumerate() {
         let obj = roots.get(pairs_base + 2 * i);
         let value = roots.get(pairs_base + 2 * i + 1);
-        new_map.insert(crate::dictmultiobject::ObjectKey { hash, obj }, value);
+        new_map.insert_with_hash(hash as u64, crate::dictmultiobject::ObjectKey(obj), value);
     }
     crate::dictmultiobject::install_object_dict_storage(roots.get(dict_slot), new_storage);
 }
@@ -306,7 +306,7 @@ impl DictStrategy for IdentityDictStrategy {
     /// `dictmultiobject.py AbstractTypedStrategy.switch_to_object_strategy`
     /// instantiation for IdentityDictStrategy — `wrap` is identity
     /// (`:26-27`), so the migration ports each `IdentityKey(obj)` into
-    /// `ObjectKey { hash: hash_w(obj), obj }` without rewrapping keys.
+    /// `ObjectKey(obj)` with `hash_w(obj)` stored in `Entry.f_hash`.
     unsafe fn switch_to_object_strategy(&self, w_dict: PyObjectRef) -> bool {
         w_dict_switch_identity_to_object_strategy(w_dict);
         true

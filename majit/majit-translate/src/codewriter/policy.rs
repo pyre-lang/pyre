@@ -798,6 +798,7 @@ mod tests {
                 name: "x".into(),
                 ty: ValueType::Int128,
                 class_root: None,
+                param: None,
             },
             true,
         );
@@ -851,6 +852,7 @@ mod tests {
                 name: "x".into(),
                 ty: ValueType::SingleFloat,
                 class_root: None,
+                param: None,
             },
             true,
         );
@@ -890,6 +892,7 @@ mod tests {
                     name: "x".into(),
                     ty,
                     class_root: None,
+                    param: None,
                 },
                 true,
             );
@@ -904,6 +907,7 @@ mod tests {
                 name: "x".into(),
                 ty: ValueType::Int,
                 class_root: None,
+                param: None,
             },
             true,
         );
@@ -926,6 +930,7 @@ mod tests {
                 name: "x".into(),
                 ty: ValueType::UInt128,
                 class_root: None,
+                param: None,
             },
             true,
         );

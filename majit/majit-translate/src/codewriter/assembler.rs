@@ -5790,6 +5790,7 @@ fn describe_space_op_producer(op: &crate::model::SpaceOperation) -> String {
             name,
             ty,
             class_root,
+            ..
         } => format!("Input {name} ty={ty:?} class_root={class_root:?}"),
         kind => op_kind_to_opname(kind),
     }
@@ -10480,6 +10481,7 @@ mod tests {
                     name: name.into(),
                     ty,
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -14813,6 +14815,7 @@ mod tests {
                         name,
                         ty,
                         class_root,
+                        ..
                     },
                 ) if name == "p" => {
                     assert_eq!(
@@ -15089,6 +15092,7 @@ mod tests {
                         name,
                         ty,
                         class_root,
+                        ..
                     },
                 ) if name == "p" => {
                     assert_eq!(
@@ -16171,6 +16175,7 @@ mod tests {
                     name: "block".into(),
                     ty: ValueType::Ref(None),
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -16973,6 +16978,7 @@ mod tests {
                     name: "block".into(),
                     ty: ValueType::Ref(None),
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -16984,6 +16990,7 @@ mod tests {
                     name: "i".into(),
                     ty: ValueType::Int,
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -17243,6 +17250,7 @@ mod tests {
                     name: "x".into(),
                     ty: crate::model::ValueType::Int,
                     class_root: None,
+                    param: None,
                 },
             })],
             num_blocks: 1,

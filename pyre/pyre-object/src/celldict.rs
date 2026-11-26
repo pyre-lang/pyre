@@ -1528,7 +1528,7 @@ impl crate::dictmultiobject::DictStrategy for ModuleDictStrategy {
             // stays valid until `version` is reassigned. `delitem` pairs the
             // two calls the same way on the object-storage arm.
             crate::dictmultiobject::w_dict_bump_keys_version(w_dict);
-            return Some((k.obj, v));
+            return Some((k.0, v));
         }
         let strategy = crate::dictmultiobject::w_module_dict_module_strategy_mut(w_dict);
         let storage = crate::dictmultiobject::w_module_dict_module_storage_mut(w_dict);
@@ -1546,7 +1546,7 @@ impl crate::dictmultiobject::DictStrategy for ModuleDictStrategy {
     /// `:208 wrapvalue`.
     unsafe fn getiterreversed(&self, w_dict: PyObjectRef) -> Vec<(PyObjectRef, PyObjectRef)> {
         if let Some(entries) = crate::dictmultiobject::w_module_dict_object_storage(w_dict) {
-            return entries.iter().rev().map(|(k, &v)| (k.obj, v)).collect();
+            return entries.iter().rev().map(|(k, &v)| (k.0, v)).collect();
         }
         let storage = crate::dictmultiobject::w_module_dict_module_storage(w_dict);
         storage

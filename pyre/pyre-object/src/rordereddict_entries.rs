@@ -69,8 +69,7 @@ impl GcRefOffsets for crate::pyobject::PyObjectRef {
 }
 
 impl GcRefOffsets for crate::dictmultiobject::ObjectKey {
-    const GC_REF_OFFSETS: &'static [usize] =
-        &[std::mem::offset_of!(crate::dictmultiobject::ObjectKey, obj)];
+    const GC_REF_OFFSETS: &'static [usize] = &[0];
 }
 
 impl GcRefOffsets for crate::identitydict::IdentityKey {
@@ -479,14 +478,11 @@ mod tests {
         let value_base = std::mem::offset_of!(Entry<Key, Value>, value);
         assert_eq!(
             entry_gc_ref_offsets::<Key, Value>(),
-            vec![key_base + std::mem::offset_of!(Key, obj), value_base + 0,]
+            vec![key_base + 0, value_base + 0,]
         );
 
         let unit_key = std::mem::offset_of!(Entry<Key, ()>, key);
-        assert_eq!(
-            entry_gc_ref_offsets::<Key, ()>(),
-            vec![unit_key + std::mem::offset_of!(Key, obj)]
-        );
+        assert_eq!(entry_gc_ref_offsets::<Key, ()>(), vec![unit_key + 0]);
         assert!(<()>::GC_REF_OFFSETS.is_empty());
     }
 

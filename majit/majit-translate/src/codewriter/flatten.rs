@@ -1840,6 +1840,7 @@ mod tests {
                     name: "owner".into(),
                     ty: ValueType::Ref(None),
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -2332,6 +2333,7 @@ mod tests {
                     name: "a".into(),
                     ty: crate::model::ValueType::Int,
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -3068,6 +3070,7 @@ mod tests {
                     name: "obj".into(),
                     ty: ValueType::Ref(None),
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -3079,6 +3082,7 @@ mod tests {
                     name: "flag".into(),
                     ty: ValueType::Int,
                     class_root: None,
+                    param: None,
                 },
                 true,
             )

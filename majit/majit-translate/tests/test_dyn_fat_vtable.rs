@@ -525,6 +525,7 @@ fn trait_method_graph(name: &str, extra_args: usize, return_type: &str) -> Funct
                 name: "self".into(),
                 ty: ValueType::Ref(None),
                 class_root: None,
+                param: None,
             },
             true,
         )
@@ -537,6 +538,7 @@ fn trait_method_graph(name: &str, extra_args: usize, return_type: &str) -> Funct
                     name: format!("a{i}"),
                     ty: ValueType::Ref(None),
                     class_root: None,
+                    param: None,
                 },
                 true,
             )

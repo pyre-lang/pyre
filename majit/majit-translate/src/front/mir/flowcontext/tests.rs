@@ -26,11 +26,11 @@ use crate::front::mir::tests::{
     calls_leaf, code_struct, control_flow_enum, count_branch_calls, count_method_calls, disc_site,
     empty_llbc, empty_struct_attrs, fixture_item_meta, fixture_llbc, graph_call_leaves, graph_ops,
     i64_field, ident_path, interior_bb, interior_caller, interior_i64, interior_local,
-    interior_meta, interior_opaque, interior_raw_mut, interior_return, interior_usize,
-    leftover_fmt_message_paths, llbc_with_types, lower_object_fn, named_adt, ok_ctor_shape,
-    option_adt_node, option_enum, option_int_arg, option_ok_or_else_site, push_fn_const,
-    replace_struct_ctors, result_adt_node, result_enum, rows, same_as_count, some_ctor_ops,
-    some_ctor_shape, struct_ctor_graph, struct_ctor_ops, struct_decl, struct_news,
+    interior_meta, interior_opaque, interior_raw_mut, interior_return, interior_struct,
+    interior_usize, leftover_fmt_message_paths, llbc_with_types, lower_object_fn, named_adt,
+    ok_ctor_shape, option_adt_node, option_enum, option_int_arg, option_ok_or_else_site,
+    push_fn_const, replace_struct_ctors, result_adt_node, result_enum, rows, same_as_count,
+    some_ctor_ops, some_ctor_shape, struct_ctor_graph, struct_ctor_ops, struct_decl, struct_news,
     type_decl_struct, tyref_to_attr_value_type, window_call_leafs, window_empty_generics,
     window_graph_ops, window_llbc, window_local, window_meta, window_mut_u8_ptr, window_opaque_fun,
     window_place, window_shared_slice, window_slice, window_span, window_u8,
@@ -327,6 +327,7 @@ fn inline_vec_field_part_uses_ssi_local_as_field_read_base() {
                 name: "holder".into(),
                 ty: ValueType::Ref(Some("Holder".into())),
                 class_root: None,
+                param: None,
             },
             true,
         )
@@ -389,6 +390,7 @@ fn dyn_receiver_data_word_uses_ssi_local_as_field_read_base() {
                 name: "strategy".into(),
                 ty: ValueType::Ref(Some("Strategy".into())),
                 class_root: None,
+                param: None,
             },
             true,
         )
@@ -4990,6 +4992,7 @@ fn single_arg_display_fmt_fixture_spill(
                 name: "ctx".to_string(),
                 ty: ValueType::Ref(Some(root.to_string())),
                 class_root: Some(root.to_string()),
+                param: None,
             },
         });
     }
@@ -5236,6 +5239,7 @@ fn collapse_fmt_chains_expands_lower_hex_to_mod_pct_x() {
             name: "n".into(),
             ty: ValueType::Int,
             class_root: None,
+            param: None,
         },
     });
     let tuple = Variable::new();
@@ -5778,6 +5782,7 @@ fn single_arg_lower_hex_fmt_graph(
             name: "n".into(),
             ty: value_ty.clone(),
             class_root: None,
+            param: None,
         },
     });
     let tuple = Variable::new();
@@ -6022,6 +6027,7 @@ fn peel_call_scoped_fmt_arg_spill_sees_function_scope_cell() {
             name: "n".to_string(),
             ty: ValueType::Int,
             class_root: None,
+            param: None,
         },
     });
     graph.block_mut(b0).operations.push(SpaceOperation {
@@ -6115,6 +6121,7 @@ fn peel_call_scoped_fmt_arg_spill_sees_join_phi_cell() {
             name: "n".to_string(),
             ty: ValueType::Int,
             class_root: None,
+            param: None,
         },
     });
     graph.block_mut(alloc_bb).operations.push(SpaceOperation {
@@ -6220,6 +6227,7 @@ fn peel_call_scoped_fmt_arg_spill_sees_loop_carried_cell() {
             name: "n".to_string(),
             ty: ValueType::Int,
             class_root: None,
+            param: None,
         },
     });
     graph.block_mut(alloc_bb).operations.push(SpaceOperation {
@@ -6373,6 +6381,7 @@ fn collapse_fmt_chains_masks_signed_i8_hex_to_width() {
             name: "n".into(),
             ty: ValueType::Int,
             class_root: None,
+            param: None,
         },
     });
     let tuple = Variable::new();
@@ -6874,10 +6883,6 @@ fn class_identity_spelling_of_string_family_and_object_roots() {
         super::W_ROOT_CLASS_ROOT
     );
     assert_eq!(
-        super::class_identity_spelling("pyre_object::dictmultiobject::ObjectKey", &empty),
-        super::OBJECT_KEY_CLASS_ROOT
-    );
-    assert_eq!(
         super::class_identity_spelling("pyre_object::unicodeobject::Utf8Str", &empty),
         "unicodeobject::Utf8Str"
     );
@@ -6911,6 +6916,45 @@ fn class_identity_spelling_of_string_family_and_object_roots() {
     assert_eq!(
         super::class_identity_spelling("rustpython_wtf8::Wtf8Buf", &empty),
         "Wtf8Buf"
+    );
+}
+
+/// `ObjectKey` is `repr(transparent)` over the object pointer
+/// (`rordereddict.py` `get_ll_dict` DICTKEY = OBJECTPTR). Harvest records
+/// that inner; there is no class-root recast onto the wrapper.
+#[test]
+fn object_key_transparent_inner_field_is_the_pointer() {
+    let raw_object = serde_json::json!({"RawPtr": [adt_node(0), "Mut"]});
+    let llbc = llbc_with_types(
+        "pyre_object",
+        vec![
+            type_decl_struct(0, &["pyre_object", "pyobject", "PyObject"], vec![]),
+            interior_struct(
+                1,
+                &["pyre_object", "dictmultiobject", "ObjectKey"],
+                &[("__pos_0", raw_object)],
+                8,
+                &[0],
+                true,
+            ),
+        ],
+        vec![],
+    );
+    let (_, _, fields, _, _, _, _, _) = super::derive_program_metadata(
+        &llbc,
+        &super::harvest_declared_gc_facts(&llbc).gc_struct_ids(),
+        super::no_immutable_fields(),
+        &std::collections::HashSet::new(),
+        &[],
+    );
+    let inner = fields
+        .transparent_inner_field("dictmultiobject::ObjectKey")
+        .or_else(|| fields.transparent_inner_field("ObjectKey"))
+        .expect("ObjectKey records its transparent inner");
+    assert!(
+        crate::front::typestr::peel_pointer_prefix(&inner)
+            .is_some_and(|pointee| pointee.contains("PyObject")),
+        "ObjectKey inner is the object pointer, got {inner}"
     );
 }
 
@@ -6979,6 +7023,7 @@ fn collapse_fmt_chains_quotes_debug_of_str() {
             name: "ctx".into(),
             ty: ValueType::Str,
             class_root: None,
+            param: None,
         },
     });
     let tuple = Variable::new();
@@ -8852,6 +8897,7 @@ fn module_dict_strategy_getitem_str_self_names_class_root() {
                     name,
                     ty,
                     class_root,
+                    ..
                 } => Some((name.clone(), ty.clone(), class_root.clone())),
                 _ => None,
             })
@@ -9902,6 +9948,7 @@ fn closure_env_upvar_read_annotates_through_function_path() {
                 name,
                 ty,
                 class_root,
+                ..
             } => Some((name.clone(), ty.clone(), class_root.clone())),
             _ => None,
         })
@@ -10553,6 +10600,7 @@ fn vec_index_retargets_each_receiver_shape() {
                     name: name.into(),
                     ty: ValueType::Ref(None),
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -10664,6 +10712,7 @@ fn vec_set_len_write_keeps_the_struct_owner() {
                 name: "frame".into(),
                 ty: ValueType::Ref(None),
                 class_root: None,
+                param: None,
             },
             true,
         )
@@ -10701,6 +10750,7 @@ fn vec_set_len_write_keeps_the_struct_owner() {
                 name: "v".into(),
                 ty: ValueType::Ref(None),
                 class_root: None,
+                param: None,
             },
             true,
         )
@@ -10726,6 +10776,7 @@ fn shared_inline_vec_len_and_index_keep_the_field_read() {
                 name: "frame".into(),
                 ty: ValueType::Ref(None),
                 class_root: None,
+                param: None,
             },
             true,
         )
@@ -10818,6 +10869,7 @@ fn gcref_field_cast_to_tuple_graph_annotates_sometuple_and_pos0_list() {
                 name: "dstorage".to_string(),
                 ty: ValueType::Ref(None),
                 class_root: Some("GCREF".to_string()),
+                param: None,
             },
             true,
         )
@@ -13785,6 +13837,7 @@ fn frame_anchor_live_input_is_the_frame_ref() {
                 name,
                 ty,
                 class_root,
+                ..
             } if name == "self" => Some((ty.clone(), class_root.clone())),
             _ => None,
         })
@@ -14847,6 +14900,7 @@ fn melt_abort_fixture_input(
                 name: name.into(),
                 ty: ValueType::Ref(Some("Obj".into())),
                 class_root: None,
+                param: None,
             },
             true,
         )

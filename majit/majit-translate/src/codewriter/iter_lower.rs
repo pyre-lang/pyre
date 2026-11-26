@@ -755,6 +755,7 @@ mod tests {
                 name: "n".into(),
                 ty: ValueType::Int,
                 class_root: None,
+                param: None,
             },
             n.clone(),
         );
@@ -903,6 +904,7 @@ mod tests {
                 name: "args_w".into(),
                 ty: ValueType::Ref(None),
                 class_root: None,
+                param: None,
             },
             l.clone(),
         );

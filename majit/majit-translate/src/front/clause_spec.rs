@@ -701,6 +701,96 @@ pub(crate) fn identity_unstructured(ty: &TyRef) -> Option<Unstructured> {
     Some(u)
 }
 
+/// `fn to_string(s: T) -> String { str(s) }` as an Unstructured body: one
+/// Call of `fn_id` on arg0. `unaryop.py` `SomeObject.str` annotates a
+/// fresh `SomeString()`; `rmodel.py` `Repr.rtype_str` emits
+/// `gendirectcall(self.ll_str, v)` (`rstr.py` `AbstractStringRepr.ll_str`).
+/// alloc extracts as Opaque; `FunctionDesc.getuniquegraph` still builds
+/// this graph (`description.py` `specialize`, `bookkeeper.py` `getdesc`).
+/// The Call is the same FunDecl the direct-call arm of `lower_call`
+/// lowers to `UnaryOp "str"`; that arm returns before `enqueue_spec`,
+/// so the copy does not re-enter `declare_spec`.
+pub(crate) fn to_string_str_unstructured(
+    fn_id: u64,
+    arg_ty: &TyRef,
+    dest_ty: &TyRef,
+) -> Option<Unstructured> {
+    let ty_json = |ty: &TyRef| match ty {
+        TyRef::Dedup { id } => serde_json::json!({"Deduplicated": id}),
+        TyRef::Inline { value: (id, body) } => serde_json::json!({"Value": [id, body]}),
+        TyRef::Other(v) => serde_json::Value::clone(v),
+    };
+    let arg_json = ty_json(arg_ty);
+    let dest_json = ty_json(dest_ty);
+    let span = serde_json::json!({
+        "data": {
+            "file_id": 0,
+            "beg": {"line": 1, "col": 0},
+            "end": {"line": 1, "col": 1}
+        }
+    });
+    let local = |index: u64, name: Option<&str>, ty: &Value| {
+        serde_json::json!({
+            "index": index,
+            "name": name,
+            "span": span,
+            "ty": ty
+        })
+    };
+    let place = |index: u64, ty: &Value| {
+        serde_json::json!({
+            "kind": {"Local": index},
+            "ty": ty
+        })
+    };
+    let value = serde_json::json!({
+        "locals": {
+            "arg_count": 1,
+            "locals": [
+                local(0, None, &dest_json),
+                local(1, Some("s"), &arg_json)
+            ]
+        },
+        "span": span,
+        "body": [
+            {
+                "statements": [],
+                "terminator": {
+                    "span": span,
+                    "kind": {
+                        "Call": {
+                            "call": {
+                                "func": {
+                                    "Regular": {
+                                        "kind": {"Fun": fn_id},
+                                        "generics": {
+                                            "regions": [],
+                                            "types": [],
+                                            "const_generics": [],
+                                            "trait_refs": []
+                                        }
+                                    }
+                                },
+                                "args": [{"Read": place(1, &arg_json)}]
+                            },
+                            "dest": place(0, &dest_json),
+                            "target": 1,
+                            "on_unwind": 1
+                        }
+                    }
+                }
+            },
+            {
+                "statements": [],
+                "terminator": {"span": span, "kind": "Return"}
+            }
+        ]
+    });
+    let mut u: Unstructured = serde_json::from_value(value).ok()?;
+    duplicate_return(&mut u);
+    Some(u)
+}
+
 /// Trait-impl id of a resolved trait call. `None` for a `Clause` ref.
 pub(crate) fn resolved_trait_impl_id(payload: &Value, llbc: &Llbc) -> Option<u64> {
     let arr = payload.as_array()?;
@@ -2905,6 +2995,51 @@ mod tests {
             u.body()[0].terminator.kind.get(),
             "\"Return\"",
             "identity terminator is Return"
+        );
+    }
+
+    /// `fn to_string(s: T) -> String { str(s) }` parses as one Call of
+    /// the FunDecl on arg0 and a Return (`FunctionDesc.getuniquegraph`).
+    #[test]
+    fn to_string_str_unstructured_is_call_and_return() {
+        let arg_ty = TyRef::Other(json!({"Adt": {"builtin": "Str"}}).into());
+        let dest_ty = TyRef::Other(
+            json!({
+                "Adt": {
+                    "id": 0,
+                    "builtin": null,
+                    "generics": {
+                        "regions": [],
+                        "types": [],
+                        "const_generics": [],
+                        "trait_refs": []
+                    }
+                }
+            })
+            .into(),
+        );
+        let u = to_string_str_unstructured(7, &arg_ty, &dest_ty).expect("str body");
+        assert_eq!(u.locals.arg_count, 1);
+        assert_eq!(u.locals.locals.len(), 2);
+        assert_eq!(u.body().len(), 2);
+        assert!(
+            u.body()[0].statements.is_empty(),
+            "str body has no statements; the Call is the terminator"
+        );
+        let kind: Value =
+            serde_json::from_str(u.body()[0].terminator.kind.get()).expect("Call terminator JSON");
+        let call = kind
+            .get("Call")
+            .unwrap_or_else(|| panic!("str body terminator is Call; kind={kind}"));
+        assert_eq!(
+            call.pointer("/call/func/Regular/kind/Fun"),
+            Some(&json!(7)),
+            "Call names the same FunDecl; call={call}"
+        );
+        assert_eq!(
+            u.body()[1].terminator.kind.get(),
+            "\"Return\"",
+            "second block returns the Call dest"
         );
     }
 

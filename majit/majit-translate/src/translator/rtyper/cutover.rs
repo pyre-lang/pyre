@@ -4670,6 +4670,15 @@ fn declared_return_annotation(
     if let Some(cell) = bk.transparent_scalar_annotation(root) {
         return Some(cell);
     }
+    // By-value `#[repr(transparent)]` is the unique non-ZST field
+    // (`transparent_nonzst_field`). Residual intern of the wrapper is
+    // the inner intern (`rordereddict.py` `get_ll_dict`; `lltype.py`
+    // `_interior_ptr._expose` of a Ptr field is that pointer).
+    if let Some(inner) = bk.transparent_inner_field(root)
+        && inner != root
+    {
+        return Some(bk.project_struct_field_type(root));
+    }
     // `*mut T` / `*const T` onto a harvested owner is the same
     // annotation an Input or field of that spelling already uses
     // (`project_struct_field_type`). A classed T stays SomeInstance
@@ -4803,6 +4812,11 @@ fn raw_ptr_token_annotation(
     let bk = registry.bookkeeper();
     if let Some(cell) = bk.transparent_scalar_annotation(root) {
         return Some(cell);
+    }
+    if let Some(inner) = bk.transparent_inner_field(root)
+        && inner != root
+    {
+        return Some(bk.project_struct_field_type(root));
     }
     if let Some(cell) = bk.raw_struct_ptr_annotation(root) {
         return Some(cell);
@@ -11535,6 +11549,7 @@ mod tests {
                         name: "value".into(),
                         ty: ValueType::Ref(None),
                         class_root: Some("GCREF".into()),
+                        param: None,
                     },
                 },
                 crate::model::SpaceOperation {
@@ -11543,6 +11558,7 @@ mod tests {
                         name: "arg".into(),
                         ty: ValueType::Ref(None),
                         class_root: None,
+                        param: None,
                     },
                 },
                 crate::model::SpaceOperation {
@@ -12438,6 +12454,7 @@ mod tests {
                     name: "x".into(),
                     ty: ValueType::Int,
                     class_root: None,
+                    param: None,
                 },
             }],
             exitswitch: None,
@@ -12753,6 +12770,7 @@ mod tests {
                     name: "c".into(),
                     ty: ValueType::Bool,
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -13116,6 +13134,7 @@ mod tests {
                     name: "c".into(),
                     ty: ValueType::Bool,
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -18049,6 +18068,7 @@ mod tests {
                     name: "switch".into(),
                     ty: ValueType::Bool,
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -20474,6 +20494,7 @@ mod tests {
                     name: "s".into(),
                     ty: ValueType::Int,
                     class_root: Some(outer.into()),
+                    param: None,
                 },
                 true,
             )
@@ -22823,6 +22844,7 @@ mod tests {
                     name: "conn".into(),
                     ty: ValueType::Ref(None),
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -23120,10 +23142,12 @@ mod tests {
     /// `entry = d.entries[i]` as InteriorPtr of `DICTENTRY`
     /// (`lltype.py` `Struct` in `GcArray`); `entry.key` is
     /// `SomePtr.getattr` (`lltype.py`) / `getinteriorfield`. IdentityKey
-    /// `get_slot` FieldRead `key` of the `entry_at` dest is that getattr.
-    /// Residual `"ref"` with no class root shells classdef-less
-    /// (`valuetype_to_someshell`); official skip is
-    /// `SomeInstance.getattr("key")` on that dest.
+    /// `LiveIter::entry_at` getattr `"key"` reads the CAST dest of
+    /// `entries_item_ptr` (`direct_arrayitems` /
+    /// `instantiated_struct_item_spelling`), not the unsuffixed residual
+    /// return of the graph. Residual `"ref"` with no class root shells
+    /// classdef-less (`valuetype_to_someshell`); official skip is
+    /// `SomeInstance.setattr("__pos_0")` of that getattr.
     #[test]
     fn identitykey_entry_at_dest_interns_someptr_getattr_key() {
         use std::rc::Rc;
@@ -23181,9 +23205,9 @@ mod tests {
         registry.set_struct_fields(Rc::new(program.struct_fields.clone()));
 
         let graph = entry_at.graph();
-        let declared = declared_return_annotation(&registry, graph).unwrap_or_else(|| {
+        let residual = declared_return_annotation(&registry, graph).unwrap_or_else(|| {
             panic!(
-                "IdentityKey entry_at dest intern is SomePtr of DICTENTRY, \
+                "IdentityKey entry_at residual dest intern is SomePtr of DICTENTRY, \
                  return_type={:?} residual_return_type={:?} return_class_root={:?} \
                  semantic_return_class_root={:?}",
                 graph.return_type,
@@ -23192,40 +23216,173 @@ mod tests {
                 entry_at.return_class_root
             )
         });
-        let s_entry = match &declared {
-            SomeValue::Ptr(ptr) => {
-                match &ptr.ll_ptrtype.TO {
-                    PtrTarget::Struct(st) => {
-                        assert_eq!(st._gckind, GcKind::Raw, "DICTENTRY is lltype.Struct");
-                    }
-                    other => panic!(
-                        "IdentityKey entry_at dest SomePtr must point at STRUCT, got {other:?}"
-                    ),
+        match &residual {
+            SomeValue::Ptr(ptr) => match &ptr.ll_ptrtype.TO {
+                PtrTarget::Struct(st) => {
+                    assert_eq!(st._gckind, GcKind::Raw, "DICTENTRY is lltype.Struct");
                 }
-                declared.clone()
-            }
-            SomeValue::InteriorPtr(_) => declared.clone(),
+                other => panic!(
+                    "IdentityKey entry_at residual SomePtr must point at STRUCT, got {other:?}"
+                ),
+            },
+            SomeValue::InteriorPtr(_) => {}
             other => panic!(
-                "IdentityKey entry_at dest intern is SomePtr/SomeInteriorPtr of DICTENTRY, \
+                "IdentityKey entry_at residual intern is SomePtr/SomeInteriorPtr of DICTENTRY, \
                  got {other:?}, return_class_root={:?}",
                 graph.return_class_root
             ),
-        };
+        }
 
-        let mut s_attr = SomeString::new(false, false);
-        s_attr.inner.base.const_box = Some(Constant::new(ConstValue::byte_str("key")));
-        let s_key = match &s_entry {
-            SomeValue::Ptr(ptr) => ptr
-                .getattr(&SomeValue::String(s_attr))
-                .expect("SomePtr.getattr key of DICTENTRY"),
-            SomeValue::InteriorPtr(iptr) => iptr
-                .getattr(&SomeValue::String(s_attr))
-                .expect("SomeInteriorPtr.getattr key of DICTENTRY"),
+        // CAST dest of `entries_item_ptr` (`direct_arrayitems`). Harvest
+        // lookup of a suffixed `Entry<K,V>` returns the template rows;
+        // intern substitutes `??TypeVar#N` from the spelling
+        // (`raw_struct_array_item_lltype_inner`) and peels a
+        // `repr(transparent)` key (`field_row_lltype`).
+        let item = program
+            .struct_fields
+            .fields
+            .keys()
+            .find(|k| {
+                k.contains("rordereddict_entries::Entry<")
+                    && k.contains("IdentityKey")
+                    && k.contains("*mut")
+                    && k.contains("PyObject")
+                    && !k.contains("pyre_object::")
+            })
+            .or_else(|| {
+                program.struct_fields.fields.keys().find(|k| {
+                    k.contains("rordereddict_entries::Entry<")
+                        && k.contains("IdentityKey")
+                        && k.contains("*mut")
+                        && k.contains("PyObject")
+                })
+            })
+            .cloned()
+            .unwrap_or_else(|| {
+                panic!(
+                    "expected instantiated Entry<IdentityKey, *mut PyObject> harvest key, got {:?}",
+                    program
+                        .struct_fields
+                        .fields
+                        .keys()
+                        .filter(|k| k.contains("Entry") && k.contains("IdentityKey"))
+                        .cloned()
+                        .collect::<Vec<_>>()
+                )
+            });
+        let s_entry =
+            crate::front::mir::gcarray_item_struct_ptr_annotation(&program.struct_fields, &item)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "CAST dest of entries_item_ptr intern is SomePtr of DICTENTRY, item={item}"
+                    )
+                });
+        match &s_entry {
+            SomeValue::Ptr(ptr) => match &ptr.ll_ptrtype.TO {
+                PtrTarget::Struct(st) => {
+                    assert_eq!(st._gckind, GcKind::Raw, "DICTENTRY is lltype.Struct");
+                }
+                other => {
+                    panic!("CAST dest SomePtr must point at STRUCT, got {other:?}, item={item}")
+                }
+            },
+            SomeValue::InteriorPtr(_) => {}
+            other => panic!(
+                "CAST dest intern is SomePtr/SomeInteriorPtr of DICTENTRY, got {other:?}, item={item}"
+            ),
+        }
+
+        let field_attr = |name: &str| {
+            let mut s_attr = SomeString::new(false, false);
+            s_attr.inner.base.const_box = Some(Constant::new(ConstValue::byte_str(name)));
+            SomeValue::String(s_attr)
+        };
+        let getattr_entry = |attr: &SomeValue| match &s_entry {
+            SomeValue::Ptr(ptr) => ptr.getattr(attr),
+            SomeValue::InteriorPtr(iptr) => iptr.getattr(attr),
             other => panic!("entry dest intern must stay SomePtr, got {other:?}"),
         };
+        // `value` is a plain `*mut PyObject`; `key` is
+        // `repr(transparent)` over that same pointer (`identitydict.py`).
+        // `field_row_lltype` intern's a classed instance pointer as
+        // `rclass.py` `OBJECTPTR` (`InstanceRepr.lowleveltype`);
+        // `lltype.py` `SomePtr.getattr` of that field stays SomePtr.
+        let s_key = getattr_entry(&field_attr("key")).expect("SomePtr.getattr key of DICTENTRY");
+        let s_value =
+            getattr_entry(&field_attr("value")).expect("SomePtr.getattr value of DICTENTRY");
+        let key_ll = match &s_entry {
+            SomeValue::Ptr(ptr) => match &ptr.ll_ptrtype.TO {
+                PtrTarget::Struct(st) => st.getattr_field_type("key"),
+                _ => None,
+            },
+            _ => None,
+        };
+        let value_ll = match &s_entry {
+            SomeValue::Ptr(ptr) => match &ptr.ll_ptrtype.TO {
+                PtrTarget::Struct(st) => st.getattr_field_type("value"),
+                _ => None,
+            },
+            _ => None,
+        };
+        let inner = program
+            .struct_fields
+            .transparent_inner_field("IdentityKey")
+            .or_else(|| {
+                program
+                    .struct_fields
+                    .transparent_inner_field("identitydict::IdentityKey")
+            });
+        let bk = registry.bookkeeper();
+        let s_key_proj = bk.project_struct_field_type("identitydict::IdentityKey");
+        let s_value_proj = bk.project_struct_field_type("*mut pyobject::PyObject");
+        let s_inner_proj = inner
+            .as_deref()
+            .map(|inner| bk.project_struct_field_type(inner));
+        eprintln!(
+            "d22-retry intern item={item} inner={inner:?} \
+             key_ll={key_ll:?} value_ll={value_ll:?} \
+             getattr_key={s_key:?} getattr_value={s_value:?} \
+             project_key={s_key_proj:?} project_value={s_value_proj:?} \
+             project_inner={s_inner_proj:?}"
+        );
+        assert_eq!(
+            key_ll, value_ll,
+            "ITEM key lltype equals the value field lltype, dest={s_entry:?}, item={item}"
+        );
+        let objectptr = |s: &SomeValue, which: &str| match s {
+            SomeValue::Ptr(p) => {
+                use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+                use crate::translator::rtyper::rclass::OBJECTPTR;
+                assert_eq!(
+                    LowLevelType::from(p.ll_ptrtype.clone()),
+                    *OBJECTPTR,
+                    "getattr {which} stays SomePtr(OBJECTPTR), dest={s_entry:?}, item={item}"
+                );
+            }
+            other => panic!(
+                "getattr {which} stays SomePtr(OBJECTPTR), got {other:?}, dest={s_entry:?}, item={item}"
+            ),
+        };
+        objectptr(&s_key, "key");
+        objectptr(&s_value, "value");
+        assert_eq!(
+            s_key_proj.tag(),
+            s_value_proj.tag(),
+            "project_struct_field_type of IdentityKey equals *mut PyObject, \
+             key={s_key_proj:?} value={s_value_proj:?}"
+        );
+        if let Some(s_inner) = s_inner_proj {
+            assert_eq!(
+                s_key_proj.tag(),
+                s_inner.tag(),
+                "project_struct_field_type of IdentityKey equals the harvested inner"
+            );
+        }
+        let s_valid =
+            getattr_entry(&field_attr("f_valid")).expect("SomePtr.getattr f_valid of DICTENTRY");
         assert!(
-            !matches!(&s_key, SomeValue::Instance(inst) if inst.classdef.is_none()),
-            "getattr key must not be classdef-less, got {s_key:?}"
+            matches!(&s_valid, SomeValue::Bool(_)),
+            "getattr f_valid stays Bool, got {s_valid:?}"
         );
     }
 
@@ -23262,6 +23419,7 @@ mod tests {
                     name: "block".to_string(),
                     ty: ValueType::Ref(None),
                     class_root: Some(owner.to_string()),
+                    param: None,
                 },
                 true,
             )

@@ -1857,12 +1857,34 @@ fn raw_scalar_address_spill_leaves_other_arguments_as_the_word() {
             input_var(&graph, "flag"),
             "{label}: flag"
         );
-        assert_eq!(
-            call_arg(call, 1),
-            input_var(&graph, word_name),
-            "{label}: the argument stays the word\n{}",
-            op_lines(&graph)
-        );
+        let word = input_var(&graph, word_name);
+        let arg1 = call_arg(call, 1);
+        if label == "&mut u8 into *mut u8" {
+            // Declared integer / `&mut u8` is not CCHARP (`ann_cast_int_to_ptr`).
+            assert_ne!(
+                arg1,
+                word,
+                "{label}: cast_int_to_ptr result reaches the call, not the Input\n{}",
+                op_lines(&graph)
+            );
+            match defining_op(&graph, arg1) {
+                Some(OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                }) if segments.last().map(String::as_str) == Some("cast_int_to_ptr") => {}
+                other => panic!(
+                    "{label}: producer is cast_int_to_ptr, got {other:?}\n{}",
+                    op_lines(&graph)
+                ),
+            }
+        } else {
+            assert_eq!(
+                arg1,
+                word,
+                "{label}: the argument stays the word\n{}",
+                op_lines(&graph)
+            );
+        }
     }
 }
 

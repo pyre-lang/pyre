@@ -1403,6 +1403,7 @@ mod tests {
                     name: "lhs".into(),
                     ty: ValueType::Str,
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -1414,6 +1415,7 @@ mod tests {
                     name: "rhs".into(),
                     ty: ValueType::Str,
                     class_root: None,
+                    param: None,
                 },
                 true,
             )

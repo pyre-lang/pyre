@@ -74,9 +74,12 @@ impl<T> ResidualSlot for *mut T {}
 impl<T> ResidualRet for *const T {}
 impl<T> ResidualRet for *mut T {}
 
-/// One-word `repr(transparent)` dict keys. `ObjectKey` / `IdentitySetKey`
-/// are two words and stay off this trait.
+/// One-word `repr(transparent)` dict keys. `IdentitySetKey` is two words
+/// and stays off this trait. `ObjectKey` is the object pointer
+/// (`rordereddict.py get_ll_dict` DICTKEY = OBJECTPTR); the digest lives
+/// in `Entry.f_hash` (`ll_hash_from_cache`).
 impl ResidualSlot for pyre_object::identitydict::IdentityKey {}
+impl ResidualSlot for pyre_object::dictmultiobject::ObjectKey {}
 impl ResidualSlot for pyre_object::dictmultiobject::BytesKey {}
 impl ResidualSlot for pyre_object::celldict::StrKey {}
 /// `PyError` is `#[repr(transparent)]` over `NonNull<PyObject>` — one `'r'` word.

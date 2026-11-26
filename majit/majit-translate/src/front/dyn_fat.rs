@@ -1231,6 +1231,7 @@ mod tests {
                 name: "strategy_".into(),
                 ty: ValueType::Ref(Some("object".into())),
                 class_root: None,
+                param: None,
             },
         });
         graph.set_goto(entry, later, vec![]);

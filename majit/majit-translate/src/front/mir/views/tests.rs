@@ -391,6 +391,7 @@ fn fat_box_len_and_index_keep_the_field_read() {
                 name: "code".into(),
                 ty: ValueType::Ref(None),
                 class_root: None,
+                param: None,
             },
             true,
         )
@@ -467,6 +468,7 @@ fn fat_box_len_and_index_keep_the_field_read() {
                 name: "raw".into(),
                 ty: ValueType::Int,
                 class_root: None,
+                param: None,
             },
             true,
         )

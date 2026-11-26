@@ -3164,6 +3164,7 @@ fn slice_join_method_annotates_as_somestring() {
             name: "sep".to_string(),
             ty: ValueType::Str,
             class_root: None,
+            param: None,
         },
         sep.clone(),
     );
@@ -3175,6 +3176,7 @@ fn slice_join_method_annotates_as_somestring() {
             name: "items".to_string(),
             ty: ValueType::Ref(None),
             class_root: Some("[str]".to_string()),
+            param: None,
         },
         items.clone(),
     );

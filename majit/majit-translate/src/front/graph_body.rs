@@ -613,6 +613,7 @@ fn declaration(
                 name,
                 ty,
                 class_root,
+                ..
             } => {
                 let index = startblock
                     .inputargs

@@ -4106,6 +4106,7 @@ fn function_get_qualname_obj_force_receiver_is_function_cast() {
                     name,
                     ty,
                     class_root,
+                    ..
                 } => dump.push(format!("Input {name} ty={ty:?} class_root={class_root:?}")),
                 OpKind::Call {
                     target,
@@ -4524,27 +4525,33 @@ fn py_null_global_narrows_to_w_root_class() {
     );
 }
 
-/// `&ObjectKey` field reads must narrow onto the dict-key class before `.hash`.
+/// `&ObjectKey` field reads project `__pos_0` without a class-root recast.
+///
+/// `ObjectKey` is `repr(transparent)` over `PyObjectRef` (`rordereddict.py
+/// get_ll_dict` DICTKEY = OBJECTPTR). The digest lives in `Entry.f_hash`
+/// (`ll_hash_from_cache`), not on the key.
 #[test]
-fn object_key_field_read_narrows_to_object_key_class() {
+fn object_key_pos0_is_field_read_without_class_narrow() {
     use majit_translate::model::OpKind;
 
     let span = class_root_probe_span();
     let empty_g = serde_json::json!({
         "regions": [], "types": [], "const_generics": [], "trait_refs": []
     });
-    let i64_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}});
+    let ptr_ty = serde_json::json!({"RawPtr": [
+        {"Scalar": {"Integer": {"Unsigned": "U8"}}},
+        "Mut"
+    ]});
     let key_adt = serde_json::json!({"Adt": {"id": 0, "generics": empty_g}});
     let key_ref = serde_json::json!({"Ref": ["Erased", key_adt.clone(), "Shared"]});
     let object_key = serde_json::json!({
         "def_id": 0,
         "item_meta": class_root_probe_meta(&["pyre_object", "dictmultiobject", "ObjectKey"]),
         "kind": {"Struct": [
-            {"name": "hash", "ty": i64_ty, "attr_info": null},
-            {"name": "obj", "ty": i64_ty, "attr_info": null}
+            {"name": "__pos_0", "ty": ptr_ty, "attr_info": null}
         ]}
     });
-    let hash_place = serde_json::json!({
+    let pos0_place = serde_json::json!({
         "kind": {"Projection": [
             {
                 "kind": {"Projection": [
@@ -4555,24 +4562,24 @@ fn object_key_field_read_narrows_to_object_key_class() {
             },
             {"Field": [null, 0]}
         ]},
-        "ty": i64_ty
+        "ty": ptr_ty
     });
-    let read_hash = serde_json::json!({
+    let read_pos0 = serde_json::json!({
         "def_id": 0,
-        "item_meta": class_root_probe_meta(&["fixture", "read_hash"]),
-        "signature": {"is_unsafe": false, "inputs": [key_ref], "output": i64_ty},
+        "item_meta": class_root_probe_meta(&["fixture", "read_pos0"]),
+        "signature": {"is_unsafe": false, "inputs": [key_ref], "output": ptr_ty},
         "body": {"Unstructured": {
             "span": span,
             "locals": {"arg_count": 1, "locals": [
-                class_root_probe_local(0, None, &i64_ty),
+                class_root_probe_local(0, None, &ptr_ty),
                 class_root_probe_local(1, Some("k"), &key_ref)
             ]},
             "body": [{
                 "statements": [{
                     "span": span,
                     "kind": {"Assign": [
-                        class_root_probe_place(0, &i64_ty),
-                        {"Use": [{"Read": hash_place}, "No"]}
+                        class_root_probe_place(0, &ptr_ty),
+                        {"Use": [{"Read": pos0_place}, "No"]}
                     ]}
                 }],
                 "kind": "Regular",
@@ -4586,30 +4593,36 @@ fn object_key_field_read_narrows_to_object_key_class() {
         "translated": {
             "crate_name": "fixture",
             "type_decls": [object_key],
-            "fun_decls": [read_hash],
+            "fun_decls": [read_pos0],
             "global_decls": [],
             "trait_decls": [],
             "trait_impls": []
         }
     });
     let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("ObjectKey fixture parses");
-    let graph = lower_function(&llbc, "read_hash").expect("read_hash lowers");
-    let narrowed = graph.blocks.iter().any(|block| {
-        block.operations.windows(2).any(|ops| {
-            majit_translate::model::cast_instance_root(&ops[0].kind)
+    let graph = lower_function(&llbc, "read_pos0").expect("read_pos0 lowers");
+    let has_object_key_cast = graph.blocks.iter().any(|block| {
+        block.operations.iter().any(|op| {
+            majit_translate::model::cast_instance_root(&op.kind)
                 == Some("dictmultiobject::ObjectKey")
-                && matches!(
-                    &ops[1].kind,
-                    OpKind::FieldRead { field, .. }
-                        if field.name == "hash"
-                            && field.owner_root.as_deref()
-                                == Some("dictmultiobject::ObjectKey")
-                )
         })
     });
     assert!(
-        narrowed,
-        "ObjectKey.hash must narrow onto dictmultiobject::ObjectKey; graph={}",
+        !has_object_key_cast,
+        "ObjectKey must not recast onto dictmultiobject::ObjectKey; graph={}",
+        graph.dump()
+    );
+    let has_pos0 = graph.blocks.iter().any(|block| {
+        block.operations.iter().any(|op| {
+            matches!(
+                &op.kind,
+                OpKind::FieldRead { field, .. } if field.name == "__pos_0"
+            )
+        })
+    });
+    assert!(
+        has_pos0,
+        "ObjectKey.__pos_0 must remain a field read; graph={}",
         graph.dump()
     );
 }

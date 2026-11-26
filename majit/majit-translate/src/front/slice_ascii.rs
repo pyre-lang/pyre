@@ -135,6 +135,7 @@ pub(crate) fn build_ll_first_non_ascii_char_graph(
             name: "s".to_string(),
             ty: ValueType::Ref(None),
             class_root: None,
+            param: None,
         },
         s.clone(),
     );

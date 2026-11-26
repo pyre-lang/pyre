@@ -157,6 +157,7 @@ fn trace_unit_result_declares_void_return() {
                         name,
                         ty,
                         class_root,
+                        ..
                     } => {
                         format!("Input {name} ty={ty:?} class={class_root:?}")
                     }

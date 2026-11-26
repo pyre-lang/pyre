@@ -3482,6 +3482,12 @@ pub fn rtype_cast_instance_to_base_ptr(
             lltype,
         ))));
     }
+    if !matches!(r_arg.lowleveltype(), LowLevelType::Ptr(_)) {
+        return Err(TyperError::message(format!(
+            "rtype_cast_instance_to_base_ptr: argument lowleveltype is not a Ptr, got {:?}",
+            r_arg.lowleveltype()
+        )));
+    }
     let v_arg = hop.inputarg(r_arg.as_ref(), 0)?;
     Ok(hop.genop("cast_pointer", vec![v_arg], GenopResult::LLType(lltype)))
 }
@@ -5661,8 +5667,11 @@ pub fn rtype_force_cast(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> 
 /// for the `r_ins1.classdef is None` (classdef-less → concrete) arm, run
 /// in one direction by the narrow and the other by the erasure.
 /// `args[0]` is the pointer operand; the narrow's `args[1]` is the
-/// constant root name (read by the annotator, unused here — it carries
-/// no runtime value).
+/// constant root name. The annotator peels a pointer
+/// `#[repr(transparent)]` wrapper
+/// (`Bookkeeper::peel_transparent_cast_root`); dest lltype is
+/// `hop.r_result` (`rclass.py` `ll_cast_to_object` / `lltype.py`
+/// `cast_pointer` of the same pointer).
 pub fn rtype_cast_instance_intrinsic(
     hop: &HighLevelOp,
     _kwds_i: &HashMap<String, usize>,
@@ -5670,10 +5679,7 @@ pub fn rtype_cast_instance_intrinsic(
     use crate::translator::rtyper::rtuple::TupleRepr;
     use crate::translator::rtyper::rtyper::GenopResult;
 
-    let r_result =
-        hop.r_result.borrow().as_ref().cloned().ok_or_else(|| {
-            TyperError::message("rtype_cast_instance_intrinsic: missing r_result")
-        })?;
+    let r_result = rtype_cast_instance_dest_repr(hop)?;
     let result_lltype = r_result.lowleveltype().clone();
     // Validated operand extraction: a malformed call (wrong arity)
     // surfaces a `TyperError` here instead of panicking on a raw
@@ -5835,6 +5841,20 @@ pub fn rtype_cast_instance_intrinsic(
         "cast_pointer"
     };
     Ok(hop.genop(opname, vec![v_ptr], GenopResult::LLType(result_lltype)))
+}
+
+/// Dest repr of `__cast_instance_intrinsic`.
+///
+/// `hop.r_result` is the annotator's intern. The analyser peels a
+/// pointer `#[repr(transparent)]` wrapper
+/// (`Bookkeeper::peel_transparent_cast_root`) before ClassDef lookup,
+/// so this is already the inner (`rclass.py` `ll_cast_to_object`).
+fn rtype_cast_instance_dest_repr(hop: &HighLevelOp) -> Result<Arc<dyn Repr>, TyperError> {
+    hop.r_result
+        .borrow()
+        .as_ref()
+        .cloned()
+        .ok_or_else(|| TyperError::message("rtype_cast_instance_intrinsic: missing r_result"))
 }
 
 #[cfg(test)]
@@ -9263,6 +9283,45 @@ mod tests {
             ops.ops.iter().map(|op| &op.opname).collect::<Vec<_>>()
         );
         assert_eq!(ops.ops.last().map(|op| op.result.clone()), Some(out));
+    }
+
+    #[test]
+    fn rtype_cast_instance_to_base_ptr_non_ptr_is_typererror() {
+        use crate::annotator::model::SomeInteger;
+        use crate::translator::rtyper::rclass::OBJECTPTR;
+        use crate::translator::rtyper::rint::IntegerRepr;
+        use crate::translator::rtyper::rmodel::{PtrRepr, Repr};
+
+        let hop = dummy_hop();
+        hop.args_v
+            .borrow_mut()
+            .push(Hlvalue::Constant(Constant::with_concretetype(
+                ConstValue::Int(1),
+                LowLevelType::Signed,
+            )));
+        hop.args_s
+            .borrow_mut()
+            .push(SomeValue::Integer(SomeInteger::new(false, false)));
+        hop.args_r
+            .borrow_mut()
+            .push(Some(
+                std::sync::Arc::new(IntegerRepr::new(LowLevelType::Signed, Some("int")))
+                    as std::sync::Arc<dyn Repr>,
+            ));
+        let objectptr = OBJECTPTR.clone();
+        let LowLevelType::Ptr(ptr) = &objectptr else {
+            panic!("OBJECTPTR must be a Ptr");
+        };
+        *hop.r_result.borrow_mut() =
+            Some(std::sync::Arc::new(PtrRepr::new((**ptr).clone())) as std::sync::Arc<dyn Repr>);
+
+        let err = rtype_cast_instance_to_base_ptr(&hop, &HashMap::new())
+            .expect_err("non-Ptr argument is a TyperError");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Ptr"),
+            "TyperError names the Ptr assert, got {msg}"
+        );
     }
 
     #[test]

@@ -371,6 +371,7 @@ fn entry_params(
             name: "count".to_string(),
             ty: ValueType::Int,
             class_root: None,
+            param: None,
         },
         count.clone(),
     );
@@ -380,6 +381,7 @@ fn entry_params(
             name: "item".to_string(),
             ty: identity.item_ty.clone(),
             class_root: None,
+            param: None,
         },
         item.clone(),
     );

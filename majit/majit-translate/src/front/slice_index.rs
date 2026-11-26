@@ -2595,6 +2595,7 @@ mod tests {
                     name: "end".into(),
                     ty: ValueType::Unsigned,
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -2725,6 +2726,7 @@ mod tests {
                     name: "end".into(),
                     ty: ValueType::Unsigned,
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -2940,6 +2942,7 @@ mod tests {
                 name: "items".into(),
                 ty: ValueType::Ref(None),
                 class_root: Some("[i64]".into()),
+                param: None,
             },
             slice.clone(),
         );

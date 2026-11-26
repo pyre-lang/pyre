@@ -503,6 +503,7 @@ mod tests {
                 name: "value".into(),
                 ty: ValueType::Str,
                 class_root: None,
+                param: None,
             },
             true,
         )
@@ -520,6 +521,7 @@ mod tests {
                     name: "block".into(),
                     ty: ValueType::Ref(None),
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -621,6 +623,7 @@ mod tests {
                     name: "block".into(),
                     ty: ValueType::Ref(None),
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -957,6 +960,7 @@ mod tests {
                     name: "block".into(),
                     ty: ValueType::Ref(None),
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -1178,6 +1182,7 @@ mod tests {
                     name: "self".into(),
                     ty: ValueType::Ref(None),
                     class_root: None,
+                    param: None,
                 },
                 true,
             )

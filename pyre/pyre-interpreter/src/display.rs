@@ -285,30 +285,49 @@ pub fn format_wtf8_repr(s: &Wtf8) -> String {
 /// The outer quote prefers `'`, flipping to `"` only when the data holds a
 /// `'` but no `"`; the body always backslash-escapes `'` and `\` and never
 /// escapes `"`, so a `'` survives as `\'` even under a `"` outer quote.
+///
+/// The counted loops are `descr_repr`'s: the quote scan stops at the first
+/// `"`; the body loop reads `c = s[i]`, appends `'\\x'`, then the two hex
+/// digits `"0123456789abcdef"[n >> 4]` and `"0123456789abcdef"[n & 0xF]`.
+/// A slice `into_iter` / `format!` body is an opaque iterator the rtyper
+/// does not register.
 pub(crate) fn bytearray_repr_string(data: &[u8], class_name: &str) -> String {
-    let has_single = data.contains(&b'\'');
-    let has_double = data.contains(&b'"');
-    let quote = if has_single && !has_double {
-        b'"'
-    } else {
-        b'\''
-    };
+    let mut quote = b'\'';
+    let mut i = 0;
+    while i < data.len() {
+        let c = data[i];
+        if c == b'"' {
+            quote = b'\'';
+            break;
+        } else if c == b'\'' {
+            quote = b'"';
+        }
+        i += 1;
+    }
     let mut out = String::with_capacity(data.len() + 14);
     out.push_str(class_name);
     out.push_str("(b");
     out.push(quote as char);
-    for &c in data {
-        match c {
-            b'\'' | b'\\' => {
-                out.push('\\');
-                out.push(c as char);
-            }
-            b'\t' => out.push_str("\\t"),
-            b'\n' => out.push_str("\\n"),
-            b'\r' => out.push_str("\\r"),
-            0x20..=0x7e => out.push(c as char),
-            _ => out.push_str(&format!("\\x{c:02x}")),
+    let mut i = 0;
+    while i < data.len() {
+        let c = data[i];
+        if c == b'\'' || c == b'\\' {
+            out.push('\\');
+            out.push(c as char);
+        } else if c == b'\t' {
+            out.push_str("\\t");
+        } else if c == b'\n' {
+            out.push_str("\\n");
+        } else if c == b'\r' {
+            out.push_str("\\r");
+        } else if !(0x20..0x7f).contains(&c) {
+            out.push_str("\\x");
+            out.push(b"0123456789abcdef"[(c >> 4) as usize] as char);
+            out.push(b"0123456789abcdef"[(c & 0xF) as usize] as char);
+        } else {
+            out.push(c as char);
         }
+        i += 1;
     }
     out.push(quote as char);
     out.push(')');
@@ -318,13 +337,12 @@ pub(crate) fn bytearray_repr_string(data: &[u8], class_name: &str) -> String {
 /// `bytesobject.py::string_escape_encode(data, quotes=True)` — bytes repr.
 /// PyPy chooses `"` only when the input contains `'` and not `"`, escapes
 /// the chosen quote and backslash, names tab/newline/carriage-return, and
-/// renders every other non-printable byte through the constant lowercase hex
-/// table.  Keep this loop in interpreter source so translation sees the same
-/// StringBuilder/character operations as PyPy instead of an opaque external
-/// Rust formatting iterator.
+/// renders every other non-printable byte as `\\x` plus two `getaddrstring`
+/// nibble digits.  Keep this loop in interpreter source so translation sees
+/// the same StringBuilder/character operations as PyPy instead of an opaque
+/// external Rust formatting iterator.
 #[majit_macros::elidable]
 pub(crate) fn bytes_repr_string(data: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
     let quote = if data.contains(&b'\'') && !data.contains(&b'"') {
         b'"'
     } else {
@@ -345,8 +363,8 @@ pub(crate) fn bytes_repr_string(data: &[u8]) -> String {
             out.push_str("\\n");
         } else if !(0x20..0x7f).contains(&c) {
             out.push_str("\\x");
-            out.push(HEX[(c >> 4) as usize] as char);
-            out.push(HEX[(c & 0x0f) as usize] as char);
+            out.push(b"0123456789abcdef"[(c >> 4) as usize] as char);
+            out.push(b"0123456789abcdef"[(c & 0xF) as usize] as char);
         } else {
             out.push(c as char);
         }
@@ -2465,7 +2483,8 @@ impl fmt::Display for PyDisplay {
 #[cfg(test)]
 mod tests {
     use super::{
-        format_float_repr, jit_format_float_repr_rstr, repr_addr, syntax_error_basename_start,
+        bytearray_repr_string, format_float_repr, jit_format_float_repr_rstr, repr_addr,
+        syntax_error_basename_start,
     };
 
     #[test]
@@ -2494,6 +2513,35 @@ mod tests {
             let bytes = unsafe { pyre_object::unicodeobject::utf8_payload_bytes(s) };
             assert_eq!(bytes, format_float_repr(value).as_bytes());
         }
+    }
+
+    #[test]
+    fn bytearray_repr_string_matches_descr_repr_nibble_table() {
+        assert_eq!(bytearray_repr_string(b"", "bytearray"), "bytearray(b'')");
+        assert_eq!(
+            bytearray_repr_string(b"abc", "bytearray"),
+            "bytearray(b'abc')"
+        );
+        assert_eq!(
+            bytearray_repr_string(b"\x01", "bytearray"),
+            "bytearray(b'\\x01')"
+        );
+        assert_eq!(
+            bytearray_repr_string(b"\xff", "bytearray"),
+            "bytearray(b'\\xff')"
+        );
+        assert_eq!(
+            bytearray_repr_string(b"\x9a", "bytearray"),
+            "bytearray(b'\\x9a')"
+        );
+        assert_eq!(
+            bytearray_repr_string(b"'", "bytearray"),
+            "bytearray(b\"\\'\")"
+        );
+        assert_eq!(
+            bytearray_repr_string(b"'\"", "bytearray"),
+            "bytearray(b'\\'\"')"
+        );
     }
 
     #[test]

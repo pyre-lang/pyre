@@ -320,6 +320,7 @@ mod tests {
                     name: "f".to_string(),
                     ty: ValueType::Int,
                     class_root: Some("fn(i64) -> bool".to_string()),
+                    param: None,
                 },
                 true,
             )
@@ -331,6 +332,7 @@ mod tests {
                     name: "x".to_string(),
                     ty: ValueType::Int,
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -425,6 +427,7 @@ mod tests {
                     name: "f".to_string(),
                     ty: ValueType::Int,
                     class_root: Some("fn(*mut PyObject) -> *mut PyObject".to_string()),
+                    param: None,
                 },
                 true,
             )
@@ -443,6 +446,7 @@ mod tests {
                     name: "obj".to_string(),
                     ty: ValueType::Ref(Some("PyObject".to_string())),
                     class_root: Some("PyObject".to_string()),
+                    param: None,
                 },
                 true,
             )
@@ -498,6 +502,7 @@ mod tests {
                     name: "f".to_string(),
                     ty: ValueType::Int,
                     class_root: Some("fn(i64) -> i64".to_string()),
+                    param: None,
                 },
                 true,
             )
@@ -509,6 +514,7 @@ mod tests {
                     name: "x".to_string(),
                     ty: ValueType::Int,
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -557,6 +563,7 @@ mod tests {
                     name: "f".to_string(),
                     ty: ValueType::Int,
                     class_root: Some("fn(&FnPtrInstArg) -> bool".to_string()),
+                    param: None,
                 },
                 true,
             )
@@ -569,6 +576,7 @@ mod tests {
                     name: "inst".to_string(),
                     ty: ValueType::Ref(Some("FnPtrInstArg".to_string())),
                     class_root: Some("FnPtrInstArg".to_string()),
+                    param: None,
                 },
                 true,
             )
@@ -688,6 +696,7 @@ mod tests {
                     name: "f".to_string(),
                     ty: ValueType::Int,
                     class_root: Some("fn(&FnPtrInstArg) -> bool".to_string()),
+                    param: None,
                 },
                 true,
             )

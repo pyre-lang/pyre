@@ -1226,9 +1226,9 @@ impl UnionBuilder {
         ) {
             Ok(hash) => {
                 let arg = pyre_object::gc_roots::shadow_stack_get(arg_slot);
-                let key = unsafe { pyre_object::dictmultiobject::object_key_hashed(arg, hash) };
+                let key = unsafe { pyre_object::dictmultiobject::object_key_hashed(arg) };
                 let set = pyre_object::gc_roots::shadow_stack_get(self.hashable_set_slot);
-                let present = unsafe { pyre_object::w_set_contains_key_checked(set, key) }
+                let present = unsafe { pyre_object::w_set_contains_key_checked(set, key, hash) }
                     .map_err(|_| crate::baseobjspace::take_pending_hash_error())?;
                 if present {
                     return Ok(());

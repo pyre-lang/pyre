@@ -1283,6 +1283,19 @@ impl PartialEq for VableArrayDescr {
 
 impl Eq for VableArrayDescr {}
 
+/// MIR parameter local an `Input` was built from, and which word of an
+/// expanded fat parameter it is. `HighLevelOp.inputarg` (`rtyper.py`)
+/// reads `args_v[arg]` / `args_r[arg]` by position, not by name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputParam {
+    /// The whole value of MIR parameter local `n`.
+    Whole(usize),
+    /// The data word of an expanded fat/slice parameter at local `n`.
+    Data(usize),
+    /// The integer length word of an expanded fat/slice parameter at local `n`.
+    Length(usize),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OpKind {
     Input {
@@ -1301,6 +1314,11 @@ pub enum OpKind {
         /// `program.struct_fields`.  Non-`Ref` params (Int, Float, Bool,
         /// Void) always have `None`.
         class_root: Option<String>,
+        /// Parameter local and expanded part, set when the front end
+        /// builds startblock Inputs (`pygraph_initial_block` /
+        /// `Lowering::new`). `None` for a phi, `ret_len_slot`, or a
+        /// hand-built graph.
+        param: Option<InputParam>,
     },
     ConstInt(i64),
     /// Function-pointer integer constant (`jtransform.py
@@ -11671,6 +11689,7 @@ impl FunctionGraph {
                     name,
                     ty: ValueType::Unknown,
                     class_root: None,
+                    param: None,
                 },
                 local.clone(),
             );
@@ -13054,6 +13073,7 @@ mod tests {
                     name: "x".into(),
                     ty: ValueType::Int,
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -13084,6 +13104,7 @@ mod tests {
                     name: "b".into(),
                     ty: ValueType::Bool,
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -13258,6 +13279,7 @@ mod tests {
                     name: "b".into(),
                     ty: ValueType::Bool,
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -13375,6 +13397,7 @@ mod tests {
                     name: "x".into(),
                     ty: ValueType::Int,
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -13415,6 +13438,7 @@ mod tests {
                     name: "cond".into(),
                     ty: ValueType::Bool,
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -13455,6 +13479,7 @@ mod tests {
                         name: "cond".into(),
                         ty: ValueType::Bool,
                         class_root: None,
+                        param: None,
                     },
                     true,
                 )
@@ -13550,6 +13575,7 @@ mod tests {
                     name: "cond".into(),
                     ty: ValueType::Int,
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -13647,6 +13673,7 @@ mod tests {
                     name: name.to_string(),
                     ty: ValueType::Int,
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -24006,6 +24033,7 @@ mod tests {
                     name: "value".into(),
                     ty: ValueType::Float,
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -24327,6 +24355,7 @@ mod tests {
                     name: "param".into(),
                     ty: ValueType::Int,
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -24442,6 +24471,7 @@ mod tests {
                     name: "captured".into(),
                     ty: ValueType::Ref(None),
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -24795,6 +24825,7 @@ mod tests {
                 name: "x".to_string(),
                 ty: ValueType::Unknown,
                 class_root: None,
+                param: None,
             },
             true,
         );
@@ -24849,6 +24880,7 @@ mod tests {
                 name: "p".to_string(),
                 ty: ValueType::Unknown,
                 class_root: None,
+                param: None,
             },
             true,
         );
@@ -24923,6 +24955,7 @@ mod tests {
                 name: "p".to_string(),
                 ty: ValueType::Unknown,
                 class_root: None,
+                param: None,
             },
             true,
         );
@@ -24967,6 +25000,7 @@ mod tests {
                 name: "p".to_string(),
                 ty: ValueType::Unknown,
                 class_root: None,
+                param: None,
             },
             true,
         );
@@ -25037,6 +25071,7 @@ mod tests {
                 name: "func_1".into(),
                 ty: ValueType::Int,
                 class_root: None,
+                param: None,
             },
         });
         graph.set_goto(root, switch_block, vec![]);
@@ -25093,6 +25128,7 @@ mod tests {
                 name: "func_1".into(),
                 ty: ValueType::Int,
                 class_root: None,
+                param: None,
             },
         });
         graph.set_goto(root, switch_block, vec![v.clone()]);
@@ -25147,6 +25183,7 @@ mod tests {
                 name: "func_1".into(),
                 ty: ValueType::Int,
                 class_root: None,
+                param: None,
             },
         });
         graph.block_mut(orphan).operations.push(SpaceOperation {
@@ -25155,6 +25192,7 @@ mod tests {
                 name: "dummy".into(),
                 ty: ValueType::Int,
                 class_root: None,
+                param: None,
             },
         });
         graph.set_goto(root, switch_block, vec![v.clone()]);
@@ -25220,6 +25258,7 @@ mod tests {
                 name: "strategy_".to_string(),
                 ty: ValueType::Ref(Some("object".into())),
                 class_root: None,
+                param: None,
             },
         });
         graph.set_goto(root, mid, vec![]);
@@ -25280,6 +25319,7 @@ mod tests {
                 name: "strategy_".into(),
                 ty: ValueType::Ref(Some("object".into())),
                 class_root: None,
+                param: None,
             },
         });
         graph.set_goto(pred, target, vec![]);
@@ -25330,6 +25370,7 @@ mod tests {
                     name: "func_1".into(),
                     ty: ValueType::Int,
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -25341,6 +25382,7 @@ mod tests {
                     name: "cond".into(),
                     ty: ValueType::Bool,
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -25401,6 +25443,7 @@ mod tests {
                     name: "value".into(),
                     ty: ValueType::Float,
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -25412,6 +25455,7 @@ mod tests {
                     name: "cond".into(),
                     ty: ValueType::Bool,
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -25505,6 +25549,7 @@ mod tests {
                     name: "cond".into(),
                     ty: ValueType::Bool,
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -25517,6 +25562,7 @@ mod tests {
                     name: "left_only".into(),
                     ty: ValueType::Float,
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -25563,6 +25609,7 @@ mod tests {
                 name: "v".into(),
                 ty: ValueType::Int,
                 class_root: None,
+                param: None,
             },
         });
         graph.block_mut(entry).operations.push(SpaceOperation {
@@ -25571,6 +25618,7 @@ mod tests {
                 name: "u".into(),
                 ty: ValueType::Int,
                 class_root: None,
+                param: None,
             },
         });
         let cond = graph
@@ -25580,6 +25628,7 @@ mod tests {
                     name: "cond".into(),
                     ty: ValueType::Bool,
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -25669,6 +25718,7 @@ mod tests {
                 name: "v".into(),
                 ty: ValueType::Int,
                 class_root: None,
+                param: None,
             },
         });
         graph.block_mut(entry).operations.push(SpaceOperation {
@@ -25677,6 +25727,7 @@ mod tests {
                 name: "u".into(),
                 ty: ValueType::Int,
                 class_root: None,
+                param: None,
             },
         });
         let cond = graph
@@ -25686,6 +25737,7 @@ mod tests {
                     name: "cond".into(),
                     ty: ValueType::Bool,
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -25735,6 +25787,7 @@ mod tests {
                     name: "value".into(),
                     ty: ValueType::Int,
                     class_root: None,
+                    param: None,
                 },
                 true,
             )

@@ -3000,21 +3000,7 @@ impl<'a> Lowering<'a> {
     pub(in crate::front::mir) fn local_has_projected_store(&self, local: usize) -> bool {
         self.projected_store_roots
             .get_or_init(|| {
-                let mut out = bit_set::BitSet::new();
-                for (bb_idx, block) in self.body.body().iter().enumerate() {
-                    if !self.forward_reached[bb_idx] {
-                        continue;
-                    }
-                    for stmt in &block.statements {
-                        if let Ok(StmtKind::Assign(dest, _)) = stmt.stmt_kind_ref()
-                            && matches!(dest.kind, PlaceKind::Projection(..))
-                            && let Some(root) = place_root_local(dest)
-                        {
-                            out.insert(root);
-                        }
-                    }
-                }
-                out
+                compute_projected_store_roots(self.llbc, self.body, &self.forward_reached)
             })
             .contains(local)
     }

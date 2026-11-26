@@ -1061,6 +1061,7 @@ mod tests {
                     name: "f".to_string(),
                     ty: ValueType::Int,
                     class_root: Some(spelling.to_string()),
+                    param: None,
                 },
                 true,
             )
@@ -1150,6 +1151,7 @@ mod tests {
                     name: "obj".to_string(),
                     ty: ValueType::Ref(None),
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -1255,6 +1257,7 @@ mod tests {
                         name: "lhs".to_string(),
                         ty: ValueType::Unknown,
                         class_root: None,
+                        param: None,
                     },
                     true,
                 )
@@ -1266,6 +1269,7 @@ mod tests {
                         name: "rhs".to_string(),
                         ty: ValueType::Unknown,
                         class_root: None,
+                        param: None,
                     },
                     true,
                 )
@@ -1317,6 +1321,7 @@ mod tests {
                     name: "lhs".into(),
                     ty: ValueType::Int,
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -1409,6 +1414,7 @@ mod tests {
                     name: "switch".into(),
                     ty: ValueType::Bool,
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -1561,6 +1567,7 @@ mod tests {
                     name: "obj".to_string(),
                     ty: ValueType::Ref(None),
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -1631,6 +1638,7 @@ mod tests {
                     name: "x".to_string(),
                     ty: ValueType::Unknown,
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -1766,6 +1774,7 @@ mod tests {
                     name: "captured".to_string(),
                     ty: ValueType::Int,
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -1799,6 +1808,7 @@ mod tests {
                     name: "x".to_string(),
                     ty: ValueType::Unknown,
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -1825,6 +1835,7 @@ mod tests {
                     name: "extra".to_string(),
                     ty: ValueType::Unknown,
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -1851,6 +1862,7 @@ mod tests {
                     name: "obj".to_string(),
                     ty: ValueType::Unknown,
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -1951,6 +1963,7 @@ mod tests {
                 name: name.to_string(),
                 ty,
                 class_root: None,
+                param: None,
             },
             var.clone(),
         );

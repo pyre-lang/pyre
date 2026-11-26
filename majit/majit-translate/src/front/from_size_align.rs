@@ -1442,6 +1442,7 @@ mod tests {
                     name: "a".to_string(),
                     ty: ValueType::Unsigned,
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -1730,6 +1731,7 @@ mod tests {
                     name: "a".to_string(),
                     ty: ValueType::Unsigned,
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -2029,6 +2031,7 @@ mod tests {
             name: "a".to_string(),
             ty: ValueType::Unsigned,
             class_root: None,
+            param: None,
         });
         let rewritten = rewire_from_size_align_call_sites(&mut g, &[call_site_for(&fsa)]);
         assert_eq!(
@@ -2061,6 +2064,7 @@ mod tests {
                     name: "layout".to_string(),
                     ty: ValueType::Ref(Some("core::alloc::layout::Layout".to_string())),
                     class_root: Some("core::alloc::layout::Layout".to_string()),
+                    param: None,
                 },
                 true,
             )

@@ -30,6 +30,7 @@ fn option_fn_return_phi_graph() -> FunctionGraph {
                 name: "c".into(),
                 ty: ValueType::Bool,
                 class_root: None,
+                param: None,
             },
             true,
         )
@@ -41,6 +42,7 @@ fn option_fn_return_phi_graph() -> FunctionGraph {
                 name: "f".into(),
                 ty: ValueType::Int,
                 class_root: Some("fn() -> i64".into()),
+                param: None,
             },
             true,
         )

@@ -122,6 +122,7 @@ fn unary_int_graph(name: &str, op: &str, operand_ll: Option<LowLevelType>) -> Fu
                 name: "c".into(),
                 ty: ValueType::Int,
                 class_root: None,
+                param: None,
             },
             true,
         )
@@ -188,6 +189,7 @@ fn skip_arm_unichr_call_codewrites_without_int_unichr() {
                 name: "n".into(),
                 ty: ValueType::Int,
                 class_root: None,
+                param: None,
             },
             true,
         )

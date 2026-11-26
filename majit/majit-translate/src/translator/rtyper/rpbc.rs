@@ -904,6 +904,7 @@ pub(crate) mod tests {
                     name: "h".to_string(),
                     ty: ValueType::Ref(None),
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -1018,6 +1019,7 @@ pub(crate) mod tests {
                     name: "vtable".to_string(),
                     ty: ValueType::Ref(Some("Handler::{vtable}".to_string())),
                     class_root: Some("Handler::{vtable}".to_string()),
+                    param: None,
                 },
                 true,
             )
@@ -1155,6 +1157,7 @@ pub(crate) mod tests {
                     name: "storage".to_string(),
                     ty: ValueType::Ref(None),
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -1218,6 +1221,7 @@ pub(crate) mod tests {
                     name: "f".to_string(),
                     ty: ValueType::Ref(None),
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -1278,6 +1282,7 @@ pub(crate) mod tests {
                     name: "fp".to_string(),
                     ty: ValueType::Int,
                     class_root: None,
+                    param: None,
                 },
                 true,
             )

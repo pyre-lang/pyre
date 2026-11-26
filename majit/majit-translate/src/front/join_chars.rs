@@ -124,6 +124,7 @@ pub(crate) fn build_ll_str2uintlist_graph() -> FunctionGraph {
             name: "s".to_string(),
             ty: ValueType::Str,
             class_root: None,
+            param: None,
         },
         s.clone(),
     );
@@ -246,6 +247,7 @@ pub(crate) fn build_ll_join_chars_graph() -> FunctionGraph {
             // `[u8]` is the list-of-unsigned spelling (`is_list_container_spelling`);
             // a shared `&[u8]` would seed `SomeString`.
             class_root: Some("[u8]".to_string()),
+            param: None,
         },
         chars.clone(),
     );
@@ -399,6 +401,7 @@ pub(crate) fn build_ll_charpsize2str_graph() -> FunctionGraph {
             // only when this spelling is on the Input; `class_root: None`
             // would seed `SomeInteger` against the stamped CCHARP lltype.
             class_root: Some("CCHARP".to_string()),
+            param: None,
         },
         cp.clone(),
     );
@@ -412,6 +415,7 @@ pub(crate) fn build_ll_charpsize2str_graph() -> FunctionGraph {
             name: "size".to_string(),
             ty: ValueType::Int,
             class_root: None,
+            param: None,
         },
         n.clone(),
     );
@@ -556,6 +560,7 @@ pub(crate) fn build_ll_charpsize2uintlist_graph() -> FunctionGraph {
             // only when this spelling is on the Input; `class_root: None`
             // would seed `SomeInteger` against the stamped CCHARP lltype.
             class_root: Some("CCHARP".to_string()),
+            param: None,
         },
         cp.clone(),
     );
@@ -569,6 +574,7 @@ pub(crate) fn build_ll_charpsize2uintlist_graph() -> FunctionGraph {
             name: "size".to_string(),
             ty: ValueType::Int,
             class_root: None,
+            param: None,
         },
         n.clone(),
     );

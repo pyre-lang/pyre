@@ -419,6 +419,7 @@ mod tests {
                         name: "a".into(),
                         ty: ValueType::Int,
                         class_root: None,
+                        param: None,
                     },
                 }),
                 FlatOp::op(SpaceOperation {
@@ -488,6 +489,7 @@ mod tests {
                         name: "owner".into(),
                         ty: ValueType::Ref(None),
                         class_root: None,
+                        param: None,
                     },
                 }),
                 FlatOp::op(SpaceOperation {

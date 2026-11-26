@@ -83,7 +83,13 @@
 //!     and field-less structs stay constructors: `rewrite_op_malloc` needs
 //!     a non-empty `all_fielddescrs`. Transparent newtype wrappers stay a
 //!     no-op alias. Enum variants, tuples, and arrays still emit
-//!     `Call(SyntheticTransparentCtor)` for later rewrites.
+//!     `Call(SyntheticTransparentCtor)` for later rewrites. An all-const
+//!     `[u8; N]` Array of valid UTF-8 (`b"..."` inlined) whose
+//!     copy-component is single-assignment and immutable is `__str_const`
+//!     instead (`rstr.py` `AbstractStringRepr.rtype_getitem` /
+//!     `ll_stritem_nonneg` on a Constant string). A dest that may meet
+//!     array storage (`lltype.py` `_ptr.__setattr__` / `_ptr.__setitem__`;
+//!     `framestate.py` `FrameState.union`) keeps the Array ctor.
 //!   - `ShallowInitBox` — synthetic `Call(SyntheticTransparentCtor)`.
 //!   - `Repeat` / `Len` / `NullaryOp` — synthetic `Call(__array_repeat
 //!     / __len / __nullary_*)`. `new_array_clear` is produced later by
@@ -113,6 +119,10 @@
 //!     `ConstUInt`.
 //!   - `Bool` → `ConstBool`. `Float` → `ConstFloat`.
 //!   - `Str` / `ByteStr` → synthetic `Call(__str_const)`.
+//!   - A const `[u8; N]` Array aggregate of UTF-8 bytes (inlined `b"..."`)
+//!     whose copy-component is single-assignment and immutable is the
+//!     same `__str_const` Constant. Indexing it is
+//!     `__string_byte_getitem` (`rstr.py` `ll_stritem_nonneg`).
 //!   - `Char` → `ConstInt` of the code point then `builtin_unichr`
 //!     (`__majit_unichr`), so a Rust `char` annotates as
 //!     `SomeUnicodeCodePoint` while staying in the Int bank
@@ -522,6 +532,9 @@ pub(crate) fn absorb_semantic_program(
                     .transparent_scalar_kinds
                     .entry(key)
                     .or_insert(kind);
+            }
+            for (key, inner) in prog.struct_fields.transparent_inners {
+                acc.struct_fields.note_transparent_inner(key, inner);
             }
             acc.struct_fields
                 .option_struct_ids
@@ -4228,21 +4241,33 @@ impl<'l> CrateLowering<'l> {
                 body = crate::front::clause_spec::identity_unstructured(&ty);
             }
         }
-        if to_string_instantiation_is_string_identity(llbc, fd, &req.types, &req.const_generics) {
+        if to_string_instantiation_is_string_str(llbc, fd, &req.types, &req.const_generics) {
             // `<T as ToString>::to_string` of a string-family T is
-            // `str(s)` of a string: the string itself (`rstr.py` one
-            // immutable rpy_string; `rbuiltin.py` `rtype_builtin_str` /
-            // `ll_str`). alloc extracts as Opaque; a fn-item value is
-            // `FunctionDesc.getuniquegraph` of that instantiation, the
-            // same identity direct calls alias (`is_to_string_identity`).
+            // `str(s)`: `unaryop.py` `SomeObject.str` annotates a fresh
+            // `SomeString()`; `rmodel.py` `Repr.rtype_str` emits
+            // `gendirectcall(self.ll_str, v)` (`rstr.py`
+            // `AbstractStringRepr.ll_str`). alloc extracts as Opaque; a
+            // fn-item value is `FunctionDesc.getuniquegraph` of that
+            // instantiation. The body is one Call of this FunDecl on
+            // arg0; `lower_call` lowers that to `UnaryOp "str"` and
+            // returns before `enqueue_spec`, so the copy does not
+            // re-enter `declare_spec`.
             if let Some(src) = fd.signature.inputs.first() {
-                let ty = crate::front::clause_spec::subst_tyref(
+                let arg_ty = crate::front::clause_spec::subst_tyref(
                     src,
                     llbc,
                     &req.types,
                     &req.const_generics,
                 );
-                body = crate::front::clause_spec::identity_unstructured(&ty);
+                let dest_ty = crate::front::clause_spec::subst_tyref(
+                    &fd.signature.output,
+                    llbc,
+                    &req.types,
+                    &req.const_generics,
+                );
+                body = crate::front::clause_spec::to_string_str_unstructured(
+                    fd.def_id, &arg_ty, &dest_ty,
+                );
             }
         }
         let Some(mut body) = body else {
@@ -7405,6 +7430,54 @@ fn derive_program_metadata(
                     })
                     .collect();
                 let canonical_name = strip_crate_prefix(&name);
+                // By-value `#[repr(transparent)]` is the unique non-ZST
+                // field's layout (`transparent_nonzst_field`). Record the
+                // *inner* spelling — `tyref_to_field_layout_string_with` of
+                // the wrapper keeps a `ValueType::Ref` handle leaf
+                // (`PyError`). Qualify the inner the same way
+                // `field_row_struct_identity` qualifies a pointer field
+                // (`*mut PyObject` → `*mut pyobject::PyObject`) so
+                // `field_row_lltype` of the wrapper intern's the same
+                // pointer as a bare inner field. Skip a Deref handle: its
+                // harvest row is already the payload pointer
+                // (`transparent_handle_field_spelling`). Skip a generic
+                // wrapper (`UnsafeCell<T>`): its template field is the
+                // type parameter, so only an instantiation knows the
+                // inner. `field_row_lltype` peels before the nested
+                // inline Struct arm (`rordereddict.py` `get_ll_dict`;
+                // `lltype.py` `_interior_ptr._expose` of a Ptr field).
+                if td.is_repr_transparent()
+                    && handle_payload.is_none()
+                    && let Some((index, _)) = transparent_nonzst_field(td, llbc)
+                    && let Some(field) = fields.get(index)
+                    && !tyref_mentions_typevar(&field.ty, llbc)
+                    && let Some(node) = tyref_node(&field.ty, llbc)
+                {
+                    let peeled = type_node_peel_aliases(node, llbc)
+                        .cloned()
+                        .unwrap_or_else(|| node.clone());
+                    let peeled_ty = TyRef::Other(peeled.into());
+                    let layout = tyref_to_field_layout_string_with(
+                        &peeled_ty,
+                        llbc,
+                        gc_struct_ids,
+                        raw_alloc_flavor_structs,
+                        &ambiguous_leaves,
+                        Some(&struct_fields),
+                    );
+                    let inner =
+                        field_row_struct_identity(&peeled_ty, llbc, &layout).unwrap_or(layout);
+                    if !inner.is_empty()
+                        && inner != name
+                        && inner != canonical_name
+                        && inner != leaf
+                    {
+                        struct_fields.note_transparent_inner(name.clone(), inner.clone());
+                        if canonical_name != name && canonical_name.contains("::") {
+                            struct_fields.note_transparent_inner(canonical_name.clone(), inner);
+                        }
+                    }
+                }
                 struct_fields.fields.insert(name.clone(), rows.clone());
                 struct_fields
                     .fields
@@ -8837,6 +8910,9 @@ impl DuplicateLeafFacts {
                 .transparent_scalar_kinds
                 .entry(key)
                 .or_insert(kind);
+        }
+        for (key, inner) in other.struct_fields.transparent_inners {
+            self.struct_fields.note_transparent_inner(key, inner);
         }
         self.struct_fields
             .option_struct_ids

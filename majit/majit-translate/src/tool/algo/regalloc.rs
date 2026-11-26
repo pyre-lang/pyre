@@ -1147,6 +1147,7 @@ mod tests {
                     name: name.into(),
                     ty: ValueType::Int,
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -1326,6 +1327,7 @@ mod tests {
                     name: name.into(),
                     ty: ValueType::Ref(None),
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -1529,6 +1531,7 @@ mod tests {
                     name: "scope_copy".into(),
                     ty: ValueType::Ref(None),
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -1591,6 +1594,7 @@ mod tests {
                     name: "engine_copy".into(),
                     ty: ValueType::Ref(None),
                     class_root: None,
+                    param: None,
                 },
                 true,
             )

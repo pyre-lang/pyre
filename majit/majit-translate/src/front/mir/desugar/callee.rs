@@ -5179,6 +5179,37 @@ pub(in crate::front::mir) fn place_root_local(place: &Place) -> Option<usize> {
     }
 }
 
+/// Roots of projected stores: `Assign` of a projection (`a[i] = ..`) and a
+/// `Call` whose destination is a projection of a local (`a[i] = f()`).
+/// `lltype.py` `_ptr.__setitem__` is that store.
+pub(in crate::front::mir) fn compute_projected_store_roots(
+    llbc: &Llbc,
+    body: &Unstructured,
+    forward: &[bool],
+) -> bit_set::BitSet {
+    let mut out = bit_set::BitSet::new();
+    for (bb_idx, bb) in body.body().iter().enumerate() {
+        if !forward.get(bb_idx).copied().unwrap_or(false) {
+            continue;
+        }
+        for stmt in &bb.statements {
+            if let Ok(StmtKind::Assign(dest, _)) = stmt.stmt_kind_ref()
+                && matches!(dest.kind, PlaceKind::Projection(..))
+                && let Some(root) = place_root_local(dest)
+            {
+                out.insert(root);
+            }
+        }
+        if let Ok(TermKind::Call { call, .. }) = bb.term_ref(llbc)
+            && matches!(call.dest.kind, PlaceKind::Projection(..))
+            && let Some(root) = place_root_local(&call.dest)
+        {
+            out.insert(root);
+        }
+    }
+    out
+}
+
 pub(in crate::front::mir) fn place_root_in_alias(place: &Place, alias: &[usize]) -> bool {
     place_root_local(place).is_some_and(|id| alias.contains(&id))
 }

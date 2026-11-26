@@ -615,10 +615,12 @@ pub(crate) fn remap_op_kind(
             name,
             ty,
             class_root,
+            param,
         } => OpKind::Input {
             name: name.clone(),
             ty: ty.clone(),
             class_root: class_root.clone(),
+            param: *param,
         },
         OpKind::ConstInt(v) => OpKind::ConstInt(*v),
         OpKind::ConstFnAddr {
@@ -2045,6 +2047,7 @@ mod tests {
                     name: "base".into(),
                     ty: ValueType::Ref(None),
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -2080,6 +2083,7 @@ mod tests {
                     name: "base".into(),
                     ty: ValueType::Ref(None),
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -2139,6 +2143,7 @@ mod tests {
                     name: "base".into(),
                     ty: ValueType::Ref(None),
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -2346,6 +2351,7 @@ mod tests {
                     name: "base".into(),
                     ty: ValueType::Ref(None),
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -2371,6 +2377,7 @@ mod tests {
                     name: "x".into(),
                     ty: ValueType::Ref(None),
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -2426,6 +2433,7 @@ mod tests {
                     name: "base".into(),
                     ty: ValueType::Ref(None),
                     class_root: None,
+                    param: None,
                 },
                 true,
             )

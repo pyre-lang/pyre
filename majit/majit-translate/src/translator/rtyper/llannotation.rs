@@ -411,12 +411,18 @@ impl SomePtr {
 /// nullable SomeString, a registered class-root `Ptr(GcStruct)` is the
 /// nullable instance. `llannotation.py` `lltype_to_annotation` of `Ptr`
 /// is SomePtr; the conversion is the same Rust adaptation as
-/// [`gc_class_root_ptr_as_instance`].
+/// [`gc_class_root_ptr_as_instance`]. A `rclass.py` `OBJECTPTR` field
+/// stays SomePtr (`lltype.py` `SomePtr.getattr`); mix-level code
+/// converts with `cast_base_ptr_to_instance`
+/// (`annlowlevel.py` `CastBasePtrToInstanceEntry`).
 fn highlevel_of_ptr_field_annotation(s: SomeValue) -> SomeValue {
     if let Some(s_str) = strptr_as_somestring(&s) {
         return s_str;
     }
-    gc_class_root_ptr_as_instance(&s).unwrap_or(s)
+    if let Some(inst) = gc_class_root_ptr_as_instance(&s) {
+        return inst;
+    }
+    s
 }
 
 /// A field whose lltype is `rstr.STRPTR` (`Ptr(GcStruct('rpy_string'))`)
@@ -512,7 +518,7 @@ fn carray_item_field_annotation(field_t: lltype::LowLevelType) -> SomeValue {
             std::collections::BTreeMap::new(),
         ));
     }
-    lltype_to_annotation(field_t)
+    highlevel_of_ptr_field_annotation(lltype_to_annotation(field_t))
 }
 
 fn is_pointer_word_lltype(ty: &lltype::LowLevelType) -> bool {

@@ -2332,6 +2332,12 @@ fn cast_instance_intrinsic(
             ));
         }
     };
+    // Every arm below sees this peeled root. A by-value
+    // `#[repr(transparent)]` wrapper whose inner is a pointer
+    // (`Bookkeeper::peel_transparent_cast_root`) is the pointee
+    // (`rclass.py` `ll_cast_to_object` / `lltype.py` `cast_pointer`).
+    // A scalar inner keeps the named dest.
+    let root = bk.peel_transparent_cast_root(&root);
     let operand = arg_at(args_s, 0, crate::runtime_names::shims::CAST_INSTANCE);
     // Nullability travels with the value, not with the target spelling: a
     // downcast of a nullable pointer is itself nullable, and a null operand
@@ -6318,6 +6324,71 @@ mod tests {
             assert!(
                 matches!(out, SomeValue::Ptr(_)),
                 "{root} must project dest as SomePtr(GCREF), got {out:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cast_instance_intrinsic_transparent_pointer_wrapper_is_the_inner() {
+        // `null_mut()` + `__cast_instance_intrinsic(..., IdentityKey)` /
+        // `ObjectKey` is `cast_pointer` onto the inner object
+        // (`rclass.py` `ll_cast_to_object`; `rordereddict.py`
+        // `get_ll_dict` DICTKEY = OBJECTPTR). The wrapper has no
+        // ClassDef (`getuniqueclassdef_for_struct_root`).
+        use crate::front::StructFieldRegistry;
+
+        for wrapper in ["identitydict::IdentityKey", "dictmultiobject::ObjectKey"] {
+            let bk = bk();
+            let pyobj = "pyobject::PyObject";
+            let pyobj_id = majit_ir::descr::StructId::from_canonical(pyobj);
+            let pyobj_identity = crate::front::semantic::ClassIdentity {
+                id: pyobj_id,
+                spelling: pyobj.to_string(),
+            };
+            let _ids = crate::test_support::register_struct_ids_serialized(
+                std::collections::HashMap::from([(pyobj.to_string(), Some(pyobj_id))]),
+            );
+            let mut reg = StructFieldRegistry::default();
+            reg.fields.insert(
+                pyobj.to_string(),
+                vec![("type_ptr".to_string(), "usize".to_string())],
+            );
+            reg.fields
+                .insert("PyObject".to_string(), reg.fields[pyobj].clone());
+            reg.class_identity
+                .insert(pyobj.to_string(), Some(pyobj_identity.clone()));
+            reg.class_identity
+                .insert("PyObject".to_string(), Some(pyobj_identity));
+            reg.note_transparent_inner(wrapper.to_string(), "*mut pyobject::PyObject".to_string());
+            bk.set_struct_fields(Rc::new(reg));
+            let classdef = bk
+                .getuniqueclassdef_for_struct_root(pyobj)
+                .expect("PyObject classdef");
+            assert!(
+                bk.getuniqueclassdef_for_struct_root(wrapper).is_err(),
+                "{wrapper} pointer wrapper has no ClassDef"
+            );
+            let s_null = SomeValue::Instance(SomeInstance::new(None, true, Default::default()));
+            let s_root = bk
+                .immutablevalue(&ConstValue::byte_str(wrapper))
+                .expect("wrapper root constant");
+            let out = call_builtin(
+                &bk,
+                crate::runtime_names::shims::CAST_INSTANCE,
+                &[Some(s_null), Some(s_root)],
+                &no_kwds(),
+            )
+            .unwrap_or_else(|e| panic!("{wrapper} cast_instance_intrinsic: {e}"));
+            let SomeValue::Instance(inst) = out else {
+                panic!("{wrapper} dest must be the inner instance, got {out:?}");
+            };
+            assert!(inst.can_be_none, "{wrapper} null_mut dest stays nullable");
+            assert!(
+                inst.classdef
+                    .as_ref()
+                    .is_some_and(|got| Rc::ptr_eq(got, &classdef)),
+                "{wrapper} dest must be PyObject, got {:?}",
+                inst.classdef.as_ref().map(|cd| cd.borrow().name.clone())
             );
         }
     }

@@ -2443,6 +2443,7 @@ mod tests {
                     name: "switch".into(),
                     ty: ValueType::Bool,
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -3121,6 +3122,7 @@ mod tests {
                     name: "obj".into(),
                     ty: ValueType::Ref(None),
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -3449,6 +3451,7 @@ mod tests {
                     name: "v".into(),
                     ty: ValueType::Ref(Some(name)),
                     class_root: Some("bytecode::CodeObject".into()),
+                    param: None,
                 },
                 true,
             )
@@ -3733,6 +3736,7 @@ mod tests {
                     name: "x".into(),
                     ty: ValueType::Ref(Some("X".into())),
                     class_root: Some("X".into()),
+                    param: None,
                 },
                 true,
             )
@@ -4391,6 +4395,7 @@ mod tests {
                     name: "n".into(),
                     ty: ValueType::Unsigned,
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -4424,6 +4429,7 @@ mod tests {
                     name: "arr".into(),
                     ty: ValueType::Ref(None),
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -4448,6 +4454,7 @@ mod tests {
                     name: "n".into(),
                     ty: ValueType::Unsigned,
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -4496,6 +4503,7 @@ mod tests {
                     name: "n".into(),
                     ty: ValueType::Unsigned,
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -4541,6 +4549,7 @@ mod tests {
                     name: "n".into(),
                     ty: ValueType::Unsigned,
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -4603,6 +4612,7 @@ mod tests {
                     name: "n".into(),
                     ty: ValueType::Unsigned,
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -4694,6 +4704,7 @@ mod tests {
                     name: "op".into(),
                     ty: ValueType::Str,
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -4732,6 +4743,7 @@ mod tests {
                     name: "op".into(),
                     ty: ValueType::Str,
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -4902,6 +4914,7 @@ mod tests {
                     name: "window".into(),
                     ty: ValueType::Ref(None),
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -4926,6 +4939,7 @@ mod tests {
                     name: "n".into(),
                     ty: ValueType::Unsigned,
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -4960,6 +4974,7 @@ mod tests {
                     name: "sub".into(),
                     ty: ValueType::Ref(None),
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -4983,6 +4998,7 @@ mod tests {
                     name: "n".into(),
                     ty: ValueType::Unsigned,
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -5013,6 +5029,7 @@ mod tests {
                     name: "slot".into(),
                     ty: ValueType::Ref(None),
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -5058,6 +5075,7 @@ mod tests {
                     name: "slot".into(),
                     ty: ValueType::Ref(None),
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -5081,6 +5099,7 @@ mod tests {
                     name: "n".into(),
                     ty: ValueType::Unsigned,
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -5113,6 +5132,7 @@ mod tests {
                     name: "window".into(),
                     ty: ValueType::Ref(None),
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -5152,6 +5172,7 @@ mod tests {
                     name: "n".into(),
                     ty: ValueType::Unsigned,
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -5186,6 +5207,7 @@ mod tests {
                     name: "window".into(),
                     ty: ValueType::Ref(None),
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -5225,6 +5247,7 @@ mod tests {
                     name: "n".into(),
                     ty: ValueType::Unsigned,
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -5490,6 +5513,7 @@ mod tests {
                     name: "u".into(),
                     ty: ValueType::Unsigned,
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -5512,6 +5536,7 @@ mod tests {
                     name: "n".into(),
                     ty: ValueType::Unsigned,
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -5544,6 +5569,7 @@ mod tests {
                     name: "obj".into(),
                     ty: ValueType::Ref(None),
                     class_root: None,
+                    param: None,
                 },
                 true,
             )

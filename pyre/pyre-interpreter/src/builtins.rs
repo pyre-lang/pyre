@@ -22040,8 +22040,8 @@ pub(crate) fn frozendict_structural_hash(obj: PyObjectRef) -> Result<i64, crate:
         };
         let value_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(value);
-        let key_hash = if let Some(key) = hashed {
-            key.hash
+        let key_hash = if let Some((_, hash)) = hashed {
+            hash
         } else {
             let Some((k, _)) =
                 (unsafe { pyre_object::dictmultiobject::w_dict_nth_item(obj, slot) })

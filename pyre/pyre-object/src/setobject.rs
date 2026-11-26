@@ -226,6 +226,7 @@ pub trait SetStrategy {
         &self,
         w_set: PyObjectRef,
         key: crate::dictmultiobject::ObjectKey,
+        hash: i64,
     ) -> Result<(), SetUpdateError>;
 
     /// `SetStrategy.remove`. A removal that empties the live set calls
@@ -237,17 +238,19 @@ pub trait SetStrategy {
         &self,
         w_set: PyObjectRef,
         key: crate::dictmultiobject::ObjectKey,
+        hash: i64,
     ) -> Result<bool, crate::dictmultiobject::DictKeyError>;
 
     /// `SetStrategy.has_key`.
     ///
     /// # Safety
     /// `w_set` must point at a valid `W_SetObject`. Caller holds `w_set_lock`.
-    /// `key.hash` is the `space.hash_w` digest of `key.obj`.
+    /// `hash` is the `space.hash_w` digest of `key.0`.
     unsafe fn has_key(
         &self,
         w_set: PyObjectRef,
         key: crate::dictmultiobject::ObjectKey,
+        hash: i64,
     ) -> Result<bool, crate::dictmultiobject::DictKeyError>;
 
     /// `SetStrategy.clear`.
@@ -293,7 +296,7 @@ pub trait SetStrategy {
         &self,
         w_set: PyObjectRef,
         slot: usize,
-    ) -> Option<crate::dictmultiobject::ObjectKey>;
+    ) -> Option<(crate::dictmultiobject::ObjectKey, i64)>;
 
     /// `num_ever_used_items` (`rordereddict.py` `_ll_dictnext`).
     ///
@@ -695,8 +698,8 @@ pub static W_SET_GC_TYPE_ID_CELL: crate::lltype::TypeIdCell =
 /// GC-managed element table shared by `set` and `frozenset` bodies.
 ///
 /// Keyed with [`ObjectKeyBuildHasher`](crate::dictmultiobject::ObjectKeyBuildHasher),
-/// the same hasher `ObjectDictStorage` uses: `ObjectKey.hash` already *is*
-/// `space.hash_w(obj)`, so the default `RandomState` would SipHash a digest
+/// the same hasher `ObjectDictStorage` uses: the digest already *is*
+/// `space.hash_w(obj)` in `Entry.f_hash`, so the default `RandomState` would SipHash a digest
 /// that is itself the hash. `rordereddict` feeds the cached integer straight
 /// into the table; the multiply only spreads it into hashbrown's control bits.
 pub type SetItemsStorage = crate::rordereddict::RDict<
@@ -1276,28 +1279,28 @@ where
     let snap = snap_entries(strategy, set_slot);
     let n = snap.live.len();
     let index_len = snap.index_len;
-    let mut hashes = Vec::with_capacity(snap.nlive);
+    let mut live_hashes = Vec::with_capacity(snap.nlive);
     let wrap_base = crate::gc_roots::shadow_stack_len();
     for live_i in 0..snap.nlive {
         let key = snap_key(strategy, &snap, live_i);
         let wrapped = crate::gc_roots::pin_root(unsafe { strategy.wrap(key) });
-        let keyed = unsafe { crate::dictmultiobject::object_key_for_checked(wrapped)? };
-        hashes.push(keyed.hash);
+        let (keyed, digest) = unsafe { crate::dictmultiobject::object_key_for_checked(wrapped)? };
+        let _ = keyed;
+        live_hashes.push(digest as u64);
     }
     let mut slot_keys = Vec::with_capacity(n);
+    let mut slot_hashes = Vec::with_capacity(n);
     let mut live_i = 0usize;
     for slot in 0..n {
         if snap.live[slot] {
-            slot_keys.push(crate::dictmultiobject::ObjectKey {
-                hash: hashes[live_i],
-                obj: crate::gc_roots::shadow_stack_get(wrap_base + live_i),
-            });
+            slot_keys.push(crate::dictmultiobject::ObjectKey(
+                crate::gc_roots::shadow_stack_get(wrap_base + live_i),
+            ));
+            slot_hashes.push(live_hashes[live_i]);
             live_i += 1;
         } else {
-            slot_keys.push(crate::dictmultiobject::ObjectKey {
-                hash: 0,
-                obj: std::ptr::null_mut(),
-            });
+            slot_keys.push(crate::dictmultiobject::ObjectKey(std::ptr::null_mut()));
+            slot_hashes.push(0);
         }
     }
     // Do not read `sstorage` here. `hash_w` above may have `clear`ed the set
@@ -1306,7 +1309,7 @@ where
         crate::dictmultiobject::ObjectKey,
         (),
         crate::dictmultiobject::ObjectKeyBuildHasher,
-    >::from_preserved_slots(&slot_keys, &snap.live, index_len);
+    >::from_preserved_slots(&slot_keys, &slot_hashes, &snap.live, index_len);
     if crate::gc_hook::gc_alloc_failed_pending() {
         return Err(crate::dictmultiobject::DictKeyError);
     }
@@ -1364,6 +1367,7 @@ unsafe fn unwrapped_add<S>(
     strategy: &S,
     w_set: PyObjectRef,
     key: crate::dictmultiobject::ObjectKey,
+    hash: i64,
 ) -> Result<(), SetUpdateError>
 where
     S: AbstractUnwrappedSetStrategy,
@@ -1373,10 +1377,10 @@ where
     let obj_slot = crate::gc_roots::shadow_stack_len();
     let _ = crate::gc_roots::pin_root(w_set);
     let key_slot = crate::gc_roots::shadow_stack_len();
-    let _ = crate::gc_roots::pin_root(key.obj);
+    let _ = crate::gc_roots::pin_root(key.0);
     let key_obj = crate::gc_roots::shadow_stack_get(key_slot);
     if unsafe { strategy.is_correct_type(key_obj) } {
-        let unwrapped = unsafe { strategy.unwrap_with_hash(key_obj, key.hash) };
+        let unwrapped = unsafe { strategy.unwrap_with_hash(key_obj, hash) };
         unsafe { unwrapped_store(strategy, obj_slot, unwrapped)? };
         return Ok(());
     }
@@ -1384,11 +1388,8 @@ where
     // `getdict_w` raises before the strategy word is published.
     unwrapped_switch_to_object(strategy, obj_slot).map_err(SetUpdateError::Key)?;
     let obj = crate::gc_roots::shadow_stack_get(obj_slot);
-    let key = crate::dictmultiobject::ObjectKey {
-        hash: key.hash,
-        obj: crate::gc_roots::shadow_stack_get(key_slot),
-    };
-    unsafe { (*(obj as *const W_SetObject)).strategy.add(obj, key) }
+    let key = crate::dictmultiobject::ObjectKey(crate::gc_roots::shadow_stack_get(key_slot));
+    unsafe { (*(obj as *const W_SetObject)).strategy.add(obj, key, hash) }
 }
 
 /// `AbstractUnwrappedSetStrategy.has_key`.
@@ -1396,6 +1397,7 @@ unsafe fn unwrapped_has_key<S>(
     strategy: &S,
     w_set: PyObjectRef,
     key: crate::dictmultiobject::ObjectKey,
+    hash: i64,
 ) -> Result<bool, crate::dictmultiobject::DictKeyError>
 where
     S: AbstractUnwrappedSetStrategy,
@@ -1405,7 +1407,7 @@ where
     let obj_slot = crate::gc_roots::shadow_stack_len();
     let _ = crate::gc_roots::pin_root(w_set);
     let key_slot = crate::gc_roots::shadow_stack_len();
-    let _ = crate::gc_roots::pin_root(key.obj);
+    let _ = crate::gc_roots::pin_root(key.0);
     let key_obj = crate::gc_roots::shadow_stack_get(key_slot);
     if unsafe { strategy.is_correct_type(key_obj) } {
         let unwrapped = unsafe { strategy.unwrap(key_obj) };
@@ -1414,11 +1416,12 @@ where
     }
     unwrapped_switch_to_object(strategy, obj_slot)?;
     let obj = crate::gc_roots::shadow_stack_get(obj_slot);
-    let key = crate::dictmultiobject::ObjectKey {
-        hash: key.hash,
-        obj: crate::gc_roots::shadow_stack_get(key_slot),
-    };
-    unsafe { (*(obj as *const W_SetObject)).strategy.has_key(obj, key) }
+    let key = crate::dictmultiobject::ObjectKey(crate::gc_roots::shadow_stack_get(key_slot));
+    unsafe {
+        (*(obj as *const W_SetObject))
+            .strategy
+            .has_key(obj, key, hash)
+    }
 }
 
 /// Delete one unwrapped key. `to_empty` is `W_SetObject._discard_from_set`.
@@ -1453,6 +1456,7 @@ unsafe fn unwrapped_remove<S>(
     strategy: &S,
     w_set: PyObjectRef,
     key: crate::dictmultiobject::ObjectKey,
+    hash: i64,
 ) -> Result<bool, crate::dictmultiobject::DictKeyError>
 where
     S: AbstractUnwrappedSetStrategy,
@@ -1462,7 +1466,7 @@ where
     let obj_slot = crate::gc_roots::shadow_stack_len();
     let _ = crate::gc_roots::pin_root(w_set);
     let key_slot = crate::gc_roots::shadow_stack_len();
-    let _ = crate::gc_roots::pin_root(key.obj);
+    let _ = crate::gc_roots::pin_root(key.0);
     let key_obj = crate::gc_roots::shadow_stack_get(key_slot);
     if unsafe { strategy.is_correct_type(key_obj) } {
         return Ok(unwrapped_delete(
@@ -1474,11 +1478,12 @@ where
     }
     unwrapped_switch_to_object(strategy, obj_slot)?;
     let obj = crate::gc_roots::shadow_stack_get(obj_slot);
-    let key = crate::dictmultiobject::ObjectKey {
-        hash: key.hash,
-        obj: crate::gc_roots::shadow_stack_get(key_slot),
-    };
-    unsafe { (*(obj as *const W_SetObject)).strategy.remove(obj, key) }
+    let key = crate::dictmultiobject::ObjectKey(crate::gc_roots::shadow_stack_get(key_slot));
+    unsafe {
+        (*(obj as *const W_SetObject))
+            .strategy
+            .remove(obj, key, hash)
+    }
 }
 
 /// `has_key` for `w_set_contains_key_for_update`. `None` means the set was
@@ -1488,14 +1493,15 @@ unsafe fn unwrapped_contains_or_switch<S>(
     strategy: &S,
     set_slot: usize,
     key: crate::dictmultiobject::ObjectKey,
+    _hash: i64,
 ) -> Result<Option<bool>, crate::dictmultiobject::DictKeyError>
 where
     S: AbstractUnwrappedSetStrategy,
     (S::Key, ()): crate::rordereddict::GcEntriesType,
 {
     let obj = crate::gc_roots::shadow_stack_get(set_slot);
-    if unsafe { strategy.is_correct_type(key.obj) } {
-        let unwrapped = unsafe { strategy.unwrap(key.obj) };
+    if unsafe { strategy.is_correct_type(key.0) } {
+        let unwrapped = unsafe { strategy.unwrap(key.0) };
         let set = unsafe { &*(obj as *const W_SetObject) };
         Ok(Some(unsafe {
             (*strategy.storage_ptr(set)).contains_key(&unwrapped)
@@ -1510,14 +1516,15 @@ unsafe fn unwrapped_remove_or_switch<S>(
     strategy: &S,
     set_slot: usize,
     key: crate::dictmultiobject::ObjectKey,
+    _hash: i64,
 ) -> Result<Option<()>, crate::dictmultiobject::DictKeyError>
 where
     S: AbstractUnwrappedSetStrategy,
     (S::Key, ()): crate::rordereddict::GcEntriesType,
 {
     let obj = crate::gc_roots::shadow_stack_get(set_slot);
-    if unsafe { strategy.is_correct_type(key.obj) } {
-        unwrapped_delete(strategy, obj, key.obj, false);
+    if unsafe { strategy.is_correct_type(key.0) } {
+        unwrapped_delete(strategy, obj, key.0, false);
         Ok(Some(()))
     } else {
         unwrapped_switch_to_object(strategy, set_slot)?;
@@ -1609,7 +1616,7 @@ unsafe fn unwrapped_key_object<S>(
     strategy: &S,
     w_set: PyObjectRef,
     slot: usize,
-) -> Option<crate::dictmultiobject::ObjectKey>
+) -> Option<(crate::dictmultiobject::ObjectKey, i64)>
 where
     S: AbstractUnwrappedSetStrategy,
 {
@@ -1623,7 +1630,7 @@ where
         let hash = strategy.insertion_hash(&key);
         let key = strategy.pin_key(key);
         let wrapped = crate::gc_roots::pin_root(unsafe { strategy.wrap(key) });
-        return Some(crate::dictmultiobject::ObjectKey { hash, obj: wrapped });
+        return Some((crate::dictmultiobject::ObjectKey(wrapped), hash));
     }
     let key = strategy.pin_key(key);
     let wrapped = crate::gc_roots::pin_root(unsafe { strategy.wrap(key) });
@@ -1650,8 +1657,8 @@ where
     for live_i in 0..snap.nlive {
         let key = snap_key(strategy, &snap, live_i);
         let wrapped = crate::gc_roots::pin_root(unsafe { strategy.wrap(key) });
-        let keyed = unsafe { crate::dictmultiobject::object_key_for(wrapped) };
-        hashes.push(keyed.hash);
+        let (_keyed, hash) = unsafe { crate::dictmultiobject::object_key_for(wrapped) };
+        hashes.push(hash);
     }
     hashes
 }
@@ -1792,15 +1799,13 @@ where
     for live_i in 0..snap.nlive {
         let key = snap_key(strategy, &snap, live_i);
         let wrapped = crate::gc_roots::pin_root(unsafe { strategy.wrap(key) });
-        let keyed = unsafe { crate::dictmultiobject::object_key_for(wrapped) };
+        let (keyed, hash) = unsafe { crate::dictmultiobject::object_key_for(wrapped) };
         let _key_roots = crate::gc_roots::push_roots();
-        let key_obj = crate::gc_roots::pin_root(keyed.obj);
+        let key_obj = crate::gc_roots::pin_root(keyed.0);
         let present = w_set_contains_key_for_update(
             crate::gc_roots::shadow_stack_get(src_slot),
-            crate::dictmultiobject::ObjectKey {
-                hash: keyed.hash,
-                obj: key_obj,
-            },
+            crate::dictmultiobject::ObjectKey(key_obj),
+            hash,
         )?;
         if !present {
             keep_at.push(live_i);
@@ -1949,15 +1954,13 @@ where
     for live_i in 0..snap.nlive {
         let key = snap_key(strategy, &snap, live_i);
         let wrapped = crate::gc_roots::pin_root(unsafe { strategy.wrap(key) });
-        let keyed = unsafe { crate::dictmultiobject::object_key_for(wrapped) };
+        let (keyed, hash) = unsafe { crate::dictmultiobject::object_key_for(wrapped) };
         let _key_roots = crate::gc_roots::push_roots();
-        let key_obj = crate::gc_roots::pin_root(keyed.obj);
+        let key_obj = crate::gc_roots::pin_root(keyed.0);
         w_set_insert_key_checked(
             crate::gc_roots::shadow_stack_get(dst_slot),
-            crate::dictmultiobject::ObjectKey {
-                hash: keyed.hash,
-                obj: key_obj,
-            },
+            crate::dictmultiobject::ObjectKey(key_obj),
+            hash,
         )?;
     }
     Ok(())
@@ -2228,24 +2231,27 @@ where
         &self,
         w_set: PyObjectRef,
         key: crate::dictmultiobject::ObjectKey,
+        hash: i64,
     ) -> Result<(), SetUpdateError> {
-        unwrapped_add(self, w_set, key)
+        unwrapped_add(self, w_set, key, hash)
     }
 
     unsafe fn remove(
         &self,
         w_set: PyObjectRef,
         key: crate::dictmultiobject::ObjectKey,
+        hash: i64,
     ) -> Result<bool, crate::dictmultiobject::DictKeyError> {
-        unwrapped_remove(self, w_set, key)
+        unwrapped_remove(self, w_set, key, hash)
     }
 
     unsafe fn has_key(
         &self,
         w_set: PyObjectRef,
         key: crate::dictmultiobject::ObjectKey,
+        hash: i64,
     ) -> Result<bool, crate::dictmultiobject::DictKeyError> {
-        unwrapped_has_key(self, w_set, key)
+        unwrapped_has_key(self, w_set, key, hash)
     }
 
     unsafe fn clear(&self, w_set: PyObjectRef) {
@@ -2274,7 +2280,7 @@ where
         &self,
         w_set: PyObjectRef,
         slot: usize,
-    ) -> Option<crate::dictmultiobject::ObjectKey> {
+    ) -> Option<(crate::dictmultiobject::ObjectKey, i64)> {
         unwrapped_key_object(self, w_set, slot)
     }
 
@@ -2285,14 +2291,14 @@ where
 
     unsafe fn iterkey_at(&self, w_set: PyObjectRef, index: usize) -> *mut PyObject {
         match unwrapped_key_object(self, w_set, index) {
-            Some(key) => key.obj,
+            Some((key, _)) => key.0,
             None => std::ptr::null_mut(),
         }
     }
 
     unsafe fn iterkey_hash_at(&self, w_set: PyObjectRef, index: usize) -> i64 {
         match unwrapped_key_object(self, w_set, index) {
-            Some(key) => key.hash,
+            Some((_, hash)) => hash,
             None => 0,
         }
     }
@@ -2845,7 +2851,7 @@ unsafe fn publish_discard_if_live_box(obj: PyObjectRef, items: *mut SetItemsStor
 /// Remember `items` after a store of a GC reference into that box.
 ///
 /// The box is old (`gc_alloc_storage_box`) and `set_items_storage_custom_trace`
-/// walks its `ObjectKey.obj` slots. A minor reaches an old box only from the
+/// walks its `ObjectKey` pointer word. A minor reaches an old box only from the
 /// remembered set — `drag_out` does not trace an old root — including a box
 /// `clear` has already detached (`d = self.unerase(w_set.sstorage)`,
 /// `setobject.py`).
@@ -3029,12 +3035,9 @@ pub unsafe fn w_set_add(obj: PyObjectRef, item: PyObjectRef) {
     let _roots = crate::gc_roots::push_roots();
     let obj_slot = crate::gc_roots::pin_roots(&[obj, item]);
     let item_slot = obj_slot + 1;
-    let key = crate::dictmultiobject::object_key_for(crate::gc_roots::shadow_stack_get(item_slot));
-    let key = crate::dictmultiobject::object_key_hashed(
-        crate::gc_roots::shadow_stack_get(item_slot),
-        key.hash,
-    );
-    let _ = w_set_insert_key_checked(crate::gc_roots::shadow_stack_get(obj_slot), key);
+    let (key, hash) =
+        crate::dictmultiobject::object_key_for(crate::gc_roots::shadow_stack_get(item_slot));
+    let _ = w_set_insert_key_checked(crate::gc_roots::shadow_stack_get(obj_slot), key, hash);
 }
 
 /// Insert an element keyed on a `space.hash_w` digest the caller already
@@ -3055,7 +3058,7 @@ pub unsafe fn w_set_add_hashed_checked(
     item: PyObjectRef,
     hash: i64,
 ) -> Result<(), SetUpdateError> {
-    w_set_insert_key_checked(obj, crate::dictmultiobject::object_key_hashed(item, hash))
+    w_set_insert_key_checked(obj, crate::dictmultiobject::object_key_hashed(item), hash)
 }
 
 /// Run a set operation with the callback-free guard raised, so
@@ -3101,6 +3104,7 @@ unsafe fn callback_free_set_op<T>(
 unsafe fn scan_set_key_reentrant(
     items: *mut SetItemsStorage,
     mut key: crate::dictmultiobject::ObjectKey,
+    hash: i64,
 ) -> Result<(Option<usize>, crate::dictmultiobject::ObjectKey), crate::dictmultiobject::DictKeyError>
 {
     'restart: loop {
@@ -3109,21 +3113,21 @@ unsafe fn scan_set_key_reentrant(
         loop {
             let Some((slot, stored_hash, stored_obj)) = (*items)
                 .next_entry(i)
-                .map(|(slot, stored, _)| (slot, stored.hash, stored.obj))
+                .map(|(slot, stored, _)| (slot, (*items).slot_hash(slot).unwrap_or(0), stored.0))
             else {
                 return Ok((None, key));
             };
 
-            if stored_hash == key.hash {
+            if stored_hash == hash as u64 {
                 let _roots = crate::gc_roots::push_roots();
                 let stored_slot = crate::gc_roots::shadow_stack_len();
                 let stored_obj = crate::gc_roots::pin_root(stored_obj);
                 let key_slot = crate::gc_roots::shadow_stack_len();
-                key.obj = crate::gc_roots::pin_root(key.obj);
+                key.0 = crate::gc_roots::pin_root(key.0);
 
-                let equal = crate::dictmultiobject::dict_keys_equal(stored_obj, key.obj);
+                let equal = crate::dictmultiobject::dict_keys_equal(stored_obj, key.0);
                 let stored_obj = crate::gc_roots::shadow_stack_get(stored_slot);
-                key.obj = crate::gc_roots::shadow_stack_get(key_slot);
+                key.0 = crate::gc_roots::shadow_stack_get(key_slot);
                 if crate::dictmultiobject::take_dict_key_error() {
                     return Err(crate::dictmultiobject::DictKeyError);
                 }
@@ -3135,7 +3139,7 @@ unsafe fn scan_set_key_reentrant(
                 let disturbed = (*items).generation() != generation
                     // `entries.valid(index) && entries[index].key == checkingkey`.
                     || !(*items).get_slot(slot).is_some_and(|(stored, _)| {
-                        stored.hash == stored_hash && stored.obj == stored_obj
+                        (*items).slot_hash(slot) == Some(stored_hash) && stored.0 == stored_obj
                     });
                 if disturbed {
                     continue 'restart;
@@ -3168,17 +3172,18 @@ unsafe fn capture_set_items(obj: PyObjectRef) -> *mut SetItemsStorage {
 /// digest the key already carries rather than one taken afresh.
 ///
 /// # Safety
-/// `obj` must point to a valid `W_SetObject`, and `key.hash` must be the
-/// `space.hash_w` digest of `key.obj`.
+/// `obj` must point to a valid `W_SetObject`, and `hash` must be the
+/// `space.hash_w` digest of `key.0`.
 pub unsafe fn w_set_insert_key_checked(
     mut obj: PyObjectRef,
     key: crate::dictmultiobject::ObjectKey,
+    hash: i64,
 ) -> Result<(), SetUpdateError> {
-    let mut key_obj = key.obj;
+    let mut key_obj = key.0;
     // `W_BaseSetObject.add` → `self.strategy.add(self, w_key)`.
     crate::with_objlock!(w_set_lock_acquire; obj, key_obj => (*(obj as *const W_SetObject))
         .strategy
-        .add(obj, crate::dictmultiobject::ObjectKey { hash: key.hash, obj: key_obj }))
+        .add(obj, crate::dictmultiobject::ObjectKey(key_obj), hash))
 }
 
 /// Explicit `Result` shell the trace field-reads. `__discriminant` is an
@@ -3264,21 +3269,24 @@ fn set_strategy_bool_shell(
 
 /// Residual word ABI for `SetStrategy::add`.
 ///
-/// The traced call passes `(w_set, &ObjectKey)`. `&self` on the ZST strategy
-/// is void in the flow graph, and `ObjectKey` stays one pointer. The vtable
-/// method is `fn(&self, PyObjectRef, ObjectKey)` — hash and obj in registers —
-/// so calling that pointer with the two residual words reads the key pointer
-/// as the set. This trampoline is the operation the trace recorded.
+/// The traced call passes `(w_set, ObjectKey, hash)`. `&self` on the ZST
+/// strategy is void in the flow graph. `ObjectKey` is one pointer
+/// (`rordereddict.py get_ll_dict` DICTKEY = OBJECTPTR); the digest lives in
+/// `Entry.f_hash` (`ll_hash_from_cache`) and is the third residual word.
 ///
 /// The method returns a `Result` ADT (`setobject.py SetStrategy.add`); the
 /// interned shell is that residual word, `llmemory.GCREF`.
 #[majit_macros::dont_look_inside]
 pub extern "C" fn set_strategy_add_key_ptr(
     w_set: PyObjectRef,
-    key: *const crate::dictmultiobject::ObjectKey,
+    key: crate::dictmultiobject::ObjectKey,
+    hash: i64,
 ) -> crate::gc_hook::GCREF {
-    let key = unsafe { std::ptr::read(key) };
-    let result = unsafe { (*(w_set as *const W_SetObject)).strategy.add(w_set, key) };
+    let result = unsafe {
+        (*(w_set as *const W_SetObject))
+            .strategy
+            .add(w_set, key, hash)
+    };
     set_strategy_add_shell(result)
 }
 
@@ -3287,10 +3295,14 @@ pub extern "C" fn set_strategy_add_key_ptr(
 #[majit_macros::dont_look_inside]
 pub extern "C" fn set_strategy_remove_key_ptr(
     w_set: PyObjectRef,
-    key: *const crate::dictmultiobject::ObjectKey,
+    key: crate::dictmultiobject::ObjectKey,
+    hash: i64,
 ) -> crate::gc_hook::GCREF {
-    let key = unsafe { std::ptr::read(key) };
-    let result = unsafe { (*(w_set as *const W_SetObject)).strategy.remove(w_set, key) };
+    let result = unsafe {
+        (*(w_set as *const W_SetObject))
+            .strategy
+            .remove(w_set, key, hash)
+    };
     set_strategy_bool_shell(result)
 }
 
@@ -3299,13 +3311,13 @@ pub extern "C" fn set_strategy_remove_key_ptr(
 #[majit_macros::dont_look_inside]
 pub extern "C" fn set_strategy_has_key_ptr(
     w_set: PyObjectRef,
-    key: *const crate::dictmultiobject::ObjectKey,
+    key: crate::dictmultiobject::ObjectKey,
+    hash: i64,
 ) -> crate::gc_hook::GCREF {
-    let key = unsafe { std::ptr::read(key) };
     let result = unsafe {
         (*(w_set as *const W_SetObject))
             .strategy
-            .has_key(w_set, key)
+            .has_key(w_set, key, hash)
     };
     set_strategy_bool_shell(result)
 }
@@ -3318,35 +3330,37 @@ pub extern "C" fn set_strategy_has_key_ptr(
 /// stored under instead of hashing it again.
 ///
 /// # Safety
-/// `obj` must point to a valid `W_SetObject`, and `key.hash` must be the
-/// `space.hash_w` digest of `key.obj`.
+/// `obj` must point to a valid `W_SetObject`, and `hash` must be the
+/// `space.hash_w` digest of `key.0`.
 pub unsafe fn w_set_contains_key_checked(
     mut obj: PyObjectRef,
     key: crate::dictmultiobject::ObjectKey,
+    hash: i64,
 ) -> Result<bool, crate::dictmultiobject::DictKeyError> {
-    let mut key_obj = key.obj;
+    let mut key_obj = key.0;
     // `W_BaseSetObject.has_key` → `self.strategy.has_key(self, w_key)`.
     crate::with_objlock!(w_set_lock_acquire; obj, key_obj => (*(obj as *const W_SetObject))
         .strategy
-        .has_key(obj, crate::dictmultiobject::ObjectKey { hash: key.hash, obj: key_obj }))
+        .has_key(obj, crate::dictmultiobject::ObjectKey(key_obj), hash))
 }
 
 /// Remove a key that carries its own digest, propagating an `eq_w` raise from
 /// the bucket probe. Returns true when an element was removed.
 ///
 /// # Safety
-/// `obj` must point to a valid `W_SetObject`, and `key.hash` must be the
-/// `space.hash_w` digest of `key.obj`.
+/// `obj` must point to a valid `W_SetObject`, and `hash` must be the
+/// `space.hash_w` digest of `key.0`.
 pub unsafe fn w_set_discard_key_checked(
     mut obj: PyObjectRef,
     key: crate::dictmultiobject::ObjectKey,
+    hash: i64,
 ) -> Result<bool, crate::dictmultiobject::DictKeyError> {
-    let mut key_obj = key.obj;
+    let mut key_obj = key.0;
     // `W_BaseSetObject.remove` → `self.strategy.remove(self, w_item)`,
     // then `_discard_from_set` switches when the set is empty.
     crate::with_objlock!(w_set_lock_acquire; obj, key_obj => (*(obj as *const W_SetObject))
         .strategy
-        .remove(obj, crate::dictmultiobject::ObjectKey { hash: key.hash, obj: key_obj }))
+        .remove(obj, crate::dictmultiobject::ObjectKey(key_obj), hash))
 }
 
 /// Membership test.
@@ -3357,8 +3371,10 @@ pub unsafe fn w_set_contains(obj: PyObjectRef, item: PyObjectRef) -> bool {
     let _roots = crate::gc_roots::push_roots();
     let obj_slot = crate::gc_roots::pin_roots(&[obj, item]);
     let item_slot = obj_slot + 1;
-    let key = crate::dictmultiobject::object_key_for(crate::gc_roots::shadow_stack_get(item_slot));
-    w_set_contains_key_checked(crate::gc_roots::shadow_stack_get(obj_slot), key).unwrap_or(false)
+    let (key, hash) =
+        crate::dictmultiobject::object_key_for(crate::gc_roots::shadow_stack_get(item_slot));
+    w_set_contains_key_checked(crate::gc_roots::shadow_stack_get(obj_slot), key, hash)
+        .unwrap_or(false)
 }
 
 /// Fallible variant of [`w_set_contains`].
@@ -3376,10 +3392,10 @@ pub unsafe fn w_set_contains_checked(
     let _roots = crate::gc_roots::push_roots();
     let obj_slot = crate::gc_roots::pin_roots(&[obj, item]);
     let item_slot = obj_slot + 1;
-    let key = crate::dictmultiobject::object_key_for_checked(crate::gc_roots::shadow_stack_get(
-        item_slot,
-    ))?;
-    w_set_contains_key_checked(crate::gc_roots::shadow_stack_get(obj_slot), key)
+    let (key, hash) = crate::dictmultiobject::object_key_for_checked(
+        crate::gc_roots::shadow_stack_get(item_slot),
+    )?;
+    w_set_contains_key_checked(crate::gc_roots::shadow_stack_get(obj_slot), key, hash)
 }
 
 /// Remove an element if present. Returns true when removed.
@@ -3392,8 +3408,10 @@ pub unsafe fn w_set_discard(obj: PyObjectRef, item: PyObjectRef) -> bool {
     let _roots = crate::gc_roots::push_roots();
     let obj_slot = crate::gc_roots::pin_roots(&[obj, item]);
     let item_slot = obj_slot + 1;
-    let key = crate::dictmultiobject::object_key_for(crate::gc_roots::shadow_stack_get(item_slot));
-    w_set_discard_key_checked(crate::gc_roots::shadow_stack_get(obj_slot), key).unwrap_or(false)
+    let (key, hash) =
+        crate::dictmultiobject::object_key_for(crate::gc_roots::shadow_stack_get(item_slot));
+    w_set_discard_key_checked(crate::gc_roots::shadow_stack_get(obj_slot), key, hash)
+        .unwrap_or(false)
 }
 
 /// Fallible variant of [`w_set_discard`].
@@ -3408,10 +3426,10 @@ pub unsafe fn w_set_discard_checked(
     let _roots = crate::gc_roots::push_roots();
     let obj_slot = crate::gc_roots::pin_roots(&[obj, item]);
     let item_slot = obj_slot + 1;
-    let key = crate::dictmultiobject::object_key_for_checked(crate::gc_roots::shadow_stack_get(
-        item_slot,
-    ))?;
-    w_set_discard_key_checked(crate::gc_roots::shadow_stack_get(obj_slot), key)
+    let (key, hash) = crate::dictmultiobject::object_key_for_checked(
+        crate::gc_roots::shadow_stack_get(item_slot),
+    )?;
+    w_set_discard_key_checked(crate::gc_roots::shadow_stack_get(obj_slot), key, hash)
 }
 
 /// Remove every element.
@@ -3505,7 +3523,7 @@ unsafe fn difference_remove_src_keys(
             break;
         };
         let src = crate::gc_roots::shadow_stack_get(src_slot);
-        let Some(key) = w_set_key_at(src, slot) else {
+        let Some((key, hash)) = w_set_key_at(src, slot) else {
             return Err(SetUpdateError::ChangedSize);
         };
         let src_set = &*(crate::gc_roots::shadow_stack_get(src_slot) as *const W_SetObject);
@@ -3513,13 +3531,11 @@ unsafe fn difference_remove_src_keys(
         let src_storage = src_set.sstorage;
         let src_len = src_set.len_relaxed();
         let _key_roots = crate::gc_roots::push_roots();
-        let key_obj = crate::gc_roots::pin_root(key.obj);
+        let key_obj = crate::gc_roots::pin_root(key.0);
         w_set_remove_key_for_update(
             crate::gc_roots::shadow_stack_get(dst_slot),
-            crate::dictmultiobject::ObjectKey {
-                hash: key.hash,
-                obj: key_obj,
-            },
+            crate::dictmultiobject::ObjectKey(key_obj),
+            hash,
         )?;
         let src_set = &*(crate::gc_roots::shadow_stack_get(src_slot) as *const W_SetObject);
         if src_set.strategy.kind != src_kind
@@ -3554,7 +3570,13 @@ unsafe fn object_set_merge_captured(
     let src_items = capture_set_items(src);
     let mut i = 0;
     while let Some((slot, &key, _)) = (*src_items).next_entry(i) {
-        w_set_insert_key_into(crate::gc_roots::shadow_stack_get(dst_slot), dst_items, key)?;
+        let hash = (*src_items).slot_hash(slot).unwrap_or(0) as i64;
+        w_set_insert_key_into(
+            crate::gc_roots::shadow_stack_get(dst_slot),
+            dst_items,
+            key,
+            hash,
+        )?;
         i = slot + 1;
     }
     Ok(())
@@ -3596,7 +3618,11 @@ unsafe fn difference_update_object_storage(
             let Some(key) = w_set_key_at(dst, slot) else {
                 return Err(SetUpdateError::ChangedSize);
             };
-            if !w_set_contains_key_for_update(crate::gc_roots::shadow_stack_get(src_slot), key)? {
+            if !w_set_contains_key_for_update(
+                crate::gc_roots::shadow_stack_get(src_slot),
+                key.0,
+                key.1,
+            )? {
                 let dst = crate::gc_roots::shadow_stack_get(dst_slot);
                 if !same_live_object_box(&*(dst as *const W_SetObject), dst_items)
                     || (*dst_items).len() != dst_len
@@ -3610,7 +3636,11 @@ unsafe fn difference_update_object_storage(
                 let Some(key) = w_set_key_at(dst, slot) else {
                     return Err(SetUpdateError::ChangedSize);
                 };
-                w_set_insert_key_checked(crate::gc_roots::shadow_stack_get(result_slot), key)?;
+                w_set_insert_key_checked(
+                    crate::gc_roots::shadow_stack_get(result_slot),
+                    key.0,
+                    key.1,
+                )?;
             }
             i = slot + 1;
         }
@@ -3633,7 +3663,7 @@ unsafe fn difference_update_object_storage(
         let Some(key) = w_set_key_at(src, slot) else {
             return Err(SetUpdateError::ChangedSize);
         };
-        w_set_remove_key_for_update(crate::gc_roots::shadow_stack_get(dst_slot), key)?;
+        w_set_remove_key_for_update(crate::gc_roots::shadow_stack_get(dst_slot), key.0, key.1)?;
         let src = crate::gc_roots::shadow_stack_get(src_slot);
         if !same_live_object_box(&*(src as *const W_SetObject), src_items)
             || (*src_items).len() != src_len
@@ -3715,10 +3745,11 @@ pub unsafe fn w_set_update_from_set(
 unsafe fn w_set_insert_key_reentrant(
     dst: PyObjectRef,
     key: crate::dictmultiobject::ObjectKey,
+    hash: i64,
 ) -> Result<(), SetUpdateError> {
     let _roots = crate::gc_roots::push_roots();
     let items = capture_set_items(dst);
-    w_set_insert_key_into(dst, items, key)
+    w_set_insert_key_into(dst, items, key, hash)
 }
 
 /// Probe-and-insert half of [`w_set_insert_key_reentrant`] against a storage
@@ -3730,13 +3761,14 @@ unsafe fn w_set_insert_key_into(
     dst: PyObjectRef,
     items: *mut SetItemsStorage,
     key: crate::dictmultiobject::ObjectKey,
+    hash: i64,
 ) -> Result<(), SetUpdateError> {
     let _dst_roots = crate::gc_roots::push_roots();
     let dst_slot = crate::gc_roots::shadow_stack_len();
     let _ = crate::gc_roots::pin_root(dst);
     let key_slot = crate::gc_roots::shadow_stack_len();
     let mut key = key;
-    key.obj = crate::gc_roots::pin_root(key.obj);
+    key.0 = crate::gc_roots::pin_root(key.0);
     // Single insert probe (matches `r_dict.setitem`'s one bucket scan), run
     // callback-free so no user `__eq__` mutates the set while the table
     // borrow is live.  When every same-hash comparison stays inside the
@@ -3747,7 +3779,7 @@ unsafe fn w_set_insert_key_into(
     // set's size.
     if let Some(result) = callback_free_set_op(|| {
         let entries = &mut *items;
-        let index = entries.index_of(&key);
+        let index = entries.index_of_with_hash(hash as u64, &key);
         if crate::dict_eq_hook::callback_free_probe_broken() {
             return false;
         }
@@ -3758,8 +3790,8 @@ unsafe fn w_set_insert_key_into(
         // leaving the ladder, so this placement probe repeats those same
         // comparisons and cannot break either.
         let mut live_key = key;
-        live_key.obj = crate::gc_roots::shadow_stack_get(key_slot);
-        entries.insert(live_key, ());
+        live_key.0 = crate::gc_roots::shadow_stack_get(key_slot);
+        entries.insert_with_hash(hash as u64, live_key, ());
         true
     }) {
         if result.map_err(SetUpdateError::Key)? {
@@ -3776,15 +3808,15 @@ unsafe fn w_set_insert_key_into(
         return Ok(());
     }
 
-    key.obj = crate::gc_roots::shadow_stack_get(key_slot);
-    let (found, key) = scan_set_key_reentrant(items, key).map_err(SetUpdateError::Key)?;
+    key.0 = crate::gc_roots::shadow_stack_get(key_slot);
+    let (found, key) = scan_set_key_reentrant(items, key, hash).map_err(SetUpdateError::Key)?;
     if found.is_some() {
         return Ok(());
     }
     // The scan above proved the key absent, and repeating the probe here would
     // repeat its comparisons — the ones that can re-enter this table.  Place it
     // on the digest alone (`ll_call_insert_clean_function`).
-    (*items).insert_known_absent(key, ());
+    (*items).insert_known_absent_with_hash(hash as u64, key, ());
     if crate::gc_hook::gc_alloc_failed_pending() {
         return Err(SetUpdateError::Memory);
     }
@@ -3803,12 +3835,13 @@ unsafe fn w_set_insert_key_into(
 unsafe fn w_set_contains_key_for_update(
     probe: PyObjectRef,
     mut key: crate::dictmultiobject::ObjectKey,
+    hash: i64,
 ) -> Result<bool, SetUpdateError> {
     let _probe_roots = crate::gc_roots::push_roots();
     let probe_slot = crate::gc_roots::shadow_stack_len();
     let probe = crate::gc_roots::pin_root(probe);
     let key_root = crate::gc_roots::shadow_stack_len();
-    key.obj = crate::gc_roots::pin_root(key.obj);
+    key.0 = crate::gc_roots::pin_root(key.0);
     // `EmptySetStrategy.has_key` is False once the key is hashed. The digest
     // is already on `key`.
     if (*(probe as *const W_SetObject)).strategy.kind == SetStrategyKind::Empty {
@@ -3826,7 +3859,7 @@ unsafe fn w_set_contains_key_for_update(
     ) {
         // `None`: the set switched to object and the scan below retries.
         let answered = on_unwrapped!(kind, strategy => {
-            unwrapped_contains_or_switch(strategy, probe_slot, key)
+            unwrapped_contains_or_switch(strategy, probe_slot, key, hash)
         })
         .map_err(SetUpdateError::Key)?;
         if let Some(bit) = answered {
@@ -3834,7 +3867,7 @@ unsafe fn w_set_contains_key_for_update(
         }
     }
     let probe = crate::gc_roots::shadow_stack_get(probe_slot);
-    key.obj = crate::gc_roots::shadow_stack_get(key_root);
+    key.0 = crate::gc_roots::shadow_stack_get(key_root);
     // Bucket probe first, as in `w_set_contains_key_checked`.  The walk below
     // is the reentrant fallback and visits every entry, so without this a
     // whole-set difference probes linearly per element and runs quadratic.
@@ -3843,13 +3876,13 @@ unsafe fn w_set_contains_key_for_update(
         if s.strategy.kind == SetStrategyKind::Empty {
             return false;
         }
-        (*object_set_storage_ptr(s)).contains_key(&key)
+        (*object_set_storage_ptr(s)).contains_with_hash(hash as u64, &key)
     }) {
         return result.map_err(SetUpdateError::Key);
     }
     'restart: loop {
         let probe = crate::gc_roots::shadow_stack_get(probe_slot);
-        key.obj = crate::gc_roots::shadow_stack_get(key_root);
+        key.0 = crate::gc_roots::shadow_stack_get(key_root);
         if (*(probe as *const W_SetObject)).strategy.kind == SetStrategyKind::Empty {
             return Ok(false);
         }
@@ -3860,15 +3893,19 @@ unsafe fn w_set_contains_key_for_update(
             let Some((slot, &stored, _)) = (*items).next_entry(i) else {
                 break;
             };
-            if stored.hash == key.hash {
+            let Some(stored_hash) = (*items).slot_hash(slot) else {
+                i = slot + 1;
+                continue;
+            };
+            if stored_hash == hash as u64 {
                 let _roots = crate::gc_roots::push_roots();
                 let stored_slot = crate::gc_roots::shadow_stack_len();
-                let stored_obj = crate::gc_roots::pin_root(stored.obj);
+                let stored_obj = crate::gc_roots::pin_root(stored.0);
                 let key_slot = crate::gc_roots::shadow_stack_len();
-                key.obj = crate::gc_roots::pin_root(key.obj);
-                let equal = crate::dictmultiobject::dict_keys_equal(stored_obj, key.obj);
+                key.0 = crate::gc_roots::pin_root(key.0);
+                let equal = crate::dictmultiobject::dict_keys_equal(stored_obj, key.0);
                 let stored_obj = crate::gc_roots::shadow_stack_get(stored_slot);
-                key.obj = crate::gc_roots::shadow_stack_get(key_slot);
+                key.0 = crate::gc_roots::shadow_stack_get(key_slot);
                 if crate::dictmultiobject::take_dict_key_error() {
                     return Err(SetUpdateError::Key(crate::dictmultiobject::DictKeyError));
                 }
@@ -3876,7 +3913,7 @@ unsafe fn w_set_contains_key_for_update(
                 if !same_live_object_box(&*(probe as *const W_SetObject), items)
                     || (*items).len() != len
                     || !(*items).get_slot(slot).is_some_and(|(current, _)| {
-                        current.hash == stored.hash && current.obj == stored_obj
+                        (*items).slot_hash(slot) == Some(stored_hash) && current.0 == stored_obj
                     })
                 {
                     continue 'restart;
@@ -3898,12 +3935,13 @@ unsafe fn w_set_contains_key_for_update(
 unsafe fn w_set_remove_key_for_update(
     dst: PyObjectRef,
     mut key: crate::dictmultiobject::ObjectKey,
+    hash: i64,
 ) -> Result<(), SetUpdateError> {
     let _dst_roots = crate::gc_roots::push_roots();
     let dst_slot = crate::gc_roots::shadow_stack_len();
     let dst = crate::gc_roots::pin_root(dst);
     let key_root = crate::gc_roots::shadow_stack_len();
-    key.obj = crate::gc_roots::pin_root(key.obj);
+    key.0 = crate::gc_roots::pin_root(key.0);
     // An empty set has nothing to delete. `EmptySetStrategy.remove` is the
     // public discard path; this helper is `delitem_with_hash` and does not
     // switch strategy when the last element leaves.
@@ -3925,7 +3963,7 @@ unsafe fn w_set_remove_key_for_update(
         // `None`: the set switched to object and the scan below deletes it.
         // `Some`: `delitem_with_hash` already ran (`to_empty` is false).
         let answered = on_unwrapped!(kind, strategy => {
-            unwrapped_remove_or_switch(strategy, dst_slot, key)
+            unwrapped_remove_or_switch(strategy, dst_slot, key, hash)
         })
         .map_err(SetUpdateError::Key)?;
         if answered.is_some() {
@@ -3933,7 +3971,7 @@ unsafe fn w_set_remove_key_for_update(
         }
     }
     let dst = crate::gc_roots::shadow_stack_get(dst_slot);
-    key.obj = crate::gc_roots::shadow_stack_get(key_root);
+    key.0 = crate::gc_roots::shadow_stack_get(key_root);
     // Locate the bucket callback-free before falling back to the entry walk,
     // which is linear in the set's size.  The index is resolved inside the
     // probe and the removal withheld when a comparison leaves the builtin
@@ -3944,7 +3982,7 @@ unsafe fn w_set_remove_key_for_update(
             return false;
         }
         let items = object_set_storage_ptr(set);
-        let index = (*items).index_of(&key);
+        let index = (*items).index_of_with_hash(hash as u64, &key);
         if crate::dict_eq_hook::callback_free_probe_broken() {
             return false;
         }
@@ -3965,7 +4003,7 @@ unsafe fn w_set_remove_key_for_update(
     }
     'restart: loop {
         let dst = crate::gc_roots::shadow_stack_get(dst_slot);
-        key.obj = crate::gc_roots::shadow_stack_get(key_root);
+        key.0 = crate::gc_roots::shadow_stack_get(key_root);
         if (*(dst as *const W_SetObject)).strategy.kind == SetStrategyKind::Empty {
             return Ok(());
         }
@@ -3977,15 +4015,19 @@ unsafe fn w_set_remove_key_for_update(
             let Some((slot, &stored, _)) = (*items).next_entry(i) else {
                 break;
             };
-            if stored.hash == key.hash {
+            let Some(stored_hash) = (*items).slot_hash(slot) else {
+                i = slot + 1;
+                continue;
+            };
+            if stored_hash == hash as u64 {
                 let _roots = crate::gc_roots::push_roots();
                 let stored_slot = crate::gc_roots::shadow_stack_len();
-                let stored_obj = crate::gc_roots::pin_root(stored.obj);
+                let stored_obj = crate::gc_roots::pin_root(stored.0);
                 let key_slot = crate::gc_roots::shadow_stack_len();
-                key.obj = crate::gc_roots::pin_root(key.obj);
-                let equal = crate::dictmultiobject::dict_keys_equal(stored_obj, key.obj);
+                key.0 = crate::gc_roots::pin_root(key.0);
+                let equal = crate::dictmultiobject::dict_keys_equal(stored_obj, key.0);
                 let stored_obj = crate::gc_roots::shadow_stack_get(stored_slot);
-                key.obj = crate::gc_roots::shadow_stack_get(key_slot);
+                key.0 = crate::gc_roots::shadow_stack_get(key_slot);
                 if crate::dictmultiobject::take_dict_key_error() {
                     return Err(SetUpdateError::Key(crate::dictmultiobject::DictKeyError));
                 }
@@ -3993,7 +4035,7 @@ unsafe fn w_set_remove_key_for_update(
                 if !same_live_object_box(&*(dst as *const W_SetObject), items)
                     || (*items).len() != len
                     || !(*items).get_slot(slot).is_some_and(|(current, _)| {
-                        current.hash == stored.hash && current.obj == stored_obj
+                        (*items).slot_hash(slot) == Some(stored_hash) && current.0 == stored_obj
                     })
                 {
                     continue 'restart;
@@ -4079,7 +4121,7 @@ pub unsafe fn w_set_stored_hashes(mut obj: PyObjectRef) -> Vec<i64> {
 pub unsafe fn w_set_key_at(
     mut obj: PyObjectRef,
     slot: usize,
-) -> Option<crate::dictmultiobject::ObjectKey> {
+) -> Option<(crate::dictmultiobject::ObjectKey, i64)> {
     // `IntegerIteratorImplementation.next_entry` is `space.newint`.
     crate::with_objlock!(w_set_lock_acquire; obj => (*(obj as *const W_SetObject)).strategy.key_at(obj, slot))
 }
@@ -4143,7 +4185,7 @@ pub unsafe fn w_set_iterkey_hash_at(mut obj: *mut PyObject, index: usize) -> i64
 /// `key` was stored under.
 #[majit_macros::dont_look_inside]
 pub unsafe fn w_set_contains_with_hash(obj: *mut PyObject, key: *mut PyObject, hash: i64) -> i64 {
-    match w_set_contains_key_checked(obj, crate::dictmultiobject::ObjectKey { hash, obj: key }) {
+    match w_set_contains_key_checked(obj, crate::dictmultiobject::ObjectKey(key), hash) {
         Ok(true) => 1,
         Ok(false) => 0,
         Err(_) => -1,
@@ -4167,7 +4209,7 @@ pub unsafe fn w_set_contains_with_hash(obj: *mut PyObject, key: *mut PyObject, h
 /// `key` was stored under.
 #[majit_macros::dont_look_inside]
 pub unsafe fn w_set_setitem_with_hash(obj: *mut PyObject, key: *mut PyObject, hash: i64) -> i64 {
-    match w_set_insert_key_checked(obj, crate::dictmultiobject::ObjectKey { hash, obj: key }) {
+    match w_set_insert_key_checked(obj, crate::dictmultiobject::ObjectKey(key), hash) {
         Ok(()) => 0,
         Err(SetUpdateError::Key(_)) => -1,
         Err(SetUpdateError::ChangedSize) => -2,
@@ -4192,9 +4234,9 @@ pub unsafe fn w_set_items(obj: PyObjectRef) -> Vec<PyObjectRef> {
 }
 
 /// Walk, in place, every element `PyObjectRef` slot of a set for an
-/// immortal owner.  Forwards each `ObjectKey.obj` slot: `ObjectKey.hash` is
-/// identity-stable across a GC move, so writing the relocated pointer through
-/// the key's `obj` slot keeps the bucket index valid.  Alloc-free — unlike
+/// immortal owner.  Forwards each `ObjectKey` pointer word: the digest lives in
+/// `Entry.f_hash` (`ll_hash_from_cache`) and is content-derived, so rewriting
+/// the pointer after a young-gen move keeps the bucket index valid.  Alloc-free — unlike
 /// [`w_set_items`], which materialises a `Vec`.  A collector-owned set does
 /// not use this walk: `set_items_storage_custom_trace` traces the storage
 /// box, and the set body only forwards `items`.
@@ -4239,6 +4281,7 @@ impl SetStrategy for EmptySetStrategy {
         &self,
         w_set: PyObjectRef,
         key: crate::dictmultiobject::ObjectKey,
+        hash: i64,
     ) -> Result<(), SetUpdateError> {
         // `EmptySetStrategy.add`: `is_plain_int1` → `IntegerSetStrategy`;
         // `type is W_BytesObject` → `BytesSetStrategy`; exact `W_UnicodeObject`
@@ -4249,7 +4292,7 @@ impl SetStrategy for EmptySetStrategy {
         let obj_slot = crate::gc_roots::shadow_stack_len();
         let _ = crate::gc_roots::pin_root(w_set);
         let key_slot = crate::gc_roots::shadow_stack_len();
-        let _ = crate::gc_roots::pin_root(key.obj);
+        let _ = crate::gc_roots::pin_root(key.0);
         let key_obj = crate::gc_roots::shadow_stack_get(key_slot);
         if crate::listobject::is_plain_int1(key_obj) {
             switch_empty_to(
@@ -4275,11 +4318,8 @@ impl SetStrategy for EmptySetStrategy {
             switch_empty_to_object_strategy(crate::gc_roots::shadow_stack_get(obj_slot));
         }
         let obj = crate::gc_roots::shadow_stack_get(obj_slot);
-        let key = crate::dictmultiobject::ObjectKey {
-            hash: key.hash,
-            obj: crate::gc_roots::shadow_stack_get(key_slot),
-        };
-        (*(obj as *const W_SetObject)).strategy.add(obj, key)
+        let key = crate::dictmultiobject::ObjectKey(crate::gc_roots::shadow_stack_get(key_slot));
+        (*(obj as *const W_SetObject)).strategy.add(obj, key, hash)
     }
 
     /// `EmptySetStrategy.remove` returns False. The caller already hashed.
@@ -4287,6 +4327,7 @@ impl SetStrategy for EmptySetStrategy {
         &self,
         _w_set: PyObjectRef,
         _key: crate::dictmultiobject::ObjectKey,
+        _hash: i64,
     ) -> Result<bool, crate::dictmultiobject::DictKeyError> {
         Ok(false)
     }
@@ -4296,6 +4337,7 @@ impl SetStrategy for EmptySetStrategy {
         &self,
         _w_set: PyObjectRef,
         _key: crate::dictmultiobject::ObjectKey,
+        _hash: i64,
     ) -> Result<bool, crate::dictmultiobject::DictKeyError> {
         Ok(false)
     }
@@ -4327,7 +4369,7 @@ impl SetStrategy for EmptySetStrategy {
         &self,
         _w_set: PyObjectRef,
         _slot: usize,
-    ) -> Option<crate::dictmultiobject::ObjectKey> {
+    ) -> Option<(crate::dictmultiobject::ObjectKey, i64)> {
         None
     }
 
@@ -4398,33 +4440,32 @@ impl SetStrategy for ObjectSetStrategy {
         &self,
         w_set: PyObjectRef,
         key: crate::dictmultiobject::ObjectKey,
+        hash: i64,
     ) -> Result<(), SetUpdateError> {
         // `ObjectSetStrategy` `is_correct_type` is always true, so `add`
         // stores into the captured box (`AbstractUnwrappedSetStrategy.add`).
-        w_set_insert_key_reentrant(w_set, key)
+        w_set_insert_key_reentrant(w_set, key, hash)
     }
 
     unsafe fn remove(
         &self,
         w_set: PyObjectRef,
         key: crate::dictmultiobject::ObjectKey,
+        hash: i64,
     ) -> Result<bool, crate::dictmultiobject::DictKeyError> {
         let _roots = crate::gc_roots::push_roots();
         let obj_slot = crate::gc_roots::shadow_stack_len();
         let _ = crate::gc_roots::pin_root(w_set);
         let key_slot = crate::gc_roots::shadow_stack_len();
-        let _ = crate::gc_roots::pin_root(key.obj);
+        let _ = crate::gc_roots::pin_root(key.0);
         let obj = crate::gc_roots::shadow_stack_get(obj_slot);
-        let key = crate::dictmultiobject::ObjectKey {
-            hash: key.hash,
-            obj: crate::gc_roots::shadow_stack_get(key_slot),
-        };
+        let key = crate::dictmultiobject::ObjectKey(crate::gc_roots::shadow_stack_get(key_slot));
         if let Some(result) = callback_free_set_op(|| {
             let items = {
                 let s = &*(obj as *const W_SetObject);
                 object_set_storage_ptr(s)
             };
-            let index = (*items).index_of(&key);
+            let index = (*items).index_of_with_hash(hash as u64, &key);
             if crate::dict_eq_hook::callback_free_probe_broken() {
                 return false;
             }
@@ -4438,7 +4479,7 @@ impl SetStrategy for ObjectSetStrategy {
             return result;
         }
         let items = capture_set_items(obj);
-        let (found, _) = scan_set_key_reentrant(items, key)?;
+        let (found, _) = scan_set_key_reentrant(items, key, hash)?;
         if let Some(index) = found {
             // Remove from the captured box; a `clear` during the probe orphans
             // it. A removal that empties the live box runs
@@ -4455,25 +4496,23 @@ impl SetStrategy for ObjectSetStrategy {
         &self,
         w_set: PyObjectRef,
         key: crate::dictmultiobject::ObjectKey,
+        hash: i64,
     ) -> Result<bool, crate::dictmultiobject::DictKeyError> {
         let _roots = crate::gc_roots::push_roots();
         let obj_slot = crate::gc_roots::shadow_stack_len();
         let _ = crate::gc_roots::pin_root(w_set);
         let key_slot = crate::gc_roots::shadow_stack_len();
-        let _ = crate::gc_roots::pin_root(key.obj);
+        let _ = crate::gc_roots::pin_root(key.0);
         let obj = crate::gc_roots::shadow_stack_get(obj_slot);
-        let key = crate::dictmultiobject::ObjectKey {
-            hash: key.hash,
-            obj: crate::gc_roots::shadow_stack_get(key_slot),
-        };
+        let key = crate::dictmultiobject::ObjectKey(crate::gc_roots::shadow_stack_get(key_slot));
         if let Some(result) = callback_free_set_op(|| {
             let s = &*(obj as *const W_SetObject);
-            (*object_set_storage_ptr(s)).contains_key(&key)
+            (*object_set_storage_ptr(s)).contains_with_hash(hash as u64, &key)
         }) {
             return result;
         }
         let items = capture_set_items(obj);
-        let (found, _) = scan_set_key_reentrant(items, key)?;
+        let (found, _) = scan_set_key_reentrant(items, key, hash)?;
         Ok(found.is_some())
     }
 
@@ -4490,7 +4529,7 @@ impl SetStrategy for ObjectSetStrategy {
         let (key, ()) = entries.pop()?;
         s.set_len_relaxed(s.len_relaxed() - 1);
         s.hash = -1;
-        Some(key.obj)
+        Some(key.0)
     }
 
     unsafe fn get_storage_copy(&self, src: PyObjectRef, dst: PyObjectRef) {
@@ -4531,7 +4570,7 @@ impl SetStrategy for ObjectSetStrategy {
         let s = &*(w_set as *const W_SetObject);
         let mut items = Vec::with_capacity((*object_set_storage_ptr(s)).len());
         for key in (*object_set_storage_ptr(s)).keys() {
-            items.push(key.obj);
+            items.push(key.0);
         }
         items
     }
@@ -4545,11 +4584,12 @@ impl SetStrategy for ObjectSetStrategy {
         &self,
         w_set: PyObjectRef,
         slot: usize,
-    ) -> Option<crate::dictmultiobject::ObjectKey> {
+    ) -> Option<(crate::dictmultiobject::ObjectKey, i64)> {
         let s = &*(w_set as *const W_SetObject);
-        (*object_set_storage_ptr(s))
+        let items = object_set_storage_ptr(s);
+        (*items)
             .get_slot(slot)
-            .map(|(&key, _)| key)
+            .map(|(&key, _)| (key, (*items).slot_hash(slot).unwrap_or(0) as i64))
     }
 
     unsafe fn num_ever_used_items(&self, w_set: PyObjectRef) -> usize {
@@ -4560,25 +4600,30 @@ impl SetStrategy for ObjectSetStrategy {
     unsafe fn iterkey_at(&self, w_set: PyObjectRef, index: usize) -> *mut PyObject {
         let s = &*(w_set as *const W_SetObject);
         match (*object_set_storage_ptr(s)).get_slot(index) {
-            Some((key, _)) => key.obj,
+            Some((key, _)) => key.0,
             None => std::ptr::null_mut(),
         }
     }
 
     unsafe fn iterkey_hash_at(&self, w_set: PyObjectRef, index: usize) -> i64 {
         let s = &*(w_set as *const W_SetObject);
-        match (*object_set_storage_ptr(s)).get_slot(index) {
-            Some((key, _)) => key.hash,
+        let items = object_set_storage_ptr(s);
+        match (*items).get_slot(index) {
+            Some(_) => (*items).slot_hash(index).unwrap_or(0) as i64,
             None => 0,
         }
     }
 
     unsafe fn stored_hashes(&self, w_set: PyObjectRef) -> Vec<i64> {
         let s = &*(w_set as *const W_SetObject);
-        (*object_set_storage_ptr(s))
-            .keys()
-            .map(|key| key.hash)
-            .collect()
+        let items = object_set_storage_ptr(s);
+        let mut hashes = Vec::new();
+        let mut i = 0;
+        while let Some((slot, _, _)) = (*items).next_entry(i) {
+            hashes.push((*items).slot_hash(slot).unwrap_or(0) as i64);
+            i = slot + 1;
+        }
+        hashes
     }
 
     unsafe fn update(
@@ -4654,7 +4699,7 @@ impl SetStrategy for ObjectSetStrategy {
         for (key, _) in entries.iter_mut_for_trace() {
             let key_ptr = key as *const crate::dictmultiobject::ObjectKey
                 as *mut crate::dictmultiobject::ObjectKey;
-            visitor(std::ptr::addr_of_mut!((*key_ptr).obj) as *mut PyObjectRef);
+            visitor(std::ptr::addr_of_mut!((*key_ptr).0) as *mut PyObjectRef);
         }
         visitor(entries.entries_slot() as *mut PyObjectRef);
         entries.visit_indexes(&mut |slot| visitor(slot as *mut PyObjectRef));
@@ -5573,11 +5618,11 @@ mod tests {
             assert!(w_set_discard(s, w_int_new(2)));
             let slot_a = w_set_next_slot(s, 0).unwrap();
             let key_a = w_set_key_at(s, slot_a).unwrap();
-            assert_eq!(crate::w_int_get_value(key_a.obj), 1);
-            assert_eq!(key_a.hash, 1);
+            assert_eq!(crate::w_int_get_value(key_a.0.0), 1);
+            assert_eq!(key_a.1, 1);
             let slot_b = w_set_next_slot(s, slot_a + 1).unwrap();
             let key_b = w_set_key_at(s, slot_b).unwrap();
-            assert_eq!(crate::w_int_get_value(key_b.obj), 3);
+            assert_eq!(crate::w_int_get_value(key_b.0.0), 3);
             let hole = slot_a + 1;
             if hole != slot_b {
                 assert!(w_set_key_at(s, hole).is_none());
@@ -5589,11 +5634,11 @@ mod tests {
             );
             assert_eq!(w_set_len(s), 3);
             assert_eq!(
-                crate::w_int_get_value(w_set_key_at(s, slot_a).unwrap().obj),
+                crate::w_int_get_value(w_set_key_at(s, slot_a).unwrap().0.0),
                 1
             );
             assert_eq!(
-                crate::w_int_get_value(w_set_key_at(s, slot_b).unwrap().obj),
+                crate::w_int_get_value(w_set_key_at(s, slot_b).unwrap().0.0),
                 3
             );
             if hole != slot_b {
@@ -5663,12 +5708,9 @@ mod tests {
             assert!(!w_set_contains(s, crate::w_bytes_from_bytes(b"ef")));
             let slot = w_set_next_slot(s, 0).unwrap();
             let key = w_set_key_at(s, slot).unwrap();
-            assert_eq!(crate::w_bytes_data(key.obj), b"ab");
-            assert_eq!(key.hash, crate::dictmultiobject::object_key_for(first).hash);
-            assert_eq!(
-                key.hash,
-                crate::dictmultiobject::object_key_for(key.obj).hash
-            );
+            assert_eq!(crate::w_bytes_data(key.0.0), b"ab");
+            assert_eq!(key.1, crate::dictmultiobject::object_key_for(first).1);
+            assert_eq!(key.1, crate::dictmultiobject::object_key_for(key.0.0).1);
             assert!(w_set_discard(s, crate::w_bytes_from_bytes(b"cd")));
             assert_eq!(w_set_len(s), 1);
             assert!(!w_set_discard(s, crate::w_bytes_from_bytes(b"zz")));
@@ -5696,12 +5738,9 @@ mod tests {
             assert!(!w_set_contains(s, crate::w_str_new("ef")));
             let slot = w_set_next_slot(s, 0).unwrap();
             let key = w_set_key_at(s, slot).unwrap();
-            assert_eq!(crate::w_str_get_wtf8(key.obj).as_bytes(), b"ab");
-            assert_eq!(key.hash, crate::dictmultiobject::object_key_for(first).hash);
-            assert_eq!(
-                key.hash,
-                crate::dictmultiobject::object_key_for(key.obj).hash
-            );
+            assert_eq!(crate::w_str_get_wtf8(key.0.0).as_bytes(), b"ab");
+            assert_eq!(key.1, crate::dictmultiobject::object_key_for(first).1);
+            assert_eq!(key.1, crate::dictmultiobject::object_key_for(key.0.0).1);
             assert!(w_set_discard(s, crate::w_str_new("cd")));
             let popped = w_set_popitem(s).unwrap();
             assert_eq!(crate::w_str_get_wtf8(popped).as_bytes(), b"ab");
@@ -5757,10 +5796,10 @@ mod tests {
             assert_eq!(strategy_kind(s), SetStrategyKind::Bytes);
             let slot_a = w_set_next_slot(s, 0).unwrap();
             let key_a = w_set_key_at(s, slot_a).unwrap();
-            assert_eq!(crate::w_bytes_data(key_a.obj), b"a");
+            assert_eq!(crate::w_bytes_data(key_a.0.0), b"a");
             let slot_c = w_set_next_slot(s, slot_a + 1).unwrap();
             let key_c = w_set_key_at(s, slot_c).unwrap();
-            assert_eq!(crate::w_bytes_data(key_c.obj), b"c");
+            assert_eq!(crate::w_bytes_data(key_c.0.0), b"c");
             let hole = slot_a + 1;
             if hole != slot_c {
                 assert!(w_set_key_at(s, hole).is_none());
@@ -5769,11 +5808,11 @@ mod tests {
             assert_eq!(strategy_kind(s), SetStrategyKind::Object);
             assert_eq!(w_set_len(s), 3);
             assert_eq!(
-                crate::w_bytes_data(w_set_key_at(s, slot_a).unwrap().obj),
+                crate::w_bytes_data(w_set_key_at(s, slot_a).unwrap().0.0),
                 b"a"
             );
             assert_eq!(
-                crate::w_bytes_data(w_set_key_at(s, slot_c).unwrap().obj),
+                crate::w_bytes_data(w_set_key_at(s, slot_c).unwrap().0.0),
                 b"c"
             );
             if hole != slot_c {
@@ -5785,8 +5824,8 @@ mod tests {
             assert!(!w_set_contains(s, crate::w_bytes_from_bytes(b"b")));
             let stored = w_set_key_at(s, slot_a).unwrap();
             assert_eq!(
-                stored.hash,
-                crate::dictmultiobject::object_key_for(crate::w_bytes_from_bytes(b"a")).hash
+                stored.1,
+                crate::dictmultiobject::object_key_for(crate::w_bytes_from_bytes(b"a")).1
             );
         }
     }
@@ -5803,12 +5842,12 @@ mod tests {
             assert_eq!(strategy_kind(s), SetStrategyKind::Ascii);
             let slot_a = w_set_next_slot(s, 0).unwrap();
             assert_eq!(
-                crate::w_str_get_wtf8(w_set_key_at(s, slot_a).unwrap().obj).as_bytes(),
+                crate::w_str_get_wtf8(w_set_key_at(s, slot_a).unwrap().0.0).as_bytes(),
                 b"a"
             );
             let slot_c = w_set_next_slot(s, slot_a + 1).unwrap();
             assert_eq!(
-                crate::w_str_get_wtf8(w_set_key_at(s, slot_c).unwrap().obj).as_bytes(),
+                crate::w_str_get_wtf8(w_set_key_at(s, slot_c).unwrap().0.0).as_bytes(),
                 b"c"
             );
             let hole = slot_a + 1;
@@ -5819,11 +5858,11 @@ mod tests {
             assert_eq!(strategy_kind(s), SetStrategyKind::Object);
             assert_eq!(w_set_len(s), 3);
             assert_eq!(
-                crate::w_str_get_wtf8(w_set_key_at(s, slot_a).unwrap().obj).as_bytes(),
+                crate::w_str_get_wtf8(w_set_key_at(s, slot_a).unwrap().0.0).as_bytes(),
                 b"a"
             );
             assert_eq!(
-                crate::w_str_get_wtf8(w_set_key_at(s, slot_c).unwrap().obj).as_bytes(),
+                crate::w_str_get_wtf8(w_set_key_at(s, slot_c).unwrap().0.0).as_bytes(),
                 b"c"
             );
             if hole != slot_c {
@@ -5835,8 +5874,8 @@ mod tests {
             assert!(!w_set_contains(s, crate::w_str_new("b")));
             let stored = w_set_key_at(s, slot_a).unwrap();
             assert_eq!(
-                stored.hash,
-                crate::dictmultiobject::object_key_for(crate::w_str_new("a")).hash
+                stored.1,
+                crate::dictmultiobject::object_key_for(crate::w_str_new("a")).1
             );
         }
     }
@@ -6115,12 +6154,12 @@ mod tests {
             w_set_add(s, inst);
             assert_eq!(strategy_kind(s), SetStrategyKind::Identity);
             let slot = w_set_next_slot(s, 0).unwrap();
-            assert_eq!(w_set_key_at(s, slot).unwrap().hash, 11);
+            assert_eq!(w_set_key_at(s, slot).unwrap().1, 11);
             assert_eq!(w_set_stored_hashes(s), vec![11]);
 
             INSTANCE_HASH.with(|cell| cell.set(99));
             assert_eq!(w_set_stored_hashes(s), vec![11]);
-            assert_eq!(w_set_key_at(s, slot).unwrap().hash, 11);
+            assert_eq!(w_set_key_at(s, slot).unwrap().1, 11);
             assert_eq!(w_set_iterkey_hash_at(s, slot), 11);
             assert!(w_set_contains(s, inst));
 

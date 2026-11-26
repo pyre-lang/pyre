@@ -929,6 +929,7 @@ mod tests {
                     name: "missing_red".into(),
                     ty: ValueType::Int,
                     class_root: None,
+                    param: None,
                 },
             });
         let old = graph.startblock;

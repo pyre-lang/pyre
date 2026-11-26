@@ -119,14 +119,14 @@ pub unsafe fn w_dict_switch_kwargs_to_object_strategy(w_dict: PyObjectRef) {
     let mut hashes = Vec::with_capacity(len);
     let pairs_base = dict_slot + 1;
     for i in 0..len {
-        let object_key =
+        let (object_key, hash) =
             crate::dictmultiobject::object_key_for(kwargs_storage(roots.get(dict_slot)).0[i]);
         // Take the value only now: the old table is traced through the
         // pinned dict, so re-reading the slot after this iteration's hash
         // yields the current word.
         let v = kwargs_storage(roots.get(dict_slot)).1[i];
-        hashes.push(object_key.hash);
-        roots.publish(&[object_key.obj, v]);
+        hashes.push(hash);
+        roots.publish(&[object_key.0, v]);
     }
     let new_storage = crate::gc_storage::gc_alloc_young_storage_box(
         crate::dictmultiobject::object_dict_storage_with_capacity(len),
@@ -136,7 +136,7 @@ pub unsafe fn w_dict_switch_kwargs_to_object_strategy(w_dict: PyObjectRef) {
     for (i, &hash) in hashes.iter().enumerate() {
         let obj = roots.get(pairs_base + 2 * i);
         let value = roots.get(pairs_base + 2 * i + 1);
-        new_map.insert(crate::dictmultiobject::ObjectKey { hash, obj }, value);
+        new_map.insert_with_hash(hash as u64, crate::dictmultiobject::ObjectKey(obj), value);
     }
     crate::dictmultiobject::install_object_dict_storage(roots.get(dict_slot), new_storage);
 }

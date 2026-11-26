@@ -1198,7 +1198,7 @@ pub fn _convert_const(_space: PyObjectRef, w_a: PyObjectRef) -> PyObjectRef {
         while let Some(slot) = unsafe { pyre_object::setobject::w_set_next_slot(current(), cursor) }
         {
             if let Some(key) = unsafe { pyre_object::setobject::w_set_key_at(current(), slot) } {
-                items.push(_convert_const(std::ptr::null_mut(), key.obj));
+                items.push(_convert_const(std::ptr::null_mut(), key.0.0));
             }
             cursor = slot + 1;
         }

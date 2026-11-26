@@ -585,7 +585,8 @@ fn write_object(
                         .ok_or_else(|| PyError::value_error("unmarshallable object"))?;
                     let item = setobject::w_set_key_at(obj_root.get(), slot)
                         .ok_or_else(|| PyError::value_error("unmarshallable object"))?
-                        .obj;
+                        .0
+                        .0;
                     cursor = slot + 1;
                     let item_root = Rooted::new(item);
                     write_object(out, item_root.get(), refs, version, depth - 1)?;

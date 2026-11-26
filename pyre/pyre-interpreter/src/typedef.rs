@@ -7494,8 +7494,8 @@ fn set_init_from_iterable_impl(
             set_setitem_with_hash_result(unsafe {
                 pyre_object::w_set_setitem_with_hash(
                     pyre_object::gc_roots::shadow_stack_get(set_slot),
-                    key.obj,
-                    key.hash,
+                    key.0.0,
+                    key.1,
                 )
             })?;
             copied_hashed_key = true;
@@ -9581,13 +9581,14 @@ fn dict_fromkeys_impl(
                 let Some(slot) = (unsafe { pyre_object::w_set_next_slot(iterable, index) }) else {
                     break;
                 };
-                let Some(key) = (unsafe { pyre_object::w_set_key_at(iterable, slot) }) else {
+                let Some((key, hash)) = (unsafe { pyre_object::w_set_key_at(iterable, slot) })
+                else {
                     break;
                 };
                 let d = pyre_object::gc_roots::shadow_stack_get(sp);
                 let value = pyre_object::gc_roots::shadow_stack_get(sp + 1);
-                unsafe { pyre_object::w_dict_store_hashed_checked(d, key.obj, value, key.hash) }
-                    .map_err(|_| crate::baseobjspace::take_pending_mapping_key_error(d, key.obj))?;
+                unsafe { pyre_object::w_dict_store_hashed_checked(d, key.0, value, hash) }
+                    .map_err(|_| crate::baseobjspace::take_pending_mapping_key_error(d, key.0))?;
                 index = slot + 1;
             }
             return Ok(pyre_object::gc_roots::shadow_stack_get(sp));
@@ -33179,22 +33180,24 @@ fn set_intersect_update(
             pyre_object::w_set_next_slot(pyre_object::gc_roots::shadow_stack_get(keep_slot), i)
         {
             let keep = pyre_object::gc_roots::shadow_stack_get(keep_slot);
-            let Some(key) = pyre_object::w_set_key_at(keep, slot) else {
+            let Some((key, hash)) = pyre_object::w_set_key_at(keep, slot) else {
                 break;
             };
             if pyre_object::w_set_contains_key_checked(
                 pyre_object::gc_roots::shadow_stack_get(probe_slot),
                 key,
+                hash,
             )
             .map_err(|_| crate::baseobjspace::take_pending_hash_error())?
             {
                 let keep = pyre_object::gc_roots::shadow_stack_get(keep_slot);
-                let Some(key) = pyre_object::w_set_key_at(keep, slot) else {
+                let Some((key, hash)) = pyre_object::w_set_key_at(keep, slot) else {
                     break;
                 };
                 pyre_object::w_set_insert_key_checked(
                     pyre_object::gc_roots::shadow_stack_get(result_slot),
                     key,
+                    hash,
                 )
                 .map_err(crate::baseobjspace::map_set_update_error)?;
             }
@@ -33534,12 +33537,13 @@ fn set_is_disjoint_from(
             pyre_object::w_set_next_slot(pyre_object::gc_roots::shadow_stack_get(walk_slot), i)
         {
             let walk = pyre_object::gc_roots::shadow_stack_get(walk_slot);
-            let Some(key) = pyre_object::w_set_key_at(walk, slot) else {
+            let Some((key, hash)) = pyre_object::w_set_key_at(walk, slot) else {
                 break;
             };
             if pyre_object::w_set_contains_key_checked(
                 pyre_object::gc_roots::shadow_stack_get(probe_slot),
                 key,
+                hash,
             )
             .map_err(|_| crate::baseobjspace::take_pending_hash_error())?
             {
@@ -33578,12 +33582,13 @@ pub(crate) fn set_is_subset_of(
             pyre_object::w_set_next_slot(pyre_object::gc_roots::shadow_stack_get(set_slot), i)
         {
             let w_set = pyre_object::gc_roots::shadow_stack_get(set_slot);
-            let Some(key) = pyre_object::w_set_key_at(w_set, slot) else {
+            let Some((key, hash)) = pyre_object::w_set_key_at(w_set, slot) else {
                 break;
             };
             if !pyre_object::w_set_contains_key_checked(
                 pyre_object::gc_roots::shadow_stack_get(other_slot),
                 key,
+                hash,
             )
             .map_err(|_| crate::baseobjspace::take_pending_hash_error())?
             {
@@ -34356,8 +34361,8 @@ fn set_iter_reduce(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
         let mut remaining = Vec::new();
         let mut i = pyre_object::w_set_iter_get_slot(iter());
         while let Some(slot) = pyre_object::w_set_next_slot(w_set(), i) {
-            if let Some(key) = pyre_object::w_set_key_at(w_set(), slot) {
-                remaining.push(key.obj);
+            if let Some((key, _)) = pyre_object::w_set_key_at(w_set(), slot) {
+                remaining.push(key.0);
             }
             i = slot + 1;
         }

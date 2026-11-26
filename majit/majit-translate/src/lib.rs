@@ -4785,6 +4785,7 @@ mod portal_driver_tests {
                         name: "self".to_string(),
                         ty: ValueType::Ref(None),
                         class_root: None,
+                        param: None,
                     },
                     true,
                 )
@@ -4803,6 +4804,7 @@ mod portal_driver_tests {
                     name: "handler".to_string(),
                     ty: ValueType::Ref(None),
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -5500,6 +5502,7 @@ mod portal_driver_tests {
                 name: "frame".into(),
                 ty: ValueType::Ref(None),
                 class_root: Some("PyFrame".into()),
+                param: None,
             },
             frame.clone(),
         );
@@ -5540,6 +5543,7 @@ mod portal_driver_tests {
                 name: "frame".into(),
                 ty: ValueType::Ref(None),
                 class_root: Some("PyFrame".into()),
+                param: None,
             },
             eval_frame,
         );
@@ -5549,6 +5553,7 @@ mod portal_driver_tests {
                 name: "resume".into(),
                 ty: ValueType::Ref(None),
                 class_root: None,
+                param: None,
             },
             resume,
         );
@@ -6421,6 +6426,7 @@ mod portal_driver_tests {
                     name: "w_type".into(),
                     ty: ValueType::Ref(None),
                     class_root: None,
+                    param: None,
                 },
             });
         graph
@@ -6432,6 +6438,7 @@ mod portal_driver_tests {
                     name: "obj".into(),
                     ty: ValueType::Ref(None),
                     class_root: None,
+                    param: None,
                 },
             });
         let len = graph.alloc_value_var_with_type(ConcreteType::Signed);

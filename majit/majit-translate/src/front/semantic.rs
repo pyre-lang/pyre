@@ -575,6 +575,15 @@ pub struct StructFieldRegistry {
     /// the wrapper is not a C struct.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub(crate) transparent_scalar_kinds: HashMap<String, crate::model::ValueType>,
+    /// Inner field-row layout of a by-value `#[repr(transparent)]` ADT
+    /// (`transparent_nonzst_field`). Keyed like
+    /// [`Self::transparent_scalar_kinds`]: full path and crate-stripped
+    /// path when it still names a module. `field_row_lltype` peels to
+    /// this spelling before the nested inline Struct arm
+    /// (`rordereddict.py` `get_ll_dict`; `lltype.py`
+    /// `_interior_ptr._expose` of a Ptr field).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub(crate) transparent_inners: HashMap<String, String>,
     /// Crate roots of FunDecls that lowered a body and are not local
     /// alias roots. Intern and field lookup strip these prefixes
     /// (`bookkeeper.py` `getuniqueclassdef`). Owned by this harvested
@@ -857,7 +866,59 @@ impl StructFieldRegistry {
         {
             return Some(kind);
         }
-        unique_transparent_scalar_kind(&self.transparent_scalar_kinds, lookup)
+        unique_path_suffix_value(&self.transparent_scalar_kinds, lookup)
+    }
+
+    /// Inner field-row layout of a harvested by-value
+    /// `#[repr(transparent)]` ADT, or `None`.
+    ///
+    /// Dual-publish and unique-suffix lookup match
+    /// [`Self::transparent_scalar_kind`]. A pointer inner is the
+    /// pointer spelling (`*mut PyObject`); `field_row_lltype` of the
+    /// wrapper is that inner's lltype (`rordereddict.py` `get_ll_dict`;
+    /// `lltype.py` `_interior_ptr._expose` of a Ptr field).
+    pub(crate) fn transparent_inner_field(&self, class_root: &str) -> Option<String> {
+        let stripped = class_root
+            .trim()
+            .trim_start_matches("&mut ")
+            .trim_start_matches('&')
+            .trim_start_matches("mut ")
+            .trim();
+        let lookup = stripped
+            .split_once('<')
+            .map(|(bare, _)| bare)
+            .unwrap_or(stripped);
+        if let Some(inner) = self
+            .transparent_inners
+            .get(stripped)
+            .or_else(|| self.transparent_inners.get(lookup))
+            .cloned()
+        {
+            return Some(inner);
+        }
+        let canonical = majit_ir::descr::canonical_struct_name(lookup);
+        if canonical.as_str() != lookup
+            && let Some(inner) = self.transparent_inners.get(canonical.as_str()).cloned()
+        {
+            return Some(inner);
+        }
+        unique_path_suffix_value(&self.transparent_inners, lookup)
+    }
+
+    /// Record the unique non-ZST field layout of a
+    /// `#[repr(transparent)]` wrapper. Skips a self-mapping and an
+    /// empty inner.
+    pub(crate) fn note_transparent_inner(
+        &mut self,
+        key: impl Into<String>,
+        inner: impl Into<String>,
+    ) {
+        let key = key.into();
+        let inner = inner.into();
+        if key.is_empty() || inner.is_empty() || key == inner {
+            return;
+        }
+        self.transparent_inners.entry(key).or_insert(inner);
     }
 
     /// Look up a field's type.  For array-typed fields like
@@ -1509,13 +1570,13 @@ pub(crate) fn is_path_suffix(longer: &str, shorter: &str) -> bool {
 /// Kind of `lookup` when every harvested transparent-scalar key whose
 /// leaf matches agrees. Two crates' `InternalBitFlags` disagree and
 /// stay `None`; `FrameAnchor` / `&FrameAnchor` share one unsigned word.
-fn unique_transparent_scalar_kind(
-    kinds: &HashMap<String, crate::model::ValueType>,
+fn unique_path_suffix_value<T: Clone + PartialEq>(
+    values: &HashMap<String, T>,
     lookup: &str,
-) -> Option<crate::model::ValueType> {
+) -> Option<T> {
     let leaf = lookup.rsplit("::").next().unwrap_or(lookup);
-    let mut found: Option<&crate::model::ValueType> = None;
-    for (key, kind) in kinds {
+    let mut found: Option<&T> = None;
+    for (key, value) in values {
         let key_leaf = key.rsplit("::").next().unwrap_or(key);
         if key_leaf != leaf {
             continue;
@@ -1526,8 +1587,8 @@ fn unique_transparent_scalar_kind(
             continue;
         }
         match found {
-            None => found = Some(kind),
-            Some(prev) if prev != kind => return None,
+            None => found = Some(value),
+            Some(prev) if prev != value => return None,
             Some(_) => {}
         }
     }
@@ -1899,6 +1960,34 @@ mod tests {
             crate::model::ValueType::Int,
         );
         assert_eq!(reg.transparent_scalar_kind("InternalBitFlags"), None);
+    }
+
+    #[test]
+    fn transparent_inner_field_resolves_unique_leaf_and_refuses_collision() {
+        let mut reg = StructFieldRegistry::default();
+        reg.note_transparent_inner(
+            "identitydict::TransparentKey".to_string(),
+            "*mut pyobject::PyObject".to_string(),
+        );
+        reg.note_transparent_inner(
+            "pyre_object::identitydict::TransparentKey".to_string(),
+            "*mut pyobject::PyObject".to_string(),
+        );
+        assert_eq!(
+            reg.transparent_inner_field("TransparentKey").as_deref(),
+            Some("*mut pyobject::PyObject")
+        );
+        assert_eq!(
+            reg.transparent_inner_field("identitydict::TransparentKey")
+                .as_deref(),
+            Some("*mut pyobject::PyObject")
+        );
+        reg.note_transparent_inner(
+            "crate_a::PackedKey".to_string(),
+            "*mut pyobject::PyObject".to_string(),
+        );
+        reg.note_transparent_inner("crate_b::PackedKey".to_string(), "i64".to_string());
+        assert_eq!(reg.transparent_inner_field("PackedKey"), None);
     }
 
     /// `remove` then `insert` of a different key restores `len`. The suffix

@@ -59,6 +59,7 @@ pub(crate) fn build_ll_wtf8_nth_graph() -> FunctionGraph {
             name: "s".to_string(),
             ty: ValueType::Str,
             class_root: None,
+            param: None,
         },
         s.clone(),
     );
@@ -72,6 +73,7 @@ pub(crate) fn build_ll_wtf8_nth_graph() -> FunctionGraph {
             // `Wtf8CodePoints::nth(n)`: `n` is `usize` / `r_uint`.
             ty: ValueType::Unsigned,
             class_root: None,
+            param: None,
         },
         n.clone(),
     );
@@ -450,6 +452,7 @@ mod tests {
                 name: "s".to_string(),
                 ty: ValueType::Str,
                 class_root: None,
+                param: None,
             },
             s.clone(),
         );
@@ -461,6 +464,7 @@ mod tests {
                 name: "n".to_string(),
                 ty: ValueType::Unsigned,
                 class_root: None,
+                param: None,
             },
             n.clone(),
         );
@@ -548,6 +552,7 @@ mod tests {
                 name: "n".to_string(),
                 ty: ValueType::Unsigned,
                 class_root: None,
+                param: None,
             },
             n.clone(),
         );
