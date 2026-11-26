@@ -5754,6 +5754,185 @@ mod portal_driver_tests {
         );
     }
 
+    /// `warmspot.py rewrite_jit_merge_point` leaves
+    /// `return portal_runner(*args)` on origportalgraph. A merge-point red
+    /// that carries `access_directly` must not retarget that call onto
+    /// `{runner}__AccessDirect_None`; jtransform emits `RecursiveCall`
+    /// of the registered runner (`call.py guess_call_kind` →
+    /// `jtransform.py handle_recursive_call`).
+    #[test]
+    fn rewritten_portal_with_access_directly_red_emits_recursive_call() {
+        use crate::codewriter::flatten::FlatOp;
+        use crate::codewriter::type_state::ConcreteType;
+
+        let mut call_control = call::CallControl::new();
+        let portal = CallPath::from_segments(["fixture", "eval_loop_jit"]);
+        let runner = CallPath::from_segments(["fixture", "portal_runner"]);
+        call_control.register_function_graph(runner.clone(), {
+            let mut graph = FunctionGraph::new("portal_runner");
+            graph.set_return(graph.startblock, None);
+            graph
+        });
+        let mut graph = FunctionGraph::new("pyre_jit::eval::eval_loop_jit");
+        let next_instr = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let is_being_profiled = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let pycode = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let frame = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let ec = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        graph.blocks[graph.startblock.0].inputargs = vec![
+            next_instr.clone(),
+            is_being_profiled.clone(),
+            pycode.clone(),
+            frame.clone(),
+            ec.clone(),
+        ];
+        let hinted = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        graph.blocks[graph.startblock.0]
+            .operations
+            .push(SpaceOperation {
+                result: Some(hinted.clone()),
+                kind: OpKind::Call {
+                    target: CallTarget::function_path(["hint_access_directly"]),
+                    args: crate::model::call_args(vec![frame]),
+                    result_ty: ValueType::Ref(None),
+                },
+            });
+        graph.blocks[graph.startblock.0]
+            .operations
+            .push(SpaceOperation {
+                result: None,
+                kind: OpKind::Call {
+                    target: CallTarget::method("jit_merge_point", Some("PyPyJitDriver".into())),
+                    args: crate::model::call_args(vec![
+                        hinted.clone(),
+                        next_instr,
+                        is_being_profiled,
+                        pycode,
+                        hinted,
+                        ec,
+                    ]),
+                    result_ty: ValueType::Void,
+                },
+            });
+        graph.set_return(graph.startblock, None);
+        call_control.register_function_graph(portal.clone(), graph);
+        call_control.register_helper_graph(portal.clone());
+
+        let config = pipeline::PipelineConfig {
+            transform: GraphTransformConfig::default(),
+            jit_drivers: vec![pipeline::JitDriverSpec {
+                portal: portal.clone(),
+                portal_runner: Some(runner.clone()),
+                greens: vec![
+                    "next_instr".into(),
+                    "is_being_profiled".into(),
+                    "pycode".into(),
+                ],
+                reds: vec!["frame".into(), "ec".into()],
+                green_kinds: Vec::new(),
+                red_kinds: Vec::new(),
+                autoreds: false,
+                virtualizables: vec!["frame".into()],
+                red_types: vec!["PyFrame".into(), "ExecutionContext".into()],
+                split_portal: true,
+                extends: None,
+            }],
+            register_trait_families: Vec::new(),
+            helper_graphs: Vec::new(),
+            builtin_graphs: Vec::new(),
+        };
+        register_configured_jitdrivers(
+            &mut call_control,
+            &config.jit_drivers,
+            &config.transform.jitdriver_receiver_roots,
+        );
+        let mut policy = policy::DefaultJitPolicy::new();
+        call_control.find_all_graphs(&mut policy);
+
+        {
+            let original_graph = call_control
+                .function_graphs()
+                .get(&portal)
+                .expect("original portal graph remains registered");
+            let runner_ops: Vec<_> = original_graph
+                .blocks
+                .iter()
+                .flat_map(|block| block.operations.iter())
+                .filter(|op| match &op.kind {
+                    OpKind::Call {
+                        target:
+                            CallTarget::FunctionPath {
+                                segments,
+                                specialization,
+                                ..
+                            },
+                        ..
+                    } => {
+                        segments.as_slice() == runner.segments.as_slice()
+                            && *specialization == GraphSpecialization::Regular
+                    }
+                    _ => false,
+                })
+                .cloned()
+                .collect();
+            assert_eq!(
+                runner_ops.len(),
+                1,
+                "rewrite must leave one Regular portal_runner call"
+            );
+            assert_eq!(
+                call_control.guess_call_kind(&runner_ops[0]),
+                call::CallKind::Recursive
+            );
+        }
+        let mut ad_runner = runner.clone();
+        ad_runner.specialization = GraphSpecialization::AccessDirect;
+        assert!(
+            call_control.function_graphs().get(&ad_runner).is_none(),
+            "injected portal_runner call must not mint an AccessDirect copy"
+        );
+
+        let (jitcodes, _, _, _, _, _) = make_jitcodes(
+            &config,
+            &mut call_control,
+            &mut PhaseProfiler::new(),
+            &[],
+            &[],
+            &[],
+        );
+        let orig_jc = call_control
+            .jitcodes()
+            .get(&portal)
+            .cloned()
+            .or_else(|| {
+                jitcodes
+                    .iter()
+                    .find(|jc| jc.name == "eval_loop_jit")
+                    .cloned()
+            })
+            .expect("orig portal jitcode");
+        let recursive = orig_jc
+            .body()
+            ._ssarepr
+            .as_ref()
+            .and_then(|ssarepr| ssarepr.as_any().downcast_ref::<SSARepr>())
+            .expect("assembled orig portal keeps its SSA representation")
+            .insns
+            .iter()
+            .find_map(|flat_op| match flat_op {
+                FlatOp::Op(inner) => match &inner.kind {
+                    OpKind::RecursiveCall { jd_index, .. } => Some(*jd_index),
+                    _ => None,
+                },
+                _ => None,
+            });
+        assert_eq!(
+            recursive,
+            Some(0),
+            "origportalgraph must emit RecursiveCall of the registered runner"
+        );
+    }
+
     /// `eval_loop_jit` reloads the hinted frame through
     /// `gc_roots::reload_top_root` inside the loop that holds
     /// `jit_merge_point`. The reload is a GC-erasure identity of its first

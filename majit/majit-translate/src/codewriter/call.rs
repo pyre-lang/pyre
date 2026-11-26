@@ -10151,11 +10151,28 @@ impl CallControl {
     /// argument carries the flag and `_jit_look_inside_` is not false;
     /// otherwise the regular cache key. The AccessDirect arm then
     /// `cachedgraph`s a distinct copy; this method only chooses the key.
+    ///
+    /// A call whose target is a registered `portal_runner` stays Regular.
+    /// `warmspot.py rewrite_jit_merge_point` injects
+    /// `direct_call(Constant(jd.portal_runner_ptr), *args)` after rtyping;
+    /// `helper_func` types that helper from FUNCTYPE via
+    /// `lltype_to_annotation` (`MixLevelHelperAnnotator.getgraph`), so the
+    /// injected site is never `FunctionDesc.specialize` /
+    /// `default_specialize`d as AccessDirect. Keeping the registered
+    /// CallPath lets `guess_call_kind` stay `recursive`
+    /// (`call.py jitdriver_sd_from_portal_runner_ptr`).
     fn call_specialization(
+        &self,
         kind: &OpKind,
         hinted: &HashSet<u64>,
         callee: &FunctionGraph,
     ) -> Specialization {
+        if let OpKind::Call { target, .. } = kind
+            && let Some(path) = self.target_to_path(target)
+            && self.is_portal_recursive_call(&path)
+        {
+            return Specialization::Regular;
+        }
         if Self::op_passes_access_directly(kind, hinted)
             && callee.func.jit_look_inside != Some(false)
         {
@@ -10583,7 +10600,7 @@ impl CallControl {
                             op_returns.push(FlagReturn::UNFLAGGED);
                             continue;
                         };
-                        let spec = Self::call_specialization(
+                        let spec = self.call_specialization(
                             &op.kind,
                             &binding_cache
                                 .as_ref()
@@ -27990,6 +28007,92 @@ mod tests {
                 "portal graph identities must not stand in for portal_runner_ptr"
             );
         }
+    }
+
+    /// `warmspot.py rewrite_jit_merge_point` injects
+    /// `direct_call(portal_runner_ptr)` after rtyping. A flagged red
+    /// actual must not retarget that call onto
+    /// `{runner}__AccessDirect_None`; `guess_call_kind` stays recursive.
+    #[test]
+    fn portal_runner_call_with_access_directly_red_stays_recursive() {
+        let mut cc = CallControl::new();
+        let portal = CallPath::from_segments(["fixture", "eval_loop_jit_portal"]);
+        let original = CallPath::from_segments(["fixture", "eval_loop_jit"]);
+        let runner = CallPath::from_segments(["call_jit", "ll_portal_runner_shim"]);
+        cc.register_function_graph(
+            runner.clone(),
+            graph_with_formals("ll_portal_runner_shim", 5),
+        );
+        cc.setup_jitdriver(
+            portal,
+            vec![
+                "next_instr".into(),
+                "is_being_profiled".into(),
+                "pycode".into(),
+            ],
+            vec!["frame".into(), "ec".into()],
+            Vec::new(),
+            Vec::new(),
+            false,
+            vec!["frame".into()],
+            vec!["PyFrame".into(), "ExecutionContext".into()],
+            original.clone(),
+        );
+        cc.set_jitdriver_portal_runner(0, Some(runner.clone()));
+
+        let mut graph = FunctionGraph::new("eval_loop_jit");
+        let next_instr = graph.alloc_value_var();
+        let is_being_profiled = graph.alloc_value_var();
+        let pycode = graph.alloc_value_var();
+        let frame = graph.alloc_value_var();
+        let ec = graph.alloc_value_var();
+        let start = graph.startblock;
+        graph.blocks[start.0].inputargs = vec![
+            next_instr.clone(),
+            is_being_profiled.clone(),
+            pycode.clone(),
+            frame.clone(),
+            ec.clone(),
+        ];
+        let hinted = push_hint_access_directly(&mut graph, start, frame);
+        graph.block_mut(start).operations.push(SpaceOperation {
+            result: None,
+            kind: OpKind::Call {
+                target: CallTarget::function_path(runner.segments.iter().map(String::as_str)),
+                args: crate::model::call_args(vec![
+                    next_instr,
+                    is_being_profiled,
+                    pycode,
+                    hinted,
+                    ec,
+                ]),
+                result_ty: ValueType::Void,
+            },
+        });
+        graph.set_return(graph.startblock, None);
+        cc.register_function_graph(original.clone(), graph);
+
+        cc.annotate_access_directly(&[original.clone()]);
+
+        let stored = cc.function_graphs().get(&original).expect("orig portal");
+        let runner_op = stored
+            .block(stored.startblock)
+            .operations
+            .iter()
+            .find(|op| call_op_target_path(op).as_ref() == Some(&runner))
+            .expect("injected portal_runner call");
+        assert_eq!(
+            call_op_target_path(runner_op).as_ref(),
+            Some(&runner),
+            "rewritten portal_runner call must stay Regular"
+        );
+        assert!(
+            cc.function_graphs()
+                .get(&access_directly_path(&runner))
+                .is_none(),
+            "portal_runner must not grow an AccessDirect copy from the injected site"
+        );
+        assert_eq!(cc.guess_call_kind(runner_op), CallKind::Recursive);
     }
 
     #[test]

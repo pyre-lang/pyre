@@ -10,11 +10,12 @@
 # `call_trace` that raises skips both the eval body and `return_trace` and STILL
 # owes the leave event, and a `return_trace` that raises owes it too.
 #
-# pyre's portal carries that bracket itself rather than reaching `execute_frame`
-# (`eval::eval_with_jit_inner`), so the nesting has to be carried with it: an
-# early return on either of the first two hooks drops the third.  Measured
-# before the fix, with the same two arms below: `call` reported no profile event
-# at all and `return` reported only `call`.
+# Native `ll_portal_runner` now runs inside `execute_frame`'s `call_trace` /
+# `return_trace` / `leave` (`eval::eval_frame_plain_with_resume`). Residual
+# portal entries (`portal_activation_*`) still carry their own copy of that
+# nested bracket: an early return on either of the first two hooks drops the
+# third.  Measured before the residual fix, with the same two arms below:
+# `call` reported no profile event at all and `return` reported only `call`.
 #
 # Both arms are exact and both are checked, because they fail separately -- the
 # first drops the leave event from a path that never ran the body, the second

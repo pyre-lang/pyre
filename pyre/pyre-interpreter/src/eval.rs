@@ -142,7 +142,7 @@ pub fn install_current_frame(frame: &mut PyFrame) -> CurrentFrameGuard {
     });
     // executioncontext.py `enter()` parity: link the frame into the
     // topframeref/f_backref chain so walkers (GC roots, sys._getframe)
-    // can iterate all active frames. `eval_frame_plain` calls
+    // can iterate all active frames. `eval_frame_plain_with_resume` calls
     // `ExecutionContext::enter` before installing TLS-only state, but
     // the JIT portal path enters through this helper directly.
     let ec = crate::call::getexecutioncontext() as *mut PyExecutionContext;
@@ -1178,7 +1178,7 @@ pub unsafe fn walk_pyframe_roots_area(
             }
             let _stdalloc = majit_gc::shadow_stack::extra_area_scope("pyframe.stdalloc");
             // SAFETY: PyFrame pointers on the f_backref chain are valid
-            // for the duration of the enclosing `eval_with_jit` call. A
+            // for the duration of the enclosing `execute_frame` call. A
             // minor collection is always synchronous with respect to the
             // interpreter thread, so frames cannot be dropped mid-walk.
             //
@@ -2414,28 +2414,6 @@ pub fn handle_exception_with_context(
     false
 }
 
-/// Execute a frame — pure interpreter, no JIT.
-///
-/// Crate-private: the canonical
-/// surface is `PyFrame::run` / `PyFrame::execute_frame` (PyPy
-/// `pyframe.py run` / `pyframe.py execute_frame`).  Retained as a
-/// free function because pyre's JIT override mechanism (call.rs
-/// `EVAL_OVERRIDE: OnceLock<EvalFn>` where `EvalFn = fn(&mut PyFrame,
-/// Option<&mut FrameResumeArgs>) -> PyResult`) requires a `fn` pointer.  Rust
-/// methods cannot be cast to `fn` pointers, so the canonical body stays as a
-/// free function and the `EVAL_OVERRIDE.unwrap_or(eval_frame_plain)` fallback
-/// (`call.rs`'s `get_eval_fn`) continues to reference it directly.
-///
-/// `resume` is `Some` only for a suspended frame being resumed
-/// (`generator.py _invoke_execute_frame`); an ordinary call passes
-/// `None` and enters at the frame's first instruction.
-pub(crate) fn eval_frame_plain(
-    frame: &mut PyFrame,
-    resume: Option<&mut crate::call::FrameResumeArgs>,
-) -> PyResult {
-    frame.execute_frame_plain(resume)
-}
-
 enum FrameResume {
     Yielded(PyObjectRef),
     Dispatch,
@@ -2534,9 +2512,8 @@ pub fn prepare_frame_resume_for_dispatch(
 ///
 /// Construction and reload are macros (`pin_resume_args!` /
 /// `reload_resume_args!`) so they expand into the already-translated caller
-/// (`execute_frame`, `eval_with_jit_inner`) rather than becoming their own
-/// graphs. Upstream has no helper type: the local is a GC pointer and the
-/// transformer writes the root.
+/// (`execute_frame`) rather than becoming their own graphs. Upstream has no
+/// helper type: the local is a GC pointer and the transformer writes the root.
 pub struct ResumeArgPins {
     pub roots: pyre_object::gc_roots::RootScope,
     pub arg_slot: Option<usize>,
@@ -2643,70 +2620,81 @@ pub(crate) fn eval_frame_plain_with_resume(
     // enter() already executed).  Python finally semantics: a finally
     // block that raises replaces the prior exception (return_trace
     // overrides eval-body, leave overrides everything).
-    let (mut outer_result, w_exitvalue) = (|| -> (PyResult, PyObjectRef) {
+    //
+    // The call sits in this graph, not in a residual try-closure:
+    // `find_all_graphs` follows it from `execute_frame` and mints the
+    // Regular `call_trace` jitcode. `dispatch` is a direct call on this
+    // path too (`pyframe.py execute_frame` `w_exitvalue = self.dispatch(...)`);
+    // an inner FnOnce would residualize it as `call_once` and hide the
+    // rewritten stub from looked-inside sites.
+    let (mut outer_result, w_exitvalue) = {
         // `execute_frame` calls `call_trace` before `resume_execute_frame`.
         // `w_arg_or_err` is a GC local there. The caller's `ResumeArgPins`
         // already roots it from `stack_check` through this hook and the resume.
         let trace = execution_context.call_trace(frame_anchor.live());
         crate::reload_resume_args!(pins, resume);
-        if let Err(e) = trace {
-            return (Err(e), pyre_object::w_none());
-        }
-        let mut inner_result = (|| -> PyResult {
-            let frame = unsafe { &mut *frame_anchor.live() };
-            crate::reload_resume_args!(pins, resume);
-            if let Some(value) = prepare_frame_resume_for_dispatch(frame, resume)? {
-                return Ok(value);
-            }
-            let frame = unsafe { &mut *frame_anchor.live() };
-            let result = dispatch_frame(frame)?;
-            Ok(result)
-        })();
-        let mut w_exitvalue = match &inner_result {
-            Ok(v) => *v,
-            Err(_) => pyre_object::w_none(),
-        };
-        // `return_trace` runs application Python while the exit value and
-        // the pending exception are still owed to `leave`.
-        let return_trace_result = {
-            let roots = pyre_object::gc_roots::push_roots();
-            let exit_slot = roots.base();
-            let exit = roots.pin_root(w_exitvalue);
+        match trace {
+            Err(e) => (Err(e), pyre_object::w_none()),
+            Ok(()) => {
+                let mut inner_result = {
+                    let frame = unsafe { &mut *frame_anchor.live() };
+                    crate::reload_resume_args!(pins, resume);
+                    match prepare_frame_resume_for_dispatch(frame, resume) {
+                        Err(e) => Err(e),
+                        Ok(Some(value)) => Ok(value),
+                        Ok(None) => {
+                            let frame = unsafe { &mut *frame_anchor.live() };
+                            dispatch_frame(frame)
+                        }
+                    }
+                };
+                let mut w_exitvalue = match &inner_result {
+                    Ok(v) => *v,
+                    Err(_) => pyre_object::w_none(),
+                };
+                // `return_trace` runs application Python while the exit value and
+                // the pending exception are still owed to `leave`.
+                let return_trace_result = {
+                    let roots = pyre_object::gc_roots::push_roots();
+                    let exit_slot = roots.base();
+                    let exit = roots.pin_root(w_exitvalue);
 
-            match inner_result {
-                Err(err) => {
-                    let mut err = err;
-                    let err_slot = err.pin(&roots);
-                    let result = execution_context.return_trace(frame_anchor.live(), exit);
-                    w_exitvalue = roots.get(exit_slot);
-                    err.reload(&roots, err_slot);
-                    inner_result = Err(err);
-                    result
+                    match inner_result {
+                        Err(err) => {
+                            let mut err = err;
+                            let err_slot = err.pin(&roots);
+                            let result = execution_context.return_trace(frame_anchor.live(), exit);
+                            w_exitvalue = roots.get(exit_slot);
+                            err.reload(&roots, err_slot);
+                            inner_result = Err(err);
+                            result
+                        }
+                        Ok(v) => {
+                            let v = pyre_object::gc_roots::pin_root(v);
+                            let result = execution_context.return_trace(frame_anchor.live(), exit);
+                            w_exitvalue = roots.get(exit_slot);
+                            inner_result = Ok(v);
+                            result
+                        }
+                    }
+                };
+                // Python finally: a finally-block exception replaces any
+                // pending exception from the try-body. Only the all-OK path
+                // advances to `got_exception = false`.
+                // Both hooks hand the exit value back at its live address, and both
+                // the local and `inner_result` carry the word taken before the
+                // callback ran, so each result is rebuilt from what came back.
+                let combined = match return_trace_result {
+                    Err(rt_err) => (Err(rt_err), w_exitvalue),
+                    Ok(live) => (inner_result.map(|_| live), live),
+                };
+                if combined.0.is_ok() {
+                    got_exception = false;
                 }
-                Ok(v) => {
-                    let v = pyre_object::gc_roots::pin_root(v);
-                    let result = execution_context.return_trace(frame_anchor.live(), exit);
-                    w_exitvalue = roots.get(exit_slot);
-                    inner_result = Ok(v);
-                    result
-                }
+                combined
             }
-        };
-        // Python finally: a finally-block exception replaces any
-        // pending exception from the try-body. Only the all-OK path
-        // advances to `got_exception = false`.
-        // Both hooks hand the exit value back at its live address, and both
-        // the local and `inner_result` carry the word taken before the
-        // callback ran, so each result is rebuilt from what came back.
-        let combined = match return_trace_result {
-            Err(rt_err) => (Err(rt_err), w_exitvalue),
-            Ok(live) => (inner_result.map(|_| live), live),
-        };
-        if combined.0.is_ok() {
-            got_exception = false;
         }
-        combined
-    })();
+    };
     let leave_result = {
         let roots = pyre_object::gc_roots::push_roots();
 
@@ -2736,20 +2724,32 @@ pub(crate) fn eval_frame_plain_with_resume(
 }
 
 /// `interp_jit.py PyFrame.dispatch`. `execute_frame` calls this after
-/// `resume_execute_frame`. The JIT registers `eval_loop_jit`; without a
-/// hook this is the plain eval loop. `inline(never)` keeps the call a
-/// graph edge so the translator can alias it onto the rewritten origportal.
+/// `resume_execute_frame`. The JIT registers `warmspot.py ll_portal_runner`
+/// (`ll_portal_runner` → `portal_runner_body_result`:
+/// `maybe_compile_and_run` then `portal_ptr`);
+/// without a hook this is the plain eval loop. `inline(never)` keeps the call
+/// a graph edge so the translator can alias it onto the rewritten origportal.
 /// Both arms run with `frame` installed as the `CURRENT_FRAME` TLS root
 /// (`eval_loop` installs it itself; the override arm installs it here).
 #[inline(never)]
 pub fn dispatch_frame(frame: &mut PyFrame) -> PyResult {
     if let Some(f) = crate::call::dispatch_override() {
         let _current_frame_guard = install_current_frame_tls_only(frame);
-        // The guard rooted the previous `CURRENT_FRAME`; `eval_loop_jit`
-        // reads its frame from the top shadow-stack root, so re-anchor it.
+        // The guard rooted the previous `CURRENT_FRAME`; `ll_portal_runner`
+        // / `eval_loop_jit` read the frame from the top shadow-stack root,
+        // so re-anchor it (`FrameRoot` expects the same top root).
         let frame_anchor = FrameAnchor::new(frame);
         return f(unsafe { &mut *frame_anchor.live() });
     }
+    let ec = crate::call::getexecutioncontext() as *mut crate::PyExecutionContext;
+    eval_loop(frame, ec, /* relink */ true)
+}
+
+/// Interpreter `PyFrame.dispatch` without the jitdriver (`pyopcode.py` /
+/// `pyframe.py` before `interp_jit.py` extends it). The native
+/// `ll_portal_runner` override uses this when a per-frame JIT decline keeps
+/// the activation in the interpreter.
+pub fn eval_loop_plain(frame: &mut PyFrame) -> PyResult {
     let ec = crate::call::getexecutioncontext() as *mut crate::PyExecutionContext;
     eval_loop(frame, ec, /* relink */ true)
 }

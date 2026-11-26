@@ -17,7 +17,7 @@ use pyre_interpreter::call::{register_build_class, set_last_exec_ctx};
 use pyre_interpreter::importing;
 use pyre_interpreter::pyframe::PyFrame;
 use pyre_interpreter::{Mode, alloc_execution_context, compile_source_with_filename};
-use pyre_jit::eval::{eval_with_jit, init_jit_hooks};
+use pyre_jit::eval::init_jit_hooks;
 
 fn run_harness(program: &str, name: &str) -> Result<(), String> {
     // Same startup as `pyrex::real_main`, on this process's own GC.
@@ -50,7 +50,8 @@ fn run_harness(program: &str, name: &str) -> Result<(), String> {
     // An `AssertionError` a program raises is object-backed, so its `message`
     // field is empty and only `message_text` derives the text from
     // `exc_object`.
-    eval_with_jit(&mut frame, None)
+    frame
+        .run()
         .map_err(|e| format!("execution error: {}", e.message_text()))?;
     Ok(())
 }

@@ -2793,32 +2793,6 @@ pub fn report_stack_underflow(frame: &PyFrame) {
     );
 }
 
-/// True when this frame owes trace events the portal sends through
-/// `execute_frame_plain`.
-///
-/// Only a frame carrying its own `f_trace` does.  Such a frame owes a `line`
-/// event at every instruction that can start one, fired by `ec.bytecode_trace`
-/// from the dispatch loop.  A compiled loop fires those later from
-/// `dispatch_bytecode`'s jitted arm (`inline_call` of `bytecode_only_trace`).
-///
-/// Neither hook that installs globally is here, and both are deliberate.
-/// `executioncontext.py settrace` keeps the JIT on and widens `trace_limit`
-/// rather than turning it off, and what it owes is answered per event
-/// elsewhere: this frame's own `call` / `return` by the bracket the portal
-/// carries (`eval::eval_with_jit_inner`), a callee's by the walker declining
-/// to enter one while a hook is installed
-/// (`jitcode_dispatch::ec_hook_installed`).
-/// `setprofile` owes the same frame-level pair, from the same bracket plus
-/// `leave`'s `_trace('leaveframe')`, and owes `c_call` / `c_return` on top —
-/// which the residual call helpers fire themselves
-/// (`call_jit.rs residual_call_c_profile_frame`), the walker keeping them
-/// reachable by folding no call while a profiler is installed
-/// (`jitcode_dispatch::residual_call::walker_foldable_runtime_helper`).  A
-/// profiled loop therefore compiles and reports, calls and all.
-pub fn frame_tracing_active(frame: &PyFrame) -> bool {
-    !frame.get_w_f_trace().is_null()
-}
-
 #[repr(C)]
 #[derive(Clone)]
 pub struct FrameDebugData {
@@ -5566,35 +5540,6 @@ impl PyFrame {
         }
     }
 
-    /// `run`, but dispatching the non-generator body through the registered
-    /// eval function (`call::get_eval_fn`) instead of the plain interpreter.
-    ///
-    /// `interp_jit.py dispatch` applies the jitdriver to every frame uniformly,
-    /// so module / class / exec'd code reaches `jit_merge_point` exactly like
-    /// a called function does.  `run` hardcodes the plain interpreter, which
-    /// keeps these entry frames off the portal; this variant restores the
-    /// uniform routing for the run-sites that want it (exec / eval / import /
-    /// class body), matching how `call_user_function` reaches the portal via
-    /// `get_eval_fn`.
-    ///
-    /// `settrace` is honored without forcing plain eval: installing a tracefunc
-    /// does not set `FORCE_PLAIN_EVAL` (that flag is a blackhole / `force_fn`
-    /// re-entry guard, unrelated to tracing).  The JIT eval override
-    /// (`eval_with_jit`) instead reads `ec.w_tracefunc` inline each bytecode
-    /// for line events and routes non-JIT-eligible frames through
-    /// `execute_frame` (so `call_trace` / `return_trace` frame events still
-    /// fire), exactly as a normal call reaches the portal via `get_eval_fn`;
-    /// and when the portal declines a frame it falls back to `execute_frame`
-    /// (plain), so this never re-enters the portal.
-    #[inline]
-    pub fn run_with_jit(&mut self) -> crate::PyResult {
-        if self._is_generator_or_coroutine() {
-            self.initialize_as_generator()
-        } else {
-            crate::call::get_eval_fn()(self, None)
-        }
-    }
-
     /// pyframe.py resume_execute_frame, after any suspended delegate has
     /// either yielded or completed in `eval_frame_plain_with_resume`.
     ///
@@ -5614,7 +5559,10 @@ impl PyFrame {
         Ok(self.next_instr())
     }
 
-    /// PyPy-compatible execution entrypoint with optional inbound values.
+    /// pyframe.py `execute_frame(w_arg_or_err=None)`. Main interpreter
+    /// entry. `Some(w_arg_or_err)` is the sent value or an
+    /// `SApplicationException` when `generator.py _invoke_execute_frame`
+    /// resumes a generator or coroutine frame; `None` is a fresh call.
     #[inline]
     pub fn execute_frame(&mut self, w_arg_or_err: Option<PyObjectRef>) -> crate::PyResult {
         // `pyframe.py execute_frame` takes no GIL: a thread acquires once at
@@ -5646,67 +5594,6 @@ impl PyFrame {
         crate::eval::eval_frame_plain_with_resume(
             unsafe { &mut *anchor.live() },
             &mut resume,
-            pins.as_ref(),
-        )
-    }
-
-    /// Generator/coroutine execution entry.  PyPy's
-    /// `PyFrame.execute_frame(w_arg_or_err)`: the sent value or an
-    /// `SApplicationException`.
-    ///
-    /// Dispatches through the registered eval function for the same reason
-    /// `run_with_jit` does: `interp_jit.py dispatch` applies the jitdriver to
-    /// every frame uniformly, and a resumed frame is a frame.  Routing this
-    /// straight to the plain evaluator instead kept every generator,
-    /// coroutine and async-generator body off the portal — 15.9% of the
-    /// standard library's loop-bearing code objects, none of which the tracer
-    /// could ever see.
-    #[inline]
-    pub fn execute_generator_frame(&mut self, w_arg_or_err: PyObjectRef) -> crate::PyResult {
-        let mut resume = crate::call::FrameResumeArgs { w_arg_or_err };
-        crate::call::get_eval_fn()(self, Some(&mut resume))
-    }
-
-    /// Plain-interpreter entry for a frame that may or may not be a resumption.
-    ///
-    /// This is what the default eval function runs, and what every JIT decline
-    /// path falls back to.  A declining path that dropped `resume` and called
-    /// `execute_frame(None)` instead would silently discard the value a
-    /// `send()` delivered or the exception a `throw()` did, so the payload
-    /// travels with the frame through the fallback.
-    #[inline]
-    pub fn execute_frame_plain(
-        &mut self,
-        resume: Option<&mut crate::call::FrameResumeArgs>,
-    ) -> crate::PyResult {
-        match resume {
-            Some(resume) => self.execute_frame_resumed(resume),
-            None => self.execute_frame(None),
-        }
-    }
-
-    /// `execute_generator_frame`'s plain-interpreter half: the resume without
-    /// the portal.  The stack check that used to sit in
-    /// `execute_generator_frame` lives here — the JIT entry performs its own.
-    #[inline]
-    pub fn execute_frame_resumed(
-        &mut self,
-        resume: &mut crate::call::FrameResumeArgs,
-    ) -> crate::PyResult {
-        // Same `w_arg_or_err` bracket as `execute_frame`: the overflow arm
-        // allocates before `call_trace` / `resume_execute_frame` consume the
-        // sent value or `SApplicationException`.
-        let pins = crate::pin_resume_args!(resume);
-        // Same collecting `stack_check` as `execute_frame`
-        // (`pyframe.py` `execute_frame.insert_stack_check_here`).
-        let anchor = crate::eval::FrameAnchor::new(self);
-        crate::stack_check::drain_jit_pending_exception()?;
-        crate::reload_resume_args!(pins.as_ref(), resume);
-        crate::stack_check::stack_check()?;
-        crate::reload_resume_args!(pins.as_ref(), resume);
-        crate::eval::eval_frame_plain_with_resume(
-            unsafe { &mut *anchor.live() },
-            resume,
             pins.as_ref(),
         )
     }

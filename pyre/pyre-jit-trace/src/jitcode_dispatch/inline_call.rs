@@ -7330,11 +7330,10 @@ fn caller_frame_box_for(ctx: &TraceCtx, frame_ptr: usize) -> Option<OpRef> {
 /// `walker_call_trace_hook_reads`. A profiler uses the `is_being_profiled`
 /// green / back-edge read.
 ///
-/// `eval_with_jit_inner` (`pyre-jit/src/eval.rs`) routing every frame for
-/// which `frame_tracing_active` holds to `execute_frame_plain` is a
-/// compilation gate, not a reporting one.  The portal frame's jitted arm
-/// reads that frame's own `debugdata.w_f_trace`; a global tracer that
-/// leaves the caller's `f_trace` unset is the inlined `call_trace`
+/// `ll_portal_runner` (`warmspot.py ll_portal_runner`) does not test
+/// `f_trace`; the portal frame's jitted arm reads that frame's own
+/// `debugdata.w_f_trace` (`pyopcode.py dispatch_bytecode`). A global tracer
+/// that leaves the caller's `f_trace` unset is the inlined `call_trace`
 /// `gettrace()` pin.
 ///
 /// The escape branch runs in both worlds.  Concretely it marks the caller and

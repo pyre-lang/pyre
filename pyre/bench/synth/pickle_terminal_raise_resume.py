@@ -14,7 +14,7 @@
 # measures.
 # pyre-check: jitstats-band=fbw_blackhole_adopted_single_frame=1,fbw_blackhole_adopted_multi_frame=1
 # The blackhole adoptions split between single- and multi-frame by host;
-# darwin reads 4/0 (single/multi) on dynasm, cranelift and wasm. loops
+# darwin dynasm reads 5/1 (single/multi). loops
 # and bridges stay exact.
 # The attribute fold, 690 firings across the corpus and undeclared. Pure-Python
 # pickle drives it 122 times here, more than any other fixture.  It also reaches

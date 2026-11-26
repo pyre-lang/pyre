@@ -62,8 +62,8 @@ pub use crate::module::sys::state::{DEFAULT_RECURSION_LIMIT, MAX_RECURSION_LIMIT
 /// most expensive level pyre can produce.
 ///
 /// A level the interpreter runs costs ~1.7 KB of native stack
-/// (`funccall_valuestack` → `OpcodeStepExecutor::call` → `eval_loop_jit`
-/// → `eval_with_jit`). A level that enters compiled code and leaves it
+/// (`funccall_valuestack` → `OpcodeStepExecutor::call` → `execute_frame`
+/// → `eval_loop_jit`). A level that enters compiled code and leaves it
 /// through a guard failure costs ~6.3 KB, because the resume chain
 /// nests on the native stack once per level:
 /// `call_assembler_helper_trampoline` → `jit_blackhole_resume_from_guard`

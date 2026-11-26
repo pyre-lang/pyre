@@ -8,17 +8,15 @@
 # events, so it cannot observe any of this -- which is why the events below
 # were not covered by anything before.
 #
-# SCOPE -- read this before citing the fixture as a guard for anything.  The
-# hook is armed BEFORE the frame is entered, which is what the name says and
-# what makes this the plain evaluator's fixture and not the JIT's:
-# `eval_with_jit_inner` (`pyre-jit/src/eval.rs`) routes any frame for which
-# `frame_tracing_active` holds to `execute_frame_plain`, so the loop here never
-# compiles and never reaches the portal.  Measured: it passes identically with
-# and without the `debugdata` guard its sibling fixtures were added for, so it
-# discriminates nothing about that fix and must not be read as covering it.
-# It is written to keep holding when that gate is narrowed -- which is the
-# point of having it now rather than then, since a fixture added alongside the
-# change that needs it proves nothing about the state before.
+# SCOPE -- the hook is armed BEFORE the frame is entered, which is what the
+# name says. `execute_frame` (`pyframe.py`) runs `call_trace` then `dispatch`
+# unconditionally; a global tracer that returns itself installs `w_f_trace`
+# in that `call_trace`, and `ll_portal_runner` (`warmspot.py ll_portal_runner`)
+# then dispatches the armed frame through the portal like any other. Line
+# events come from `dispatch_bytecode`'s jitted arm (`bytecode_only_trace`).
+# Measured: it passes identically with and without the `debugdata` guard its
+# sibling fixtures were added for, so it discriminates nothing about that fix
+# and must not be read as covering it.
 #
 # In particular it does NOT cover the open GC abort (`GC BUG: invalid type_id
 # ... site=marking_regray_root`).  That one needs local tracing armed on a
@@ -68,9 +66,8 @@ def main():
     # bookkeeping loop here is long enough to become hot and compile, and
     # `run_selfcheck`'s JIT floor is corpus-level (`loops_compiled >= 1`), not
     # "the loop under test compiled" -- so it would be satisfied by this loop
-    # while the loop the fixture is about never compiles, which is exactly the
-    # vacuous pass the floor exists to catch.  Measured: with the loop here the
-    # run reports `loops_compiled=1`, without it `0`.
+    # even if the loop under test did not compile, which is the vacuous pass
+    # the floor exists to catch.
     counts = {
         key: events.count(key)
         for key in (("line", 3), ("line", 2), ("call", 0), ("return", 4))

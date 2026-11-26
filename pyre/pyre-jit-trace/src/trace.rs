@@ -5386,6 +5386,14 @@ fn run_perfn_walk<Sym: WalkSym>(
     let _perfn_code_roots = pyre_object::gc_roots::push_roots();
     let perfn_code_slot = _perfn_code_roots.pin_roots(&[w_code as pyre_object::PyObjectRef]);
     let w_code = pyre_object::gc_roots::shadow_stack_get(perfn_code_slot) as *const ();
+    // The walk runs residual calls concretely, and a minor collection there
+    // moves a nursery frame. `cf_addr` is held in an owner root from walk
+    // entry and read back at every use: the locals seed, the close-loop args,
+    // the adopt and the end-state flushes all follow calls that can collect
+    // (`gc_restore_root` after each call that can collect). A host frame the
+    // GC does not own stays unrooted (`FrameBox::from_raw`).
+    let cf_root = crate::jitcode_dispatch::owner_root_if_gc(cf_addr);
+    let cf_addr_now = || cf_root.as_ref().map_or(cf_addr, |root| root.get().0);
     let ctx = live_trace_ctx(meta);
     let session = std::cell::RefCell::new(crate::jitcode_dispatch::WalkSession {
         carrier_raise_seed,
@@ -5531,7 +5539,7 @@ fn run_perfn_walk<Sym: WalkSym>(
     // loop-input registers seeded at walk entry, not just r0.
     let frame_box = ctx
         .standard_virtualizable_box()
-        .unwrap_or_else(|| ctx.const_ref(cf_addr as i64));
+        .unwrap_or_else(|| ctx.const_ref(cf_addr_now() as i64));
     // Seed the loop's live INPUT registers so the
     // post-merge-point loop body resolves its loop-invariant reads.  The
     // walk enters AT the loop-header `jit_merge_point`, past the reads
@@ -5700,6 +5708,7 @@ fn run_perfn_walk<Sym: WalkSym>(
                     // a raising callee then mutates concrete state but cannot
                     // recover the exception class, aborting and replaying the
                     // already-applied mutation.
+                    let cf_addr = cf_addr_now();
                     if cf_addr != 0 {
                         let frame =
                             unsafe { &*(cf_addr as *const pyre_interpreter::pyframe::PyFrame) };
@@ -6032,13 +6041,6 @@ fn run_perfn_walk<Sym: WalkSym>(
         }
     }
 
-    // The walk runs residual calls concretely, and a minor collection there
-    // moves a nursery frame.  `cf_addr` is a plain address, so it is held in a
-    // root slot across the walk and read back afterwards, the way a GCREF
-    // livevar is restored after a call that can collect.  A host frame the
-    // GC does not own stays unrooted (`FrameBox::from_raw`).
-    let cf_root = majit_gc::gc_owns_object(cf_addr)
-        .then(|| majit_gc::shadow_stack::OwnerRootGuard::new(majit_ir::GcRef(cf_addr)));
     let Some((code_len, mut walk_result)) = dispatch_perfn_frame(
         ctx,
         sym,
@@ -6053,11 +6055,6 @@ fn run_perfn_walk<Sym: WalkSym>(
     ) else {
         return None;
     };
-    // Read the frame back from its root at every use: the close-loop args,
-    // the adopt and the end-state flushes below allocate, and a minor
-    // collection between two uses moves a nursery frame again
-    // (`gc_restore_root` after each call that can collect).
-    let cf_addr_now = || cf_root.as_ref().map_or(cf_addr, |root| root.get().0);
 
     // Full-body-walk loop close: the walker's `jit_merge_point` handler
     // produces RPython-style reds (`jump_args = [frame, ec]`, len 2 for the

@@ -57,7 +57,14 @@ pub struct Assembler {
     /// `assembler.py` `self.all_liveness_length = 0`.
     all_liveness_length: usize,
     /// `assembler.py` `self.all_liveness_positions = {}`.
-    all_liveness_positions: HashMap<(VecSet<u8>, VecSet<u8>, VecSet<u8>), u16>,
+    ///
+    /// Keyed on the sorted/deduped triple `intern_liveness` and
+    /// `decode_liveness_records` use. `VecSet` retains insertion order, so
+    /// using the sets themselves would miss `frozenset` equality whenever
+    /// two `-live-` insns list the same registers in different operand
+    /// order, and each miss would append a duplicate record into the
+    /// two-byte offset budget.
+    all_liveness_positions: HashMap<(Vec<u8>, Vec<u8>, Vec<u8>), u16>,
     /// `assembler.py` `self.num_liveness_ops = 0`.
     num_liveness_ops: usize,
     /// `assembler.py` `self.indirectcalltargets = set()    # set of JitCodes`.
@@ -178,14 +185,7 @@ impl Assembler {
                 .into_iter()
                 .filter_map(|(live_i, live_r, live_f, offset)| {
                     let offset = u16::try_from(offset).ok()?;
-                    Some((
-                        (
-                            live_i.into_iter().collect::<VecSet<u8>>(),
-                            live_r.into_iter().collect::<VecSet<u8>>(),
-                            live_f.into_iter().collect::<VecSet<u8>>(),
-                        ),
-                        offset,
-                    ))
+                    Some(((live_i, live_r, live_f), offset))
                 })
                 .collect();
         Self {
@@ -364,8 +364,7 @@ impl Assembler {
                 // matches on `opname` to keep the tuple-shape parity.
                 if opname == super::flatten::OPNAME_LIVE {
                     // `assembler.py:149` increments `self.num_liveness_ops`.
-                    // pyre's counter lives on `ASSEMBLER_STATE`;
-                    // `intern_liveness` below takes care of the `+= 1`, so
+                    // `encode_liveness_info` takes care of the `+= 1`, so
                     // there is no local pre-increment here (matching
                     // upstream: the bump happens inside `_encode_liveness`).
                     let live_i = get_liveness_info(args, Kind::Int);
@@ -459,8 +458,8 @@ impl Assembler {
     /// Line-by-line port of RPython's `_encode_liveness`:
     ///   - Dedup key is `(frozenset(live_i), frozenset(live_r),
     ///     frozenset(live_f))`. Pyre carries each kind as a `VecSet<u8>`
-    ///     (Vec-backed sorted set), and the cache uses the same
-    ///     `(VecSet, VecSet, VecSet)` triple as its `HashMap` key.
+    ///     (insertion-ordered) and hashes the sorted/deduped triple so
+    ///     the key matches `frozenset`.
     ///   - On miss: append the three u8 length bytes + the encoded
     ///     bitsets, and advance `all_liveness_length`.
     ///   - `num_liveness_ops` bumps once per `-live-` write regardless of
@@ -480,8 +479,10 @@ impl Assembler {
     ) -> Option<u16> {
         use majit_jitcode::liveness::encode_liveness;
 
+        // `assembler.py write_insn` bumps once per `-live-` write, cache hits
+        // included, before it encodes the record.
         self.num_liveness_ops += 1;
-        let key = (live_i.clone(), live_r.clone(), live_f.clone());
+        let key = liveness_position_key(live_i, live_r, live_f);
         let pos = if let Some(&cached) = self.all_liveness_positions.get(&key) {
             cached
         } else {
@@ -777,6 +778,23 @@ fn get_liveness_info(args: &[Operand], kind: Kind) -> VecSet<u8> {
         }
     }
     lives
+}
+
+/// `assembler.py` `_encode_liveness` keys on `frozenset` of each kind.
+/// `VecSet` retains insertion order, so the HashMap key is the sorted
+/// triple `intern_liveness` already canonicalises to.
+fn liveness_position_key(
+    live_i: &VecSet<u8>,
+    live_r: &VecSet<u8>,
+    live_f: &VecSet<u8>,
+) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+    let canon = |live: &VecSet<u8>| {
+        let mut v: Vec<u8> = live.iter().copied().collect();
+        v.sort_unstable();
+        v.dedup();
+        v
+    };
+    (canon(live_i), canon(live_r), canon(live_f))
 }
 
 fn dispatch_op(
@@ -2708,6 +2726,44 @@ mod tests {
             jitcode.is_none(),
             "a `-live-` offset past the 2-byte operand must decline the graph"
         );
+    }
+
+    #[test]
+    fn encode_liveness_dedups_same_registers_in_different_operand_order() {
+        // `assembler.py` `_encode_liveness` keys on frozenset. Two `-live-`
+        // insns that list the same registers in different operand order
+        // must share one record; VecSet insertion order must not mint a
+        // second copy and spend the 2-byte offset budget.
+        let mut ssarepr = SSARepr::new("live_dedup");
+        ssarepr.insns.push(Insn::live(vec![
+            Operand::Register(r(Kind::Ref, 0)),
+            Operand::Register(r(Kind::Ref, 2)),
+            Operand::Register(r(Kind::Ref, 1)),
+        ]));
+        ssarepr.insns.push(Insn::live(vec![
+            Operand::Register(r(Kind::Ref, 2)),
+            Operand::Register(r(Kind::Ref, 0)),
+            Operand::Register(r(Kind::Ref, 1)),
+        ]));
+        ssarepr.insns.push(Insn::op(
+            "ref_return",
+            vec![Operand::Register(r(Kind::Ref, 0))],
+        ));
+        let mut assembler = Assembler::new();
+        let before_len = assembler.all_liveness_length();
+        let before_ops = assembler.num_liveness_ops();
+        let jitcode = assembler.assemble(
+            &mut ssarepr,
+            JitCodeBuilder::default(),
+            Some(NumRegs {
+                ref_: 3,
+                ..NumRegs::default()
+            }),
+        );
+        assert!(!jitcode.code.is_empty());
+        assert_eq!(assembler.num_liveness_ops() - before_ops, 2);
+        // One unique record: 3 count bytes + encode_liveness([0,1,2]) = 0x07.
+        assert_eq!(assembler.all_liveness_length() - before_len, 4);
     }
 
     #[test]

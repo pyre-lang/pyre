@@ -8,11 +8,11 @@
 # 8 bytes and isize/usize = 4, so `_int_to_int_cast` records `int_signext` /
 # `int_and` that are the identity on 64-bit native; traces are a few ops
 # longer on wasm and a tiny `trace_limit` can cut one frame earlier or later.
-# At 136 that extra length sits on a knife-edge (native 5 multi-frame blackhole
-# adoptions, wasm 4). Measured on dynasm, cranelift and wasm together, 111-126
-# is a 16-wide plateau of identical counters (multi=4, single=70) including
-# every ±2 neighbour, so 124 (closest to 136 with that window) is robust to
-# the wasm length difference. 142-147 is a narrower 6-wide plateau.
+# At 136 that extra length sat on a knife-edge (native 5 multi-frame blackhole
+# adoptions, wasm 4). Measured on dynasm, cranelift and wasm together, 109-126
+# is an 18-wide plateau of identical counters (multi=3, single=68) including
+# every ±2 neighbour, so 124 is robust to the wasm length difference. 141-147
+# is a narrower 7-wide plateau.
 import atexit
 
 # Keep lazy shutdown imports outside this fixture's tiny trace limit. The
@@ -58,8 +58,6 @@ total = 0
 for n in range(200):
     total += entry(box, mapping, values, n)
 
-print(total, box[0], mapping["count"], len(values), sum(values))
-
 
 # The same handoff must preserve the innermost frame and pending exception
 # when the blackhole finishes by unwinding instead of returning a value.
@@ -90,10 +88,16 @@ for n in range(100):
     except ValueError as exc:
         raised_total += exc.args[0]
 
-print(raised_total, len(raised_values), sum(raised_values))
-
 # Keep the tiny trace limit inside this workload. Otherwise shutdown
 # importlib/atexit helpers become extra segmentation tests whose frame
-# boundaries depend on the target layout (interp_jit.set_param).
+# boundaries depend on the target layout (interp_jit.set_param).  The
+# checksums print after the reset for the same reason: app-level `sum` ->
+# `_int_sum` under the tiny limit cuts its own traces, inside the list
+# iterator helper or in the `_int_sum` frame depending on the target and on
+# how its callers are entered, and those cuts were counted with the
+# subject's handoffs.
 if pypyjit is not None:
     pypyjit.set_param("default")
+
+print(total, box[0], mapping["count"], len(values), sum(values))
+print(raised_total, len(raised_values), sum(raised_values))

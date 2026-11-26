@@ -10,7 +10,6 @@ use pyre_interpreter::importing;
 use pyre_interpreter::{
     CompileOpts, PyDisplay, PyError, PyExecutionContext, alloc_execution_context,
 };
-use pyre_jit::eval::eval_with_jit;
 
 use crate::repl_readline::{Readline, ReadlineResult};
 
@@ -349,7 +348,7 @@ fn exec_in_main(runtime: &ReplRuntime, w_code: pyre_object::PyObjectRef) -> Resu
         runtime.ctx_ptr,
         None,
     )?;
-    eval_with_jit(&mut frame, None).map(|_| ())
+    frame.run().map(|_| ())
 }
 
 /// `pymain_run_startup` — the PYTHONSTARTUP file, run in `__main__` ahead of
@@ -647,7 +646,7 @@ fn shell_exec(
                 Ok(frame) => frame,
                 Err(err) => return ShellExecResult::RuntimeErr(err),
             };
-            match eval_with_jit(&mut frame, None) {
+            match frame.run() {
                 Ok(result) => {
                     if !result.is_null() && !unsafe { pyre_object::is_none(result) } {
                         println!("{}", PyDisplay(result));

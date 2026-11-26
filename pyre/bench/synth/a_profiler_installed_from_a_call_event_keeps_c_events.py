@@ -5,9 +5,11 @@
 # run by the time it becomes profiled.
 #
 # `executioncontext.py call_trace` runs the callback first and only then writes
-# `getorcreatedebug().is_being_profiled = True`, so the write lands after
-# `eval::eval_with_jit_inner` has admitted the frame -- the profiled answer
-# cannot come from refusing it.  It comes from the green key instead:
+# `getorcreatedebug().is_being_profiled = True`. That write lands before
+# `dispatch_frame` / `ll_portal_runner`, and `ll_portal_runner` does not refuse
+# a profiled frame -- `is_being_profiled` is an `interp_jit.py` portal green,
+# not a decline.  The profiled answer cannot come from refusing the frame.
+# It comes from the green key instead:
 # `is_being_profiled` is an `interp_jit.py` portal green, so a profiled
 # activation names a different cell from the one the warm-up loop filled, and a
 # trace recorded under that key folds no call

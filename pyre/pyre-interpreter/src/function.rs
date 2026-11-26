@@ -4364,7 +4364,7 @@ fn funccall_flat_from_args(
     let closure = unsafe { function_get_closure(func) };
     // Pin globals/closure on the same scope as func/code/args so
     // `createframe` / `getexecutioncontext` / `FrameBox::new` /
-    // `frame_into_generator_for_function` / `get_eval_fn` stay under one
+    // `frame_into_generator_for_function` / `new_frame.run` stay under one
     // `push_roots`, matching `_flat_pycall_defaults`.
     let env_base = _roots.pin_roots(&[w_globals, closure]);
     let mut func = _roots.get(root_base);
@@ -4406,7 +4406,7 @@ fn funccall_flat_from_args(
     // function.py `Function.funccall` — `new_frame.run(self.name, self.qualname)`
     // → `initialize_as_generator(name, qualname)` / `GeneratorIterator`.
     // Same arm as `_flat_pycall`: transfer the owned `FrameBox`, do not
-    // snapshot through `run_with_jit` / `initialize_as_generator`. Re-read
+    // snapshot through `run` / `initialize_as_generator`. Re-read
     // `func` off the live publish the way `_flat_pycall_defaults` does.
     let mut func = _roots.get(root_base);
     if new_frame._is_generator_or_coroutine() {
@@ -4414,10 +4414,7 @@ fn funccall_flat_from_args(
             crate::call::frame_into_generator_for_function(new_frame, func)
         })
     } else {
-        pyre_object::with_roots!(func => {
-            let eval_fn = crate::call::get_eval_fn();
-            eval_fn(&mut new_frame, None)
-        })
+        pyre_object::with_roots!(func => new_frame.run())
     }
 }
 
@@ -4819,8 +4816,7 @@ fn _flat_pycall(
             }
         }
     } else {
-        let eval_fn = crate::call::get_eval_fn();
-        match eval_fn(&mut new_frame, None) {
+        match new_frame.run() {
             Ok(v) => v,
             Err(e) => {
                 crate::call::set_call_error(e);
@@ -4928,8 +4924,7 @@ fn _flat_pycall_defaults(
             }
         }
     } else {
-        let eval_fn = crate::call::get_eval_fn();
-        match eval_fn(&mut new_frame, None) {
+        match new_frame.run() {
             Ok(v) => v,
             Err(e) => {
                 crate::call::set_call_error(e);

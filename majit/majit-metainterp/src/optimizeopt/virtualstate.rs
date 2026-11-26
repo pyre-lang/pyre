@@ -307,6 +307,15 @@ pub struct VirtualStateInfoNode {
     /// (`Constant`/`KnownClass`/`NonNull`/`IntBounded`/`Unknown`); other
     /// variants leave this at -1.
     pub position_in_notvirtuals: Cell<i32>,
+    /// `history.py` `ConstPtr` index of a `Constant(Value::Ref)`.
+    ///
+    /// RPython stores `NotVirtualStateInfo.constbox` as the box itself;
+    /// MiniMark traces that field (`llsupport/gc.py`
+    /// `GcRewriterAssembler._record_constptrs`). The port's inline
+    /// `Value::Ref` is a snapshot of `ConstPtr.value`, so the intern
+    /// index is the box: `trace_index` forwards the slot and the
+    /// snapshot is refreshed from `resolve`.
+    const_ptr_index: u32,
 }
 
 impl VirtualStateInfoNode {
@@ -315,11 +324,19 @@ impl VirtualStateInfoNode {
     }
 
     pub fn new_with_lenbound(info: VirtualStateInfo, lenbound: Option<IntBound>) -> Self {
+        let mut info = info;
+        let const_ptr_index = intern_index_of_info(&info);
+        if const_ptr_index != 0 {
+            if let VirtualStateInfo::Constant(Value::Ref(gcref)) = &mut info {
+                *gcref = majit_ir::const_ptr_table::resolve(const_ptr_index);
+            }
+        }
         VirtualStateInfoNode {
             info,
             lenbound,
             position: Cell::new(-1),
             position_in_notvirtuals: Cell::new(-1),
+            const_ptr_index,
         }
     }
 
@@ -419,6 +436,7 @@ impl Clone for VirtualStateInfoNode {
             lenbound: self.lenbound.clone(),
             position: Cell::new(-1),
             position_in_notvirtuals: Cell::new(-1),
+            const_ptr_index: self.const_ptr_index,
         }
     }
 }
@@ -454,6 +472,21 @@ impl VirtualStateInfo {
     }
 }
 
+fn intern_constant_ref(gcref: GcRef) -> u32 {
+    if gcref.is_null() || gcref == GcRef::NO_CONCRETE {
+        0
+    } else {
+        majit_ir::const_ptr_table::intern(gcref)
+    }
+}
+
+fn intern_index_of_info(info: &VirtualStateInfo) -> u32 {
+    match info {
+        VirtualStateInfo::Constant(Value::Ref(gcref)) => intern_constant_ref(*gcref),
+        _ => 0,
+    }
+}
+
 fn visit_const_value(value: &mut Value, visitor: &mut dyn FnMut(&mut GcRef)) {
     if let Value::Ref(gcref) = value {
         visitor(gcref);
@@ -474,7 +507,59 @@ fn visit_info_node(
     // is mutated in place; this writes the shared node so every clone sees
     // the new address.
     let node_mut = unsafe { &mut *(ptr as *mut VirtualStateInfoNode) };
+    if node_mut.const_ptr_index != 0 {
+        // `NotVirtualStateInfo.constbox` is the interned `ConstPtr`.
+        // A snapshot of a nursery address that intern already forwarded
+        // is from-space; visiting it is `minor_root_target` garbage.
+        majit_ir::const_ptr_table::trace_index(node_mut.const_ptr_index, visitor);
+        if let VirtualStateInfo::Constant(Value::Ref(gcref)) = &mut node_mut.info {
+            *gcref = majit_ir::const_ptr_table::resolve(node_mut.const_ptr_index);
+        }
+        return;
+    }
     visit_state_info(&mut node_mut.info, visitor, seen);
+}
+
+fn collect_node_indexes(
+    ptr: *const VirtualStateInfoNode,
+    indexes: &mut Vec<u32>,
+    seen: &mut Vec<*const VirtualStateInfoNode>,
+) {
+    if ptr.is_null() || seen.contains(&ptr) {
+        return;
+    }
+    seen.push(ptr);
+    // SAFETY: same graph as `visit_info_node`; the walk is immutable.
+    let node = unsafe { &*ptr };
+    if node.const_ptr_index != 0 {
+        indexes.push(node.const_ptr_index);
+    }
+    match &node.info {
+        VirtualStateInfo::Virtual { fields, .. } | VirtualStateInfo::VStruct { fields, .. } => {
+            for (_, child) in fields {
+                collect_node_indexes(Rc::as_ptr(child), indexes, seen);
+            }
+        }
+        VirtualStateInfo::VArray { items, .. } => {
+            for child in items.iter().flatten() {
+                collect_node_indexes(Rc::as_ptr(child), indexes, seen);
+            }
+        }
+        VirtualStateInfo::VArrayStruct { element_fields, .. } => {
+            for fields in element_fields {
+                for (_, child) in fields {
+                    if let Some(child) = child {
+                        collect_node_indexes(Rc::as_ptr(child), indexes, seen);
+                    }
+                }
+            }
+        }
+        VirtualStateInfo::Constant(_)
+        | VirtualStateInfo::KnownClass { .. }
+        | VirtualStateInfo::NonNull
+        | VirtualStateInfo::IntBounded(_)
+        | VirtualStateInfo::Unknown(_) => {}
+    }
 }
 
 fn visit_state_info(
@@ -557,20 +642,20 @@ pub struct VirtualState {
     /// virtualstate.py `VirtualState.info_counter`. Increments through
     /// `enum_into` to assign per-instance positions.
     info_counter: i32,
-    /// ConstPtr table indexes interned from this state's `Constant` refs.
+    /// Intern indexes of short-preamble snapshots that are not intern
+    /// words on a node (`Const::Ref` / `PtrInfo::Constant`).
     ///
-    /// `TargetToken.virtual_state` is a field of a GC object; MiniMark traces
-    /// `NotVirtualStateInfo.constbox` through that graph. The compiled-loop
-    /// holder walk (`MetaInterp::walk_rd_consts_refs`) is that graph here:
-    /// it stamps these indexes via `trace_index` and forwards the inline
-    /// copies. The list lives as long as this state, independent of which
-    /// mutator created the token.
+    /// Node `Constant(Value::Ref)` intern lives on
+    /// [`VirtualStateInfoNode::const_ptr_index`] (`NotVirtualStateInfo.constbox`).
+    /// `finalize_short_preamble` records only the rest so
+    /// `walk_rd_consts_refs` does not stamp the same `constbox` twice.
     const_ptr_indexes: Vec<u32>,
 }
 
 impl VirtualState {
-    /// Visit every inline `ConstPtr.value` / known-class Ref stored below this
-    /// virtual state.
+    /// Visit interned `ConstPtr.value` slots stored on nodes
+    /// (`NotVirtualStateInfo.constbox`) and refresh the `Value::Ref` snapshot
+    /// from `resolve`.
     ///
     /// RPython keeps `TargetToken.virtual_state` in the GC-traced object graph.
     /// The Rust port stores the same graph in `Rc<VirtualStateInfoNode>`; during
@@ -603,12 +688,26 @@ impl VirtualState {
         vs
     }
 
-    /// Record interned ConstPtr indexes this state still names.
+    /// Intern indexes stored on nodes (`NotVirtualStateInfo.constbox`).
+    ///
+    /// `finalize_short_preamble` drops these from the retained list so the
+    /// compiled-loop walk stamps each `constbox` once, through the node.
+    pub(crate) fn interned_const_ptr_indexes(&self) -> Vec<u32> {
+        let mut indexes = Vec::new();
+        let mut seen: Vec<*const VirtualStateInfoNode> = Vec::new();
+        for node in &self.state {
+            collect_node_indexes(Rc::as_ptr(node), &mut indexes, &mut seen);
+        }
+        indexes
+    }
+
+    /// Record interned ConstPtr indexes this state's short preamble still
+    /// names and the node graph does not.
     ///
     /// `finalize_short_preamble` assigns `TargetToken.virtual_state` and
-    /// then records the indexes that graph (and the short preamble) hold.
-    /// `walk_rd_consts_refs` stamps them for the token's life. Replaces any
-    /// previous list. Partial-trace ops are not part of that graph.
+    /// then records those indexes. `walk_rd_consts_refs` stamps them for
+    /// the token's life. Replaces any previous list. Partial-trace ops are
+    /// not part of that graph.
     pub(crate) fn retain_const_ptr_indexes(&mut self, indexes: &[u32]) {
         let mut indexes = indexes.to_vec();
         indexes.sort_unstable();
@@ -617,11 +716,8 @@ impl VirtualState {
         self.const_ptr_indexes = indexes;
     }
 
-    /// Stamp interned `ConstPtr.value` slots this state still names.
-    ///
-    /// The inline `Constant(Value::Ref)` copies are a different holder;
-    /// [`Self::walk_const_ptr_refs_mut`] forwards those. `trace_index` is
-    /// idempotent inside one wave.
+    /// Stamp interned `ConstPtr.value` slots retained for short-preamble
+    /// snapshots. Node intern is walked by [`Self::walk_const_ptr_refs_mut`].
     pub(crate) fn trace_const_ptr_indexes(&self, visitor: &mut dyn FnMut(&mut GcRef)) {
         for &index in &self.const_ptr_indexes {
             majit_ir::const_ptr_table::trace_index(index, visitor);

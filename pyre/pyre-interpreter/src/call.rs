@@ -118,7 +118,6 @@ pub(crate) unsafe fn walk_pending_call_error_area(
 
 use pyre_object::{PY_NULL, PyObjectRef};
 
-use crate::eval::eval_frame_plain;
 use crate::pyframe::PyFrame;
 
 // ── Eval function injection ──────────────────────────────────────
@@ -130,15 +129,13 @@ use crate::pyframe::PyFrame;
 /// (`pyframe.py execute_frame` / `resume_execute_frame`). Original
 /// `throw()` arguments for a non-generator delegate live on that object.
 ///
-/// Passed by `&mut` so this stays a single pointer in [`EvalFn`]: putting
-/// the word in every ordinary Python call would widen the hottest path for
-/// the one caller that resumes a frame.
+/// Passed by `&mut` so `execute_frame` can reload it after a collecting
+/// `stack_check`. Putting the word in every ordinary Python call would
+/// widen the hottest path for the one caller that resumes a frame.
 pub struct FrameResumeArgs {
     pub w_arg_or_err: PyObjectRef,
 }
 
-type EvalFn = fn(&mut PyFrame, Option<&mut FrameResumeArgs>) -> PyResult;
-majit_gc::oncelock_fn_static!(static EVAL_OVERRIDE: OnceLock<EvalFn>);
 type ThreadEntryFn = fn();
 majit_gc::oncelock_fn_static!(static THREAD_ENTRY_HOOK: OnceLock<ThreadEntryFn>);
 
@@ -365,12 +362,8 @@ impl Drop for RecursionDepthGuard {
     }
 }
 
-/// Register the JIT-aware eval function. Called by pyre-jit at startup.
-pub fn register_eval_override(f: EvalFn) {
-    let _ = EVAL_OVERRIDE.set(f);
-}
-
-/// `interp_jit.py PyFrame.dispatch`. The JIT registers `eval_loop_jit`.
+/// `interp_jit.py PyFrame.dispatch`. The JIT registers
+/// `warmspot.py ll_portal_runner` (`portal_runner_body_result`).
 type DispatchFn = fn(&mut PyFrame) -> PyResult;
 static DISPATCH_OVERRIDE: OnceLock<DispatchFn> = OnceLock::new();
 
@@ -400,52 +393,17 @@ pub fn enter_runtime_thread() {
     }
 }
 
-/// Get the current eval function (JIT-aware if registered, plain otherwise).
-/// Respects the force-plain-eval mode.
-#[inline]
-pub fn get_eval_fn() -> EvalFn {
-    // The thread-local read stays in `is_force_plain_eval`. Inlined here it
-    // is a call whose target is the `FORCE_PLAIN_EVAL` static, a symbolic
-    // path the portal walk cannot execute.
-    //
-    // Both arms produce the address word and one transmute follows: a
-    // function item in one arm and a transmuted word in the other merge as
-    // `Ptr(Func) ∪ Integer`, which the annotator has no arm for.
-    let addr = if is_force_plain_eval() {
-        plain_eval_fn_addr()
-    } else {
-        // `EVAL_OVERRIDE` is a `OnceLock` static. Reading it in the portal
-        // graph is a symbolic path. The word comes back from a residual
-        // and is the registered eval function.
-        current_eval_fn_addr()
-    };
-    unsafe { std::mem::transmute::<usize, EvalFn>(addr) }
-}
-
-/// Address of `eval_frame_plain`, the evaluator "force plain eval" selects.
-#[majit_macros::dont_look_inside]
-pub fn plain_eval_fn_addr() -> usize {
-    eval_frame_plain as *const () as usize
-}
-
-/// Address of the process eval function (`EVAL_OVERRIDE`, else plain).
-#[majit_macros::dont_look_inside]
-pub fn current_eval_fn_addr() -> usize {
-    EVAL_OVERRIDE.get().copied().unwrap_or(eval_frame_plain) as usize
-}
-
-/// Execute a newly-created frame through the process-selected evaluator using
-/// the one-word residual ABI.
+/// Execute a newly-created frame through `PyFrame::execute_frame` using the
+/// one-word residual ABI.
 ///
 /// `Function.call_args` calls the frame runner directly. This helper is that
-/// call: `get_eval_fn()` is an indirect call whose family is the registered
-/// evaluators (`graphs_from`). `find_all_graphs` follows that family, so
-/// `eval_with_jit` and the rewritten portal stub are in the closure. The
-/// result/exception split stays on the pending-error channel used by the
-/// other bare-`PyObjectRef` call boundaries.
+/// call: `execute_frame` is the looked-inside `pyframe.py execute_frame`
+/// door, so `find_all_graphs` sees rewritten `dispatch` and emits
+/// `recursive_call`. The result/exception split stays on the pending-error
+/// channel used by the other bare-`PyObjectRef` call boundaries.
 pub fn eval_current_frame_raw(frame: &mut PyFrame) -> PyObjectRef {
     clear_call_error();
-    match get_eval_fn()(frame, None) {
+    match frame.execute_frame(None) {
         Ok(value) => value,
         Err(error) => {
             set_call_error(error);
@@ -461,7 +419,7 @@ pub fn eval_current_frame_raw(frame: &mut PyFrame) -> PyObjectRef {
 // jitdriver to widen the trace budget while a tracefunc is installed.
 // pyre-interpreter cannot import pyre-jit (its lower-layer crate), so
 // the JIT side registers a hook at boot that pyre-interpreter calls
-// through.  Mirrors the `EVAL_OVERRIDE` pattern above.
+// through.  Mirrors the `DISPATCH_OVERRIDE` pattern above.
 type SetJitParamFn = fn(name: &str, value: i64);
 majit_gc::oncelock_fn_static!(static SET_JIT_PARAM_HOOK: OnceLock<SetJitParamFn>);
 
@@ -473,8 +431,7 @@ pub fn register_set_jit_param_hook(f: SetJitParamFn) {
 
 /// `rlib/jit.py jit.set_param(driver=None, name, value)` analogue.
 /// No-op when pyre-jit has not registered the hook (e.g. JIT-disabled
-/// builds or boot-time callers that fire before the first `eval_with_jit`
-/// invocation).
+/// builds or boot-time callers that fire before `init_jit_hooks`).
 pub fn set_jit_param(name: &str, value: i64) {
     if let Some(hook) = SET_JIT_PARAM_HOOK.get() {
         hook(name, value);
@@ -525,7 +482,7 @@ pub fn set_jit_param_enable_opts(value: &str) {
 /// jd1 (`unpackiterable_driver`) merge-point hook. pyre-interpreter cannot
 /// import pyre-jit (its upper crate), so the JIT registers this at boot and the
 /// `unpackiterable_driver.jit_merge_point` marker calls through it. Mirrors the
-/// `SET_JIT_PARAM_HOOK` / `EVAL_OVERRIDE` inversion pattern.
+/// `SET_JIT_PARAM_HOOK` / `DISPATCH_OVERRIDE` inversion pattern.
 /// `greenkey` is the merge-point green; `w_iterator` and `items` are the two
 /// `reds='auto'` values the JIT walk backs its InputArgs with.
 ///
@@ -846,7 +803,7 @@ pub(crate) fn capture_last_exec_ctx_cell() -> *const () {
 /// slot seeded at process boot by pyrex (`pyrex/src/lib.rs`'s
 /// `setup_exec_context`, which calls
 /// `set_last_exec_ctx(execution_context.as_ptr())`) and
-/// re-stamped on every `eval_frame_plain` entry. The slot stays
+/// re-stamped on every `execute_frame` entry. The slot stays
 /// pointing at that thread's EC for the lifetime of its activation, so
 /// `sys.gettrace`/`settrace`/`getprofile`/`setprofile` and other
 /// `space.getexecutioncontext()` callers see the live EC even when
@@ -891,8 +848,9 @@ pub fn ensure_executioncontext() -> *const crate::PyExecutionContext {
 }
 
 /// Guard that temporarily forces all nested calls to use the plain
-/// interpreter, bypassing eval_with_jit. Used by force_fn to avoid
-/// re-entering compiled code from blackhole execution.
+/// interpreter. Used by force_fn to avoid re-entering compiled code from
+/// blackhole execution. The native `ll_portal_runner` override reads
+/// [`is_force_plain_eval`] and runs `eval_loop` instead of the portal.
 pub struct ForcePlainEvalGuard;
 
 impl Drop for ForcePlainEvalGuard {
@@ -910,8 +868,8 @@ pub fn is_force_plain_eval() -> bool {
     FORCE_PLAIN_EVAL.with(|c| c.get() > 0)
 }
 
-/// Enter "force plain eval" mode. While active, `call_user_function` uses
-/// `eval_frame_plain` instead of the JIT-aware eval override.
+/// Enter "force plain eval" mode. While active, `PyFrame.dispatch` runs
+/// the plain eval loop instead of `ll_portal_runner`.
 pub fn force_plain_eval() -> ForcePlainEvalGuard {
     FORCE_PLAIN_EVAL.with(|c| c.set(c.get() + 1));
     ForcePlainEvalGuard
@@ -972,7 +930,7 @@ fn user_function_too_many_error(
 }
 
 /// Fill positional defaults, kw-only defaults, and pack varargs for a
-/// user-function call.  Shared by `call_user_function_with_eval`,
+/// user-function call.  Shared by `call_user_function`,
 /// `call_user_function_plain_with_ctx`, `call_user_function_with_args`
 /// and `function_call_args` so every positional-only entry applies the same
 /// `function.py` `_flat_pycall_defaults` + `argument.py` `_match_signature`
@@ -1347,12 +1305,12 @@ fn prepare_user_call(
     Ok(PreparedUserCall::Frame(func_frame))
 }
 
-fn call_user_function_with_eval(
+fn run_prepared_user_frame(
     frame: &PyFrame,
     callable: PyObjectRef,
     args: &[PyObjectRef],
-    eval_fn: EvalFn,
 ) -> PyResult {
+    let _ = frame;
     let mut func_frame = match prepare_user_call(getexecutioncontext(), callable, args, false)? {
         PreparedUserCall::Frame(func_frame) => func_frame,
         PreparedUserCall::Generator(generator) => return Ok(generator),
@@ -1361,18 +1319,17 @@ fn call_user_function_with_eval(
     // The caller is the executing frame: `FrameAnchor` and the
     // execution-context chain already root it, and
     // `pyframe_object_custom_trace` visits `locals_cells_stack_w`.
-    // The callee is a `FrameBox` (`owner_root`) until `eval_fn` links it;
+    // The callee is a `FrameBox` (`owner_root`) until `run` links it;
     // pin the frame object (`shadowstack.py` `push_roots`).
     let _callee_locals_root = crate::pyframe::FrameLocalsRoot::new(func_frame.as_mut_ptr());
-    eval_fn(&mut func_frame, None)
+    func_frame.run()
 }
 
 /// [`call_user_function`] with the execution context in place of the caller
 /// frame — the `function.py Function.call_args(self, args)` shape, which
 /// upstream reaches with no frame at all.
 ///
-/// Also the residual-call sibling of [`call_user_function_plain`], keeping the
-/// JIT-aware eval function.
+/// Also the residual-call sibling of [`call_user_function_plain`].
 ///
 /// `blackhole.py bhimpl_residual_call_r_i` is `cpu.bh_call_i(func, ...)`
 /// — it invokes the *translated function*, and when that function's graph
@@ -1487,8 +1444,6 @@ pub fn call_user_function_resolved(
         return frame_into_generator_for_function(gen_frame, callable);
     }
 
-    let eval_fn = get_eval_fn();
-
     let mut func_frame =
         crate::pyframe::FrameBox::new(PyFrame::try_new_for_call_with_closure_and_globals_obj(
             w_code as *const (),
@@ -1500,7 +1455,7 @@ pub fn call_user_function_resolved(
         )?)?;
     func_frame.fix_array_ptrs();
     let _callee_locals_root = crate::pyframe::FrameLocalsRoot::new(func_frame.as_mut_ptr());
-    eval_fn(&mut func_frame, None)
+    func_frame.run()
 }
 
 /// Invoke a builtin's function pointer for a positional-only call,
@@ -2882,27 +2837,25 @@ pub fn call_user_function(
     callable: PyObjectRef,
     args: &[PyObjectRef],
 ) -> PyResult {
-    let eval_fn = get_eval_fn();
-    call_user_function_with_eval(frame, callable, args, eval_fn)
+    run_prepared_user_frame(frame, callable, args)
 }
 
-/// Plain interpreter-only user-function call.
-///
-/// JIT residual helpers should use this instead of the injected eval override.
-/// PyPy residual calls are opaque slow paths; they should not accidentally
-/// re-enter the caller's portal/tracing state.
+/// Residual sibling of [`call_user_function`]. Both go through
+/// `PyFrame.run` (`pycode.py funcrun`); `force_plain_eval` is what keeps a
+/// blackhole residual off compiled entry (`warmspot.py ll_portal_runner`
+/// still sees `dispatch`).
 pub fn call_user_function_plain(
     frame: &PyFrame,
     callable: PyObjectRef,
     args: &[PyObjectRef],
 ) -> PyResult {
-    call_user_function_with_eval(frame, callable, args, eval_frame_plain)
+    run_prepared_user_frame(frame, callable, args)
 }
 
 /// Call a user function with an explicit execution context pointer.
 /// Used by MIFrame Box tracking when concrete_frame is unavailable.
 ///
-/// Mirrors `call_user_function_with_eval`'s arg-fill + generator dispatch
+/// Mirrors `call_user_function`'s arg-fill + generator dispatch
 /// so MIFrame Box tracking sees the same result as a concrete-frame call
 /// for callees with positional defaults, kw-only defaults, varargs, or
 /// the GENERATOR/COROUTINE flags.  The caller-side `FrameLocalsRoot` is
@@ -4739,7 +4692,7 @@ fn call_with_kwargs_in_ctx_impl(
             // local (`shadowstack.py` `push_roots`); this ABI boundary is
             // outside that transform.
             let _callee_locals_root = crate::pyframe::FrameLocalsRoot::new(func_frame.as_mut_ptr());
-            return get_eval_fn()(&mut func_frame, None);
+            return func_frame.run();
         } // end user function branch
     } // end is_function
 
@@ -5855,19 +5808,12 @@ fn call_user_function_with_args(mut func: PyObjectRef, args: &[PyObjectRef]) -> 
     // `Arguments.parse_into_scope`.  Both arms end at the same
     // `PyFrame.run`, so the shortcut buys argument matching and nothing else.
     //
-    // pyre had already put the flat arm on `get_eval_fn`
-    // (`function.rs _flat_pycall`), while the gate that stood here left the
-    // fallback arm on the plain evaluator unless the code also named `super`.
-    // #1551 wrote it that way knowingly, to hold the stdlib's trace topology
-    // still "until the broader Function.call_args port is ready as one unit";
-    // this is that port.  `call_user_function_with_ctx` above is the same
-    // `Function.call_args` shape and has been routing to `get_eval_fn` all
-    // along.
+    // Both arms end at `PyFrame.run`, so this is `pycode.py funcrun`.
     //
     // The callee frame is pinned and the caller is not, for the reason
     // `call_user_function_with_ctx` records: no caller `PyFrame` exists here.
     let _callee_locals_root = crate::pyframe::FrameLocalsRoot::new(frame.as_mut_ptr());
-    let result = frame.run_with_jit();
+    let result = frame.run();
     match result {
         Ok(v) => v,
         Err(e) => {
@@ -7217,16 +7163,12 @@ fn build_class_inner(
     let body_ns = pyre_object::gc_roots::shadow_stack_get(w_namespace_root);
     frame.setdictscope(body_ns, false)?;
 
-    // Route the class body through the JIT portal (like the exec / import
-    // run-sites) so a hot class-level loop can warm and compile.  The body's
-    // NEWLOCALS bindings land in `body_ns`; that object's values are rooted by
-    // the `debugdata.w_locals` walk in `walk_pyframe_roots`.
     // compiling.py `build_class`: `w_cell = frame.run()`.  When the body
     // referenced `__class__`, `compile_class_body` returns that cell
     // (`LoadClosure` `__class__`, `Copy 1`, `STORE_NAME` `__classcell__`,
     // `RETURN_VALUE`); otherwise it returns None.  The post-metaclass
     // check below uses this return value, not a later mapping lookup.
-    let w_cell = frame.run_with_jit()?;
+    let w_cell = frame.run()?;
     let w_cell_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(w_cell);
 

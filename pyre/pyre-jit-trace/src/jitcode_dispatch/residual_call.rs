@@ -480,6 +480,30 @@ pub(crate) fn owner_root_if_gc(addr: usize) -> Option<majit_gc::shadow_stack::Ow
     ))
 }
 
+/// A frame address a guard displaces from a walk-TLS publication cell and
+/// writes back on drop.  The registered root area walks the cell, not the
+/// guard, so while the residual runs the displaced address is held as an
+/// owner root and read back from it: a collection inside the residual
+/// forwards it in place, the way `executioncontext.py enter` keeps the
+/// displaced `topframeref` in the GC field `frame.f_backref`.
+struct DisplacedFrameAddr {
+    addr: usize,
+    root: Option<majit_gc::shadow_stack::OwnerRootGuard>,
+}
+
+impl DisplacedFrameAddr {
+    fn new(addr: usize) -> Self {
+        Self {
+            addr,
+            root: owner_root_if_gc(addr),
+        }
+    }
+
+    fn get(&self) -> usize {
+        self.root.as_ref().map_or(self.addr, |root| root.get().0)
+    }
+}
+
 /// One [`owner_root_if_gc`] per `Ref` concrete, for a fold that carries an
 /// operand list across the Trace-pool appends of its guards and sub-walk.
 pub(crate) fn owner_roots_for_concretes(
@@ -3783,12 +3807,13 @@ pub(super) fn finalize_published_last_instr(frame: usize, last_instr: isize) {
 /// differ by exactly one and may only coexist for the residual's duration.
 /// Leaving the executing value behind makes an abort replay one opcode late.
 struct LiveLastInstrGuard {
-    frame: *mut pyre_interpreter::PyFrame,
-    /// Re-read on drop. `frame` is the address at enter and is what the
-    /// publication cell compares; the object may have moved.
-    frame_root: Option<majit_gc::shadow_stack::OwnerRootGuard>,
+    /// Re-read on drop: the object may have moved, and the publication cell
+    /// it is compared against is forwarded by the root area.
+    frame: DisplacedFrameAddr,
     saved: isize,
     prev: Option<PublishedLastInstr>,
+    /// `prev.frame`, rooted while this guard displaces it.
+    prev_frame: Option<DisplacedFrameAddr>,
 }
 
 impl LiveLastInstrGuard {
@@ -3815,7 +3840,6 @@ impl LiveLastInstrGuard {
         }
         let saved = unsafe { (*frame).last_instr };
         unsafe { (*frame).last_instr = py_pc as isize };
-        let frame_root = owner_root_if_gc(frame as usize);
         // Save/restore rather than set/clear: a residual can run user code that
         // records a nested walk whose own residual enters a second guard, and
         // clearing on the inner drop would leave the still-live outer
@@ -3829,21 +3853,30 @@ impl LiveLastInstrGuard {
                 saved,
             }))
         });
+        let prev_frame = prev.map(|published| DisplacedFrameAddr::new(published.frame));
         Some(Self {
-            frame,
-            frame_root,
+            frame: DisplacedFrameAddr::new(frame as usize),
             saved,
             prev,
+            prev_frame,
         })
     }
 }
 
 impl Drop for LiveLastInstrGuard {
     fn drop(&mut self) {
+        let frame = self.frame.get();
+        let prev = self.prev.map(|published| PublishedLastInstr {
+            frame: self
+                .prev_frame
+                .as_ref()
+                .map_or(published.frame, DisplacedFrameAddr::get),
+            ..published
+        });
         let restore = PUBLISHED_LAST_INSTR.with(|slot| {
-            let current = slot.replace(self.prev);
+            let current = slot.replace(prev);
             current
-                .filter(|published| published.frame == self.frame as usize)
+                .filter(|published| published.frame == frame)
                 .map_or(self.saved, |published| published.saved)
         });
         // An armed [`capture_escape_flush_undo`] means this residual forced
@@ -3851,16 +3884,15 @@ impl Drop for LiveLastInstrGuard {
         // writes nothing, so the executing `last_instr` the guard published
         // stays; restoring the pre-call resume pc would move the live frame
         // off the jitcode-pc image `write_box_at` already stored.
+        // `frame` is the rooted, current address; `undo.frame` keeps the
+        // capture-time word, so compare against the undo's own root.
         let flushed = ESCAPE_FLUSH_UNDO.with(|slot| {
-            slot.borrow().as_ref().map(|undo| undo.frame) == Some(self.frame as usize)
+            slot.borrow()
+                .as_ref()
+                .is_some_and(|undo| undo.current_frame() == frame)
         });
         if !flushed {
-            let frame = self
-                .frame_root
-                .as_ref()
-                .map(|root| root.get().0 as *mut pyre_interpreter::PyFrame)
-                .unwrap_or(self.frame);
-            unsafe { (*frame).last_instr = restore };
+            unsafe { (*(frame as *mut pyre_interpreter::PyFrame)).last_instr = restore };
         }
     }
 }
@@ -3927,8 +3959,10 @@ struct ResidualFrameChainGuard {
     /// root and not a shadow-stack slot: the shadow stack is LIFO and the
     /// residual publishes across this scope.
     frame_root: majit_gc::shadow_stack::OwnerRootGuard,
-    previous_published: *mut pyre_interpreter::PyFrame,
+    previous_published: DisplacedFrameAddr,
     previous_shadow: Option<PublishedInlineShadow>,
+    /// The address of a displaced `PublishedInlineShadow::Written`.
+    previous_shadow_written: Option<DisplacedFrameAddr>,
     /// Whether this guard performed the chain write, so `Drop` restores only
     /// what it changed.  False when `frame` is already top or an ancestor.
     entered: bool,
@@ -4060,14 +4094,19 @@ impl ResidualFrameChainGuard {
         } else {
             (std::ptr::null_mut(), None)
         };
+        let previous_shadow_written = match previous_shadow {
+            Some(PublishedInlineShadow::Written(addr)) => Some(DisplacedFrameAddr::new(addr)),
+            _ => None,
+        };
 
         Some(Self {
             ec,
             frame_root: majit_gc::shadow_stack::OwnerRootGuard::new(majit_ir::GcRef(
                 frame as usize,
             )),
-            previous_published,
+            previous_published: DisplacedFrameAddr::new(previous_published as usize),
             previous_shadow,
+            previous_shadow_written,
             entered,
             displaced_published: displace_published,
             got_exception: std::cell::Cell::new(false),
@@ -4095,8 +4134,17 @@ impl Drop for ResidualFrameChainGuard {
             // `executioncontext.py leave` restores `topframeref` from
             // `frame.f_backref` when this guard wrote the chain.
             if self.displaced_published {
-                PUBLISHED_INLINE_FRAME.with(|slot| slot.set(self.previous_published));
-                PUBLISHED_INLINE_SHADOW.with(|slot| slot.replace(self.previous_shadow.take()));
+                let previous_published =
+                    self.previous_published.get() as *mut pyre_interpreter::PyFrame;
+                PUBLISHED_INLINE_FRAME.with(|slot| slot.set(previous_published));
+                let mut previous_shadow = self.previous_shadow.take();
+                if let (Some(PublishedInlineShadow::Written(addr)), Some(written)) = (
+                    previous_shadow.as_mut(),
+                    self.previous_shadow_written.as_ref(),
+                ) {
+                    *addr = written.get();
+                }
+                PUBLISHED_INLINE_SHADOW.with(|slot| slot.replace(previous_shadow));
             }
             if self.entered {
                 // `executioncontext.py leave`: `self.topframeref = frame.f_backref`
@@ -4126,21 +4174,24 @@ impl Drop for ResidualFrameChainGuard {
 }
 
 struct ActiveFrameEscapeGuard {
-    prev: Option<usize>,
+    prev: Option<DisplacedFrameAddr>,
 }
 
 impl ActiveFrameEscapeGuard {
     fn enter(frame: usize) -> Self {
         let current = (frame != 0).then_some(frame);
         Self {
-            prev: ACTIVE_FRAME_ESCAPE.with(|slot| slot.replace(current)),
+            prev: ACTIVE_FRAME_ESCAPE
+                .with(|slot| slot.replace(current))
+                .map(DisplacedFrameAddr::new),
         }
     }
 }
 
 impl Drop for ActiveFrameEscapeGuard {
     fn drop(&mut self) {
-        ACTIVE_FRAME_ESCAPE.with(|slot| slot.set(self.prev));
+        let prev = self.prev.as_ref().map(DisplacedFrameAddr::get);
+        ACTIVE_FRAME_ESCAPE.with(|slot| slot.set(prev));
     }
 }
 

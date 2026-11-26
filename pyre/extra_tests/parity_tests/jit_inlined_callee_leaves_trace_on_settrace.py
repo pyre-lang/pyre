@@ -18,8 +18,8 @@
 """A compiled trace has to leave when `sys.settrace` is installed.
 
 The tracer returns `None` from every `call` event, so it claims no frame and
-`frame_tracing_active` lets the loop keep compiling — what this measures is the
-compiled path's own frame events rather than the interpreter's.
+the loop keeps compiling — what this measures is the compiled path's own
+frame events rather than the interpreter's.
 
 The loop is warmed with no hook installed, so its callee is inlined into a
 trace recorded against a null `w_tracefunc`.  Installing a tracer afterwards

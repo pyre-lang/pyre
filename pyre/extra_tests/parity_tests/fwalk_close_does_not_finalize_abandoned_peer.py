@@ -3,7 +3,7 @@
 # that close() of one fwalk must not run a peer's finally.
 # parity-tests reason: close() of one fwalk must not collect the heap and
 # close another generator's dirfds.  An exhausted scandir's leftover
-# finalizer registration is a no-op (`may_ignore_finalizer` / `_close`).
+# finalizer registration is a no-op once `_close` has marked it closed.
 import os
 import shutil
 import tempfile

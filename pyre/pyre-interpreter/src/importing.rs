@@ -5019,10 +5019,9 @@ fn exec_code_module(
     // Code.exec_code → space.createframe(...) + frame.run().  Surface
     // initialize_frame_scopes' freevar/closure mismatch (TypeError /
     // ValueError per pyframe.py) as PyError so the importer
-    // reports it instead of panicking.  Route through run_with_jit so the
-    // GENERATOR / COROUTINE / ASYNC_GENERATOR dispatch in
-    // pyframe.py holds for the import path too, and so an imported
-    // module's top-level hot loop reaches the JIT portal.
+    // reports it instead of panicking. `run` holds GENERATOR / COROUTINE /
+    // ASYNC_GENERATOR wrapping and enters `execute_frame` (rewritten
+    // `dispatch` = portal).
     // `moduledef.py` `_compile_bootstrap_module` is NOT_RPYTHON and
     // `startup_at_translation_time_only` does not re-exec those frames.
     // `zipimport` `Module.install` only inserts `zipimporter`. Those three
@@ -5033,7 +5032,7 @@ fn exec_code_module(
     if plain_dispatch {
         frame.execute_frame(None)
     } else {
-        frame.run_with_jit()
+        frame.run()
     }
 }
 

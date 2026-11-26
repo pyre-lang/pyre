@@ -1,13 +1,12 @@
 # pyre-check: max-pypy-ratio=12
 # pyre-check: jitstats-band=guard_failures=232
-# wasm guard_failures reads 7539, 7539, 7539 on this macOS arm64 wasm-host
-# binary at check.py's 4MB PYPY_GC_NURSERY pin, 7754 at PYPY_GC_NURSERY=2M
-# (bridges 23 -> 25), and 7522 at 8M. Linux and Windows dynasm, cranelift and
-# wasm read 8136 on every run (16 loops, 23 bridges; the two function-entry
-# traces `use_int` and `use_contains` are ones PyPy compiles too). macOS dynasm
-# reads 7772 on every run (14 loops, 24 bridges): its minor-collection
-# schedule leaves those two entry counters under the bound, and its own
-# baseline records that.
+# Linux and Windows dynasm, cranelift and wasm, and macOS cranelift and wasm,
+# read guard_failures 8770 (16 loops, 27 bridges; the two function-entry
+# traces `use_int` and `use_contains` are ones PyPy compiles too) at check.py's
+# 4MB PYPY_GC_NURSERY pin. The macOS arm64 wasm-host binary reads 8770 at
+# PYPY_GC_NURSERY=8M and 8809 at 2M (bridges 27 -> 26). macOS dynasm reads
+# 8655 (15 loops, 27 bridges) locally and on CI: its minor-collection
+# schedule gives one loop fewer, and its own baseline records that.
 # The wasm guest runs the minor-GC schedule off its allocation
 # volume, and moving the builtin module from each ExecutionContext to the
 # object space changed that volume. At the 4MB pin loops and bridges match

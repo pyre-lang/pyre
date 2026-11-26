@@ -364,7 +364,7 @@ pub const PYTHON_DISPATCH_SEEDS: &[&str] = &[
     // The frame executors.  `execute_frame` and its resumed twin are inherent
     // methods, so the `impl` block sits in the path as an opaque segment and
     // the bare `pyframe::execute_frame` spelling can never match.
-    "eval::eval_frame_plain",
+    "eval::eval_loop_plain",
     "eval::eval_frame_plain_with_resume",
     "eval::eval_loop",
     "pyframe::<Impl>::execute_frame",
@@ -381,6 +381,7 @@ pub const PYTHON_DISPATCH_SEEDS: &[&str] = &[
     "eval::portal_runner",
     "eval::portal_runner_dispatch",
     "eval::portal_runner_body_result",
+    "eval::ll_portal_runner",
     "eval::portal_body_result",
     "eval::call_assembler_portal_body_result",
     "eval::continue_entered_frame",

@@ -5459,32 +5459,43 @@ mod tests {
         );
     }
 
-    /// After the IIFE `inline_call` of `call_mut`, both
-    /// `ExecutionContext::leave` residual calls take a `raw_load` of the
-    /// `got_exception` cell (`rdtoa.py` `strtod` `end_ptr`), not the
-    /// pre-call `int_copy 1`.
+    /// `pyframe.py execute_frame` sets `got_exception = True`, clears it
+    /// once `return_trace` has run, and `finally: leave(self, w_exitvalue,
+    /// got_exception)`. The try body is inline in
+    /// `eval_frame_plain_with_resume`, so `got_exception` is one int
+    /// register: every `ExecutionContext::leave` residual call takes it,
+    /// and that register is written `1` and later `0`, not left at the
+    /// value it had before the body ran.
     #[test]
-    fn eval_frame_plain_with_resume_leave_reloads_got_exception_from_cell() {
+    fn eval_frame_plain_with_resume_leave_takes_cleared_got_exception() {
         use majit_jitcode::jitcode::ConstIRelocKind;
-        let roots: Vec<usize> = jitcode_index()
+        let idx = jitcode_index()
             .paths
             .iter()
-            .enumerate()
-            .filter_map(|(i, path)| {
-                let path = path.as_ref()?;
-                if path.specialization != GraphSpecialization::Regular {
-                    return None;
+            .position(|path| {
+                path.as_ref().is_some_and(|path| {
+                    path.specialization == GraphSpecialization::Regular
+                        && path.segments.last().map(String::as_str)
+                            == Some("eval_frame_plain_with_resume")
+                })
+            })
+            .expect("expected a Regular eval_frame_plain_with_resume jitcode");
+        let jc = get_jitcode_by_index(idx).expect("eval_frame_plain_with_resume jitcode");
+        let leave_consts: std::collections::HashSet<usize> = jc
+            .reloc_consts_i
+            .iter()
+            .filter_map(|desc| match &desc.kind {
+                ConstIRelocKind::FnAddr { path, .. }
+                    if path.ends_with("ExecutionContext::leave") =>
+                {
+                    Some(desc.constants_i_index)
                 }
-                matches!(
-                    path.segments.last().map(String::as_str),
-                    Some("eval_frame_plain_with_resume" | "execute_frame")
-                )
-                .then_some(i)
+                _ => None,
             })
             .collect();
         assert!(
-            !roots.is_empty(),
-            "expected a Regular execute_frame / eval_frame_plain_with_resume jitcode"
+            !leave_consts.is_empty(),
+            "eval_frame_plain_with_resume must residual_call ExecutionContext::leave"
         );
         let regs_i = vec![0i64; 4096];
         let regs_r = vec![0i64; 4096];
@@ -5494,166 +5505,100 @@ mod tests {
             registers_r: &regs_r,
             registers_f: &regs_f,
         };
-        let mut checked = 0usize;
-        for idx in roots {
-            let Some(jc) = get_jitcode_by_index(idx) else {
+        let n_i = jc.c_num_regs_i;
+        let ops: Vec<_> = decoded_ops(&jc.code)
+            .filter_map(|decoded| resolve_op_at(&jc.code, decoded.pc, regs))
+            .collect();
+        let int_const = |operand: &ResolvedOperand| match operand {
+            ResolvedOperand::ConstByte { byte } => Some(*byte as i64),
+            ResolvedOperand::IntReg { reg, .. } if *reg >= n_i => {
+                jc.constants_i.get((*reg - n_i) as usize).copied()
+            }
+            _ => None,
+        };
+        let mut got_exception_regs = std::collections::HashSet::new();
+        for (i, op) in ops.iter().enumerate() {
+            if !op.decoded.opname.starts_with("residual_call") {
+                continue;
+            }
+            let Some(ResolvedOperand::IntReg {
+                reg: fnaddr_reg, ..
+            }) = op.operands.first()
+            else {
                 continue;
             };
-            let leave_consts: std::collections::HashSet<usize> = jc
-                .reloc_consts_i
-                .iter()
-                .filter_map(|desc| match &desc.kind {
-                    ConstIRelocKind::FnAddr { path, .. }
-                        if path.ends_with("ExecutionContext::leave") =>
-                    {
-                        Some(desc.constants_i_index)
-                    }
-                    _ => None,
-                })
-                .collect();
-            if leave_consts.is_empty() {
-                continue;
-            }
-            let n_i = jc.c_num_regs_i;
-            let runtime = get_runtime_jitcode_by_index(idx);
-            let mut ops = Vec::new();
-            for decoded in decoded_ops(&jc.code) {
-                if let Some(resolved) = resolve_op_at(&jc.code, decoded.pc, regs) {
-                    ops.push(resolved);
-                }
-            }
-            let iife_pos = ops.iter().position(|op| {
-                if !op.decoded.opname.starts_with("inline_call") {
-                    return false;
-                }
-                let Some(descr_idx) = decoded_op_descr_index(&jc.code, &op.decoded) else {
-                    return false;
-                };
-                let descr_idx = descr_idx as usize;
-                let callee = runtime
-                    .as_ref()
-                    .and_then(|frame| frame.descr_at(descr_idx))
-                    .and_then(|descr| descr.as_jitcode_exec())
-                    .map(|callee| callee.index())
-                    .or_else(|| {
-                        descr_ref_table()
-                            .at(descr_idx)
-                            .and_then(|descr| descr.as_jitcode_descr().map(|jc| jc.jitcode_index()))
-                    })
-                    .or_else(|| match get_descr_by_index(descr_idx) {
-                        Some(BhDescr::JitCode { jitcode_index, .. }) => Some(*jitcode_index),
-                        _ => None,
-                    });
-                let Some(callee) = callee else {
-                    return false;
-                };
-                jitcode_index().paths.get(callee).is_some_and(|path| {
-                    path.as_ref().is_some_and(|path| {
-                        path.segments.last().map(String::as_str) == Some("call_mut")
-                            && path
-                                .segments
-                                .iter()
-                                .any(|seg| seg.contains("eval_frame_plain_with_resume"))
-                    })
-                })
+            let fnaddr_is_leave = ops[..i].iter().rev().find_map(|prev| match prev.result {
+                Some(ResolvedResult::Int { reg }) if reg == *fnaddr_reg => Some(
+                    prev.decoded.opname == "int_copy"
+                        && matches!(
+                            prev.operands.first(),
+                            Some(ResolvedOperand::IntReg { reg, .. })
+                                if *reg >= n_i
+                                    && leave_consts.contains(&((*reg - n_i) as usize))
+                        ),
+                ),
+                _ => None,
             });
-            let Some(iife_pos) = iife_pos else {
+            if fnaddr_is_leave != Some(true) {
                 continue;
-            };
-            for (i, op) in ops.iter().enumerate() {
-                if !op.decoded.opname.starts_with("residual_call") {
-                    continue;
-                }
-                let Some(ResolvedOperand::IntReg {
-                    reg: fnaddr_reg, ..
-                }) = op
-                    .operands
-                    .iter()
-                    .find(|operand| matches!(operand, ResolvedOperand::IntReg { .. }))
-                else {
-                    continue;
-                };
-                let fnaddr_is_leave = (0..i).rev().find_map(|j| {
-                    let prev = &ops[j];
-                    match prev.result {
-                        Some(ResolvedResult::Int { reg }) if reg == *fnaddr_reg => {
-                            if prev.decoded.opname != "int_copy" {
-                                return Some(false);
-                            }
-                            match prev.operands.first() {
-                                Some(ResolvedOperand::IntReg { reg, .. }) if *reg >= n_i => {
-                                    Some(leave_consts.contains(&(*reg as usize - n_i as usize)))
-                                }
-                                _ => Some(false),
-                            }
-                        }
-                        _ => None,
-                    }
-                });
-                if fnaddr_is_leave != Some(true) {
-                    continue;
-                }
-                assert!(
-                    i > iife_pos,
-                    "ExecutionContext::leave must follow the IIFE inline_call"
-                );
-                let Some(ResolvedOperand::IntList(ints)) = op
-                    .operands
-                    .iter()
-                    .find(|operand| matches!(operand, ResolvedOperand::IntList(_)))
-                else {
-                    panic!(
-                        "leave residual_call must have an int-arg list; op={:?}",
-                        op.decoded
-                    );
-                };
-                assert!(
-                    !ints.is_empty(),
-                    "leave residual_call must pass got_exception as an int arg"
-                );
-                let mut got_exception_reg = ints[0].0;
-                let mut write_at = (iife_pos + 1..i).rev().find_map(|j| match ops[j].result {
-                    Some(ResolvedResult::Int { reg }) if reg == got_exception_reg => Some(j),
-                    _ => None,
-                });
-                while let Some(at) = write_at {
-                    if ops[at].decoded.opname != "int_copy" {
-                        break;
-                    }
-                    let Some(ResolvedOperand::IntReg { reg: src, .. }) = ops[at].operands.first()
-                    else {
-                        break;
-                    };
-                    if *src >= n_i {
-                        break;
-                    }
-                    got_exception_reg = *src;
-                    write_at = (iife_pos + 1..at).rev().find_map(|j| match ops[j].result {
-                        Some(ResolvedResult::Int { reg }) if reg == got_exception_reg => Some(j),
-                        _ => None,
-                    });
-                }
-                let write_at = write_at.unwrap_or_else(|| {
-                    panic!(
-                        "leave int arg %i{got_exception_reg} was not written after \
-                         the IIFE inline_call; op={:?}",
-                        op.decoded
-                    )
-                });
-                assert!(
-                    ops[write_at].decoded.opname.starts_with("raw_load"),
-                    "leave int arg must come from a raw_load after the IIFE, got {} at pc {}",
-                    ops[write_at].decoded.opname,
-                    ops[write_at].decoded.pc
-                );
-                checked += 1;
             }
+            let Some(ResolvedOperand::IntList(ints)) = op
+                .operands
+                .iter()
+                .find(|operand| matches!(operand, ResolvedOperand::IntList(_)))
+            else {
+                panic!(
+                    "leave residual_call must have an int-arg list; op={:?}",
+                    op.decoded
+                );
+            };
+            assert_eq!(
+                ints.len(),
+                1,
+                "leave residual_call must pass got_exception as its one int arg; op={:?}",
+                op.decoded
+            );
+            assert!(
+                ints[0].0 < n_i,
+                "leave got_exception must be a register, not a constant; op={:?}",
+                op.decoded
+            );
+            got_exception_regs.insert(ints[0].0);
         }
-        assert!(
-            checked > 0,
-            "expected ExecutionContext::leave residual calls on \
-             eval_frame_plain_with_resume whose int arg is a post-IIFE raw_load"
+        assert_eq!(
+            got_exception_regs.len(),
+            1,
+            "every ExecutionContext::leave call must take the same got_exception \
+             register, got {got_exception_regs:?}"
         );
+        let got_exception = *got_exception_regs.iter().next().unwrap();
+        let writes: Vec<(usize, Option<i64>)> = ops
+            .iter()
+            .filter(|op| {
+                matches!(op.result, Some(ResolvedResult::Int { reg }) if reg == got_exception)
+                    && op.decoded.opname == "int_copy"
+            })
+            .map(|op| (op.decoded.pc, op.operands.first().and_then(int_const)))
+            .collect();
+        let set_true = writes
+            .iter()
+            .find(|(_, value)| *value == Some(1))
+            .map(|(pc, _)| *pc);
+        let set_false = writes
+            .iter()
+            .find(|(_, value)| *value == Some(0))
+            .map(|(pc, _)| *pc);
+        match (set_true, set_false) {
+            (Some(t), Some(f)) => assert!(
+                t < f,
+                "got_exception %i{got_exception} must be cleared after it is set: \
+                 writes={writes:?}"
+            ),
+            _ => panic!(
+                "got_exception %i{got_exception} must be written 1 and then 0 before \
+                 leave; writes={writes:?}"
+            ),
+        }
     }
 
     #[test]

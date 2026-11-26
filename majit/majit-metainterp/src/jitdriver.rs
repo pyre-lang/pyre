@@ -981,6 +981,35 @@ use majit_ir::descr::DescrRef;
 use majit_ir::operand::Operand;
 use majit_ir::{GreenKey, GreenType, JitDriverVar, Type, Value, VarKind, green_type_to_ir};
 
+/// The recording context's virtualizable frame, saved while a compiled entry
+/// runs another frame on the same `TraceCtx`.
+///
+/// Upstream the outer `MetaInterp` keeps that frame in
+/// `virtualizable_boxes[-1]`, a box the GC traces.  Here the compiled run can
+/// collect and move a nursery frame, so the saved address is held under an
+/// owner root and read back from it on restore.
+struct SavedTraceVablePtr {
+    ptr: *const u8,
+    root: Option<majit_gc::shadow_stack::OwnerRootGuard>,
+}
+
+impl SavedTraceVablePtr {
+    fn new(ptr: *const u8) -> Self {
+        let addr = ptr as usize;
+        let root = (addr != 0
+            && majit_gc::gc_owns_object(addr)
+            && majit_gc::shadow_stack::mutator_is_registered())
+        .then(|| majit_gc::shadow_stack::OwnerRootGuard::new(majit_ir::GcRef(addr)));
+        Self { ptr, root }
+    }
+
+    fn get(&self) -> *const u8 {
+        self.root
+            .as_ref()
+            .map_or(self.ptr, |root| root.get().0 as *const u8)
+    }
+}
+
 /// Bucket the variables of a given kind by IR `Type`, returning
 /// `(num_int, num_ref, num_float)`. `Type::Void` is skipped per
 /// upstream — `bhimpl_jit_merge_point` only encodes `i / R / F` slots.
@@ -4107,7 +4136,7 @@ impl<S: JitState> JitDriver<S> {
     /// now survives a declined bridge attempt. Both consumers want a live
     /// session rather than the bare class — `close_loop_args_at` reads it
     /// mid-walk to decide whose LABEL types the JUMP must match, and
-    /// `eval_with_jit_inner` reads it to force concrete force-helper calls onto
+    /// `ll_portal_runner` reads it to force concrete force-helper calls onto
     /// the plain interpreter — but `self.sym` is not the liveness signal:
     /// `start_bridge_tracing` sets `bridge_info` (through
     /// `start_retrace_from_guard`) and then runs `rebuild_from_resumedata`
@@ -7362,11 +7391,8 @@ impl<S: JitState> JitDriver<S> {
             // `pyjitpl.py synchronize_virtualizable` always targets that
             // MetaInterp's own `virtualizable_boxes[-1]`; every exit after
             // this capture puts the outer pointer back.
-            let saved_vable_ptr = self
-                .meta
-                .tracing
-                .as_ref()
-                .map(|ctx| ctx.virtualizable_heap_ptr().unwrap_or(std::ptr::null()));
+            let saved_vable_root = self.save_trace_vable_ptr();
+            let saved_vable_ptr = saved_vable_root.as_ref();
             if !self.sync_before(state, compiled_meta, vable) {
                 self.entry_scratch_out(scratch);
                 return None;
@@ -7605,7 +7631,7 @@ impl<S: JitState> JitDriver<S> {
         vable: Option<&JitDriverVar>,
         selected_dispatch_key: u32,
         portal_rca: bool,
-        saved_vable_ptr: Option<*const u8>,
+        saved_vable_ptr: Option<&SavedTraceVablePtr>,
     ) -> Option<PortalResume> {
         // `compile.py handle_fail(self, deadframe, ...)` is a method on
         // the descr reached through `jf_descr`. Borrow it off the
@@ -7795,7 +7821,7 @@ impl<S: JitState> JitDriver<S> {
         vable: Option<&JitDriverVar>,
         selected_dispatch_key: u32,
         portal_rca: bool,
-        saved_vable_ptr: Option<*const u8>,
+        saved_vable_ptr: Option<&SavedTraceVablePtr>,
     ) -> Option<PortalResume> {
         // `execute_assembler` has already returned. Restore the caller's
         // saved recording-context virtualizable pointer (`None` when no
@@ -8861,11 +8887,8 @@ impl<S: JitState> JitDriver<S> {
             return;
         }
 
-        let saved_vable_ptr = self
-            .meta
-            .tracing
-            .as_ref()
-            .map(|ctx| ctx.virtualizable_heap_ptr().unwrap_or(std::ptr::null()));
+        let saved_vable_root = self.save_trace_vable_ptr();
+        let saved_vable_ptr = saved_vable_root.as_ref();
 
         if !self.sync_before(state, &meta, vable) {
             return;
@@ -8958,11 +8981,8 @@ impl<S: JitState> JitDriver<S> {
         let vable = descriptor
             .as_deref()
             .and_then(JitDriverStaticData::virtualizable);
-        let saved_vable_ptr = self
-            .meta
-            .tracing
-            .as_ref()
-            .map(|ctx| ctx.virtualizable_heap_ptr().unwrap_or(std::ptr::null()));
+        let saved_vable_root = self.save_trace_vable_ptr();
+        let saved_vable_ptr = saved_vable_root.as_ref();
         if !self.sync_before(state, &meta, vable) {
             return;
         }
@@ -9214,11 +9234,8 @@ impl<S: JitState> JitDriver<S> {
         let vable = descriptor
             .as_deref()
             .and_then(JitDriverStaticData::virtualizable);
-        let saved_vable_ptr = self
-            .meta
-            .tracing
-            .as_ref()
-            .map(|ctx| ctx.virtualizable_heap_ptr().unwrap_or(std::ptr::null()));
+        let saved_vable_root = self.save_trace_vable_ptr();
+        let saved_vable_ptr = saved_vable_root.as_ref();
         if !self.sync_before(state, &meta, vable) {
             crate::mc_diag_bump(62); // mst_sync_before_false
             return false;
@@ -9641,6 +9658,14 @@ impl<S: JitState> JitDriver<S> {
         true
     }
 
+    /// Saves the recording context's virtualizable frame before a compiled
+    /// entry, for [`Self::restore_trace_vable_ptr`].
+    fn save_trace_vable_ptr(&self) -> Option<SavedTraceVablePtr> {
+        self.meta.tracing.as_ref().map(|ctx| {
+            SavedTraceVablePtr::new(ctx.virtualizable_heap_ptr().unwrap_or(std::ptr::null()))
+        })
+    }
+
     /// Puts back the recording context's virtualizable frame saved before a
     /// compiled entry. `sync_after` does this for the exits that take it; the
     /// decline and finish exits call this directly, because a walk that resumes
@@ -9652,8 +9677,8 @@ impl<S: JitState> JitDriver<S> {
     /// MetaInterp would not outlive that portal entry. `saved` is `None`
     /// when no attempt owns the seed — the pointer dies with the door.
     /// A parked outer attempt keeps its own copy and restores it here.
-    fn restore_trace_vable_ptr(&mut self, saved: Option<*const u8>) {
-        match saved {
+    fn restore_trace_vable_ptr(&mut self, saved: Option<&SavedTraceVablePtr>) {
+        match saved.map(SavedTraceVablePtr::get) {
             Some(ptr) => {
                 if let Some(ctx) = self.meta.tracing.as_mut() {
                     ctx.set_virtualizable_heap_ptr(ptr);
@@ -9675,7 +9700,7 @@ impl<S: JitState> JitDriver<S> {
         state: &mut S,
         meta: &S::Meta,
         virtualizable: Option<&JitDriverVar>,
-        saved_vable_ptr: Option<*const u8>,
+        saved_vable_ptr: Option<&SavedTraceVablePtr>,
     ) {
         self.restore_trace_vable_ptr(saved_vable_ptr);
         let Some(virtualizable) = virtualizable else {
@@ -9974,11 +9999,8 @@ impl<S: JitState> JitDriver<S> {
         let vable = descriptor
             .as_deref()
             .and_then(JitDriverStaticData::virtualizable);
-        let saved_vable_ptr = self
-            .meta
-            .tracing
-            .as_ref()
-            .map(|ctx| ctx.virtualizable_heap_ptr().unwrap_or(std::ptr::null()));
+        let saved_vable_root = self.save_trace_vable_ptr();
+        let saved_vable_ptr = saved_vable_root.as_ref();
         if (!filled_without_meta && !state.is_compatible(meta))
             || !self.sync_before(state, meta, vable)
         {
@@ -10153,11 +10175,8 @@ impl<S: JitState> JitDriver<S> {
                 via_blackhole: false,
             };
         }
-        let saved_vable_ptr = self
-            .meta
-            .tracing
-            .as_ref()
-            .map(|ctx| ctx.virtualizable_heap_ptr().unwrap_or(std::ptr::null()));
+        let saved_vable_root = self.save_trace_vable_ptr();
+        let saved_vable_ptr = saved_vable_root.as_ref();
         if !self.sync_before(state, meta, vable) {
             if crate::majit_log_enabled() {
                 eprintln!(

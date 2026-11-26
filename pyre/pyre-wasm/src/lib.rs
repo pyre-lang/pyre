@@ -1040,7 +1040,7 @@ fn run_python_impl(source: &str) -> String {
         Err(e) => return format!("Error: {e}"),
     };
     // Nothing reaches a GC frame but the `CURRENT_FRAME` / `f_backref` chain,
-    // which this one joins only when `eval_with_jit` installs it. Publish it
+    // which this one joins only when `frame.run()` installs it. Publish it
     // until then (pyrex `run_source` does the same).
     let _main_frame_root = pyre_object::gc_roots::push_roots();
     let _ = pyre_object::gc_roots::pin_root(
@@ -1048,9 +1048,7 @@ fn run_python_impl(source: &str) -> String {
     );
 
     // catch_unwind to capture panics from JIT as error messages
-    let eval_result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        pyre_jit::eval::eval_with_jit(&mut frame, None)
-    })) {
+    let eval_result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| frame.run())) {
         Ok(r) => r,
         Err(_) => {
             EXIT_CODE.with(|c| c.set(1));

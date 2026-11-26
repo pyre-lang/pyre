@@ -15,7 +15,6 @@ use pyre_interpreter::{
     CompileOpts, ExecutionContextRef, Mode, PyDisplay, PyErrorKind, PyExecutionContext,
     alloc_execution_context,
 };
-use pyre_jit::eval::eval_with_jit;
 
 pub mod memory_ceiling;
 pub use memory_ceiling::ProcessAllocator;
@@ -2103,7 +2102,7 @@ fn eval_program_in_main(
         Ok(mut frame) => {
             // The frame is a GC object, and the only root that reaches one is the
             // `CURRENT_FRAME` / `f_backref` chain the frame walker follows — which it
-            // joins when `eval_with_jit` below installs it.  What runs between here
+            // joins when `frame.run()` below installs it.  What runs between here
             // and that call is Python -- the `linecache` registration below -- and can
             // therefore drive a collection that would reclaim the frame and hand its
             // storage to the next frame allocation.  RPython keeps a local holding a GC
@@ -2132,7 +2131,7 @@ fn eval_program_in_main(
                 );
             }
 
-            match eval_with_jit(&mut frame, None) {
+            match frame.run() {
                 Ok(result) => {
                     if !result.is_null() && !unsafe { pyre_object::is_none(result) } {
                         println!("{}", PyDisplay(result));

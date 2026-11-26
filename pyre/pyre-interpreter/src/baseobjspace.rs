@@ -23765,15 +23765,15 @@ pub unsafe fn generator_invoke_execute_frame(
     }
     // generator.py:_invoke_execute_frame uses the execution context of the
     // thread resuming the generator.  Like PyPy, the suspended frame stores no
-    // EC of its own; `execute_generator_frame` reads the thread-owned slot at
+    // EC of its own; `pyframe.py execute_frame` reads the thread-owned slot at
     // this activation boundary.
     // generator.py `_invoke_execute_frame` → `frame.execute_frame(w_arg_or_err)`.
-    // `execute_generator_frame` is look-inside and dispatches through
-    // `get_eval_fn` the way `interp_jit.py dispatch` applies the jitdriver
-    // to every frame. `pyframe.py execute_frame` / `resume_execute_frame`
-    // carry no `dont_look_inside`.
+    // Reload `w_arg_or_err` from the shadow-stack slot immediately before
+    // the call; `execute_frame` pins it itself (`pin_resume_args!`).
+    // `pyframe.py execute_frame` / `resume_execute_frame` carry no
+    // `dont_look_inside`; rewritten `dispatch` is `ll_portal_runner`.
     let executed = (*crate::eval::frame_anchor_live(frame_depth))
-        .execute_generator_frame(pyre_object::gc_roots::shadow_stack_get(arg_slot));
+        .execute_frame(Some(pyre_object::gc_roots::shadow_stack_get(arg_slot)));
     // `generator.py` `_leak_stopiteration` / `_leak_stopasynciteration`
     // run before the `finally`. The `Result` shell is built only after
     // `frame_anchor` is dropped, so the return block forwards the shell

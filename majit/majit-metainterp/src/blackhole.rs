@@ -4051,13 +4051,20 @@ pub fn convert_and_run_from_pyjitpl<P: BlackholeInterpPool>(
                     cur_bh.virtualizable_stack_base = frame_stack_base;
                 }
             }
-            // Keep every completed interpreter bank rooted while later frames are
-            // acquired and throughout `run_forever`.  The chain is consumed and
-            // released there, so these banks cannot be recovered by moving them
-            // out after the run.
-            unsafe {
-                majit_gc::shadow_stack::push_resume_ref_roots(cur_bh.registers_r.as_mut_slice());
-            }
+            // Every completed interpreter bank stays rooted while later frames
+            // are acquired and throughout `run_forever` through the pool
+            // registration `acquire_interp` made (`register_bh_interp_with_live`
+            // names the `registers_r` field, not its buffer): upstream each
+            // interpreter is a GC object whose `registers_r` is traced.  A
+            // slice registration here would name the buffer instead.
+            // `_run_forever` releases each finished frame to the pool before
+            // this function pops its roots, and a recursive call that
+            // re-enters the JIT can acquire that interpreter and grow its
+            // bank, leaving the slice pointing at freed memory.
+            debug_assert!(
+                cur_bh.rooted,
+                "convert_and_run_from_pyjitpl: acquired interpreter outside the pool"
+            );
             cur_bh.nextblackholeinterp = next_bh;
             next_bh = Some(cur_bh);
         }

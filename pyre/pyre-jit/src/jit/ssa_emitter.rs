@@ -157,7 +157,8 @@ impl SSAReprEmitter {
     /// against the pre-populated builder, translate the walker's
     /// per-PC insn-index map into byte offsets, and return the
     /// finished `JitCode` alongside the translated positions. Returns `None`
-    /// when the single-byte register/constant namespace cannot encode it.
+    /// when the single-byte register/constant namespace cannot encode it, or
+    /// when a `-live-` start offset would not fit in two bytes.
     ///
     /// `num_regs` is the post-regalloc per-kind ceiling computed by
     /// `RegAllocator::find_num_colors` from `max(color)+1`

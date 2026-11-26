@@ -3824,6 +3824,8 @@ impl<M: Clone> MetaInterp<M> {
         ) {
             let mut attrs = tt.attrs();
             if let Some(virtual_state) = attrs.virtual_state.as_mut() {
+                // Node intern is `NotVirtualStateInfo.constbox`. The retained
+                // list is short-preamble intern the node does not hold.
                 virtual_state.walk_const_ptr_refs_mut(visitor);
                 virtual_state.trace_const_ptr_indexes(visitor);
             }
@@ -18542,7 +18544,7 @@ impl<M: Clone> MetaInterp<M> {
                 None
             };
             if guard_op.is_some() {
-                self.capture_guard_resumedata_after_residual();
+                self.capture_resumedata(true);
             }
             let last_exc_box = match guard_op {
                 Some(_) if class_is_const => self
@@ -18574,14 +18576,16 @@ impl<M: Clone> MetaInterp<M> {
                 if let Some(ctx) = self.tracing.as_mut() {
                     ctx.record_guard(OpCode::GuardNoException, &[]);
                 }
-                self.capture_guard_resumedata_after_residual();
+                self.capture_resumedata(true);
             }
             Ok(())
         }
     }
 
-    /// `pyjitpl.py generate_guard` → `capture_resumedata` for
-    /// `GUARD_EXCEPTION` / `GUARD_NO_EXCEPTION`.
+    /// `pyjitpl.py generate_guard` → `capture_resumedata(resumepc=-1,
+    /// after_residual_call)` for a guard the MetaInterp records itself:
+    /// `GUARD_EXCEPTION` / `GUARD_NO_EXCEPTION` (`after_residual_call`
+    /// True) and `store_token_in_vable`'s `GUARD_NOT_FORCED_2` (False).
     ///
     /// `resumepc=-1` leaves `frame.pc` where the interpreter put it.
     /// `after_residual_call=True` reads liveness at that pc, which is
@@ -18593,15 +18597,17 @@ impl<M: Clone> MetaInterp<M> {
     /// is a no-op under `cfg(test)`, so that recorder stays on
     /// `Vec<Snapshot>` and `capture_resumedata` indexes the side table
     /// (`build_state_field_snapshot` is that walk).
-    fn capture_guard_resumedata_after_residual(&mut self) {
+    fn capture_resumedata(&mut self, after_residual_call: bool) {
         let byte = self
             .tracing
             .as_ref()
             .is_some_and(|ctx| ctx.recorder.has_byte_buffer());
         if byte {
             let ctx = self.tracing.as_mut().expect("trace still active");
-            let snapshot_id =
-                ctx.capture_resumedata_from_framestack(&mut self.framestack.frames, true);
+            let snapshot_id = ctx.capture_resumedata_from_framestack(
+                &mut self.framestack.frames,
+                after_residual_call,
+            );
             ctx.set_last_guard_resume_position(snapshot_id);
             return;
         }
@@ -18622,13 +18628,40 @@ impl<M: Clone> MetaInterp<M> {
             &mut self.framestack,
             op_live,
             &liveness,
-            true,
+            after_residual_call,
             &vable,
             &vref,
         );
         let ctx = self.tracing.as_mut().expect("trace still active");
         let snapshot_id = ctx.capture_resumedata(snapshot);
         ctx.set_last_guard_resume_position(snapshot_id);
+    }
+
+    /// pyjitpl.py `MetaInterp.store_token_in_vable()`.
+    ///
+    /// ```text
+    /// force_token = self.history.record0(rop.FORCE_TOKEN, ...)
+    /// self.history.record2(rop.SETFIELD_GC, vbox, force_token,
+    ///                      None, descr=vinfo.vable_token_descr)
+    /// self.generate_guard(rop.GUARD_NOT_FORCED_2)
+    /// ```
+    ///
+    /// The guard is what makes the FINISH that follows keep the frame's
+    /// contents: the backend stores its descr in `jf_force_descr` and its
+    /// gcmap becomes the FINISH gcmap (`store_force_descr` /
+    /// `_finish_gcmap`). Without it, a frame left armed by the FORCE_TOKEN
+    /// and forced after a later collection reads unforwarded refs.
+    fn store_token_in_vable(&mut self) {
+        let recorded = self
+            .tracing
+            .as_mut()
+            .is_some_and(|ctx| ctx.store_token_in_vable_setfield());
+        if recorded {
+            if let Some(ctx) = self.tracing.as_mut() {
+                ctx.record_guard(OpCode::GuardNotForced2, &[]);
+            }
+            self.capture_resumedata(false);
+        }
     }
 
     /// pyjitpl.py `MetaInterp.finishframe_exception()`.
@@ -19884,9 +19917,8 @@ impl<M: Clone> MetaInterp<M> {
     /// finish/compile sequence and emits FINISH from there with the
     /// matching `make_fail_descr_typed(result_types)` descr (the
     /// `done_with_this_frame_descr_*` analog).  This method runs the
-    /// upstream skeleton — `store_token_in_vable` (idempotent because
-    /// the frontend already records it before TraceAction::Finish),
-    /// result_type/exits/token bookkeeping, and surfacing
+    /// upstream skeleton — `store_token_in_vable`, result_type/exits/token
+    /// bookkeeping, and surfacing
     /// `SwitchToBlackhole` to the caller — without re-emitting the
     /// FINISH op.
     pub fn compile_done_with_this_frame(
@@ -19895,15 +19927,7 @@ impl<M: Clone> MetaInterp<M> {
         result_type: majit_ir::Type,
     ) -> Result<(), SwitchToBlackhole> {
         // pyjitpl.py self.store_token_in_vable()
-        // Early-return on no-vinfo / no-vbox / forced_virtualizable ==
-        // vbox (pyjitpl.py). The accompanying GUARD_NOT_FORCED_2
-        // is emitted by the pyre frontend wrapper
-        // (pyre-jit-trace/src/trace_opcode.rs::store_token_in_vable)
-        // through MIFrame::generate_guard so the guard captures fresh
-        // resumedata at the current framestack position.
-        if let Some(ctx) = self.tracing.as_mut() {
-            ctx.store_token_in_vable_setfield();
-        }
+        self.store_token_in_vable();
         // pyjitpl.py:3200-3216: select exits / result-type from result_type.
         let (exits, finish_arg_types): (Vec<OpRef>, Vec<majit_ir::Type>) = match result_type {
             // pyjitpl.py:3204-3206: VOID → exits = [], assert exitbox is None.
@@ -19961,14 +19985,7 @@ impl<M: Clone> MetaInterp<M> {
         valuebox: Option<OpRef>,
     ) -> Result<(), SwitchToBlackhole> {
         // pyjitpl.py self.store_token_in_vable()
-        // Same split as compile_done_with_this_frame: the
-        // GUARD_NOT_FORCED_2 that RPython's store_token_in_vable emits
-        // (pyjitpl.py) is produced by the pyre frontend wrapper
-        // (pyre-jit-trace/src/trace_opcode.rs::store_token_in_vable)
-        // through MIFrame::generate_guard.
-        if let Some(ctx) = self.tracing.as_mut() {
-            ctx.store_token_in_vable_setfield();
-        }
+        self.store_token_in_vable();
         // pyjitpl.py:3242 self.history.record1(rop.FINISH, valuebox, None, descr=token)
         // pyjitpl.py target_token = compile.compile_trace(self, self.resumekey, [valuebox])
         // pyjitpl.py if target_token is not token: compile.giveup()
@@ -33078,9 +33095,7 @@ mod tests {
         let dead = GcRef(0x90_0000_D001);
         let live = GcRef(0x90_0000_D002);
         let (_const_ref, index, _restore) = intern_const_ptr(dead);
-        let mut vs =
-            VirtualState::new(vec![VirtualStateInfo::Constant(majit_ir::Value::Ref(dead))]);
-        vs.retain_const_ptr_indexes(&[index]);
+        let vs = VirtualState::new(vec![VirtualStateInfo::Constant(majit_ir::Value::Ref(dead))]);
 
         let pred_tt = crate::history::TargetToken::new_loop(13);
         pred_tt.attrs().virtual_state = Some(vs);

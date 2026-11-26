@@ -1,13 +1,13 @@
 # pyre-check: selfcheck
 # pyre-check: selfcheck-interpreted
 # The empty compile set is measured, not a relaxation: `PYRE_LOOP_CENSUS=1`
-# emits no `[loop-census]` line for this file. The defect is on the portal's
-# COLD path — `eval_with_jit_inner` consumed the resume payload before entering
-# the bracket, which every frame reaching the portal does whether or not
-# anything compiled — so warming a loop would add nothing to the guard. The
-# discriminator is the JIT build against `PYRE_JIT=0`, not compiled against
-# interpreted: `PYRE_JIT=0` reports all six events and the default build
-# reported two.
+# emits no `[loop-census]` line for this file. The defect is on residual
+# portal entries (`portal_activation_*`) — they consumed the resume payload
+# before entering their own bracket, which every frame reaching those entries
+# does whether or not anything compiled — so warming a loop would add nothing
+# to the guard. The discriminator is the JIT build against `PYRE_JIT=0`, not
+# compiled against interpreted: `PYRE_JIT=0` reports all six events and the
+# default build reported two.
 #
 # A delegating generator / coroutine is resumed with a hook installed, and the
 # activation of the DELEGATING frame is the one being counted.
@@ -27,11 +27,12 @@
 #     finally:
 #         executioncontext.leave(self, w_exitvalue, got_exception)
 #
-# pyre's portal sits at `execute_frame`'s own level, so it carries that bracket
-# itself — but it consumed the resume payload BEFORE entering the bracket, and
-# a suspended `yield from` / `await` delegate that yields again finishes the
-# resumption there and returns. That return jumped `call_trace`,
-# `return_trace`, `leaveframe_trace` and the frame-chain leave in one step.
+# Native `execute_frame` puts the resume inside that bracket. Residual
+# `portal_activation_*` entries used to consume the resume payload BEFORE
+# their own bracket, and a suspended `yield from` / `await` delegate that
+# yields again finishes the resumption there and returns. That return jumped
+# `call_trace`, `return_trace`, `leaveframe_trace` and the frame-chain leave
+# in one step.
 #
 # TWO DEFECTS, ONE HOIST, and the fixture checks both because they fail
 # differently:

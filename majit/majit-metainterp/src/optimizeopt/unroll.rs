@@ -1763,13 +1763,11 @@ impl UnrollOptimizer {
         self.target_tokens.push(target_token);
         // `publish_const_ptr_root` dies with `imported_loop_state`. That
         // list also names ConstPtrs in partial-trace ops, which die with
-        // the state. The token keeps its virtual state and short preamble;
-        // record only the indexes those two still hold so
-        // `walk_rd_consts_refs` can stamp them for the token's life.
+        // the state. Node intern is `NotVirtualStateInfo.constbox` on the
+        // token's virtual state. Record intern indexes of short-preamble
+        // snapshots the node does not hold so `walk_rd_consts_refs` can
+        // stamp them for the token's life.
         if let Some(token) = self.target_tokens.last_mut() {
-            // Virtual-state walks do not take the table lock. Holder and
-            // exported-state walks call `trace_index`, which holds it:
-            // copy addresses first, then resolve.
             let mut addrs = Vec::new();
             let mut take_addr = |gcref: &mut majit_ir::GcRef| {
                 if !gcref.is_null() {
@@ -1777,9 +1775,9 @@ impl UnrollOptimizer {
                 }
             };
             let mut attrs = token.attrs();
-            if let Some(virtual_state) = attrs.virtual_state.as_mut() {
-                virtual_state.walk_const_ptr_refs_mut(&mut take_addr);
-            }
+            // Node intern is `NotVirtualStateInfo.constbox`; the compiled-loop
+            // walk stamps it through the node. Copy short-preamble snapshot
+            // addresses first, then resolve: holder walks call `trace_index`.
             if let Some(short_preamble) = attrs.short_preamble.as_mut()
                 && let Some(exported_state) = short_preamble.exported_state.as_mut()
             {
@@ -1788,10 +1786,17 @@ impl UnrollOptimizer {
             if let Some(short_preamble) = attrs.short_preamble.as_mut() {
                 short_preamble.walk_const_ptr_holders_mut(&mut take_addr);
             }
+            let node_owned = attrs
+                .virtual_state
+                .as_ref()
+                .map(|vs| vs.interned_const_ptr_indexes())
+                .unwrap_or_default();
             let mut indexes = Vec::with_capacity(addrs.len());
             for addr in addrs {
                 if let Some(index) = majit_ir::const_ptr_table::index_of_current(addr) {
-                    indexes.push(index);
+                    if !node_owned.contains(&index) {
+                        indexes.push(index);
+                    }
                 }
             }
             if let Some(virtual_state) = attrs.virtual_state.as_mut() {

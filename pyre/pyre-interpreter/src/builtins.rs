@@ -21303,16 +21303,15 @@ pub fn exec_or_eval(
             frame.setdictscope(implicit_caller_locals, inject_closure)?;
         }
     }
-    // run_with_jit rather than execute_frame so that
-    // `eval(compile("(x for x in [])", ..., 'eval'))` of generator-flagged
-    // code returns the wrapped generator object instead of executing the
-    // body inline, and so the exec'd body reaches the JIT portal (a hot loop
-    // inside exec()'d source warms into a trace like any function would).
+    // eval.py `Code.exec_code`: `frame.run()`. Generator-flagged code
+    // (`eval(compile("(x for x in [])", ..., 'eval'))`) returns the wrapped
+    // generator object instead of executing the body inline. `run` enters
+    // `execute_frame`, whose rewritten `dispatch` is the portal.
     // STORE_GLOBAL / DELETE_GLOBAL writes during the run land on the
     // storage proxy and back-mirror to the dict object, so the user dict
     // and the frame's globals stay one and the same throughout the run
     // (pyopcode.py parity — no entry/exit drain needed).
-    let result = frame.run_with_jit();
+    let result = frame.run();
 
     let _ = raw_code; // keep raw_code alive until after exec for safety.
     match result {

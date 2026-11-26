@@ -31,7 +31,7 @@ use pyre_interpreter::call::{register_build_class, set_last_exec_ctx};
 use pyre_interpreter::importing;
 use pyre_interpreter::pyframe::PyFrame;
 use pyre_interpreter::{Mode, alloc_execution_context, compile_source_with_filename};
-use pyre_jit::eval::{eval_with_jit, init_jit_hooks};
+use pyre_jit::eval::init_jit_hooks;
 
 /// Nursery-born rbigint digits move; every long op that allocates while
 /// still reading an operand must have that operand on the shadow stack.
@@ -304,7 +304,8 @@ fn run_harness(program: &str, name: &str, vacuity_label: &str) -> Result<(), Str
 
     // An uncaught `assert` in the program surfaces here as `Err`, so a
     // successful return means every read-back assertion held.
-    eval_with_jit(&mut frame, None)
+    frame
+        .run()
         .map_err(|e| format!("execution error: {}", e.message_text()))?;
 
     // Non-vacuity: the stable instance allocator hook is installed by the

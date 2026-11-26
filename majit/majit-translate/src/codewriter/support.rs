@@ -258,6 +258,10 @@ pub(crate) fn rewrite_jit_merge_point(
     if !graph.func.unroll_safe {
         graph.push_hint("unroll_safe");
     }
+    // `warmspot.py rewrite_jit_merge_point`: `direct_call(Constant(
+    // portal_runner_ptr), *args)` after rtyping. The CallPath is the
+    // registered `portal_runner`; `call_specialization` does not
+    // AccessDirect-specialize that site.
     graph.block_mut(block).operations.push(SpaceOperation {
         result: result.clone(),
         kind: OpKind::Call {

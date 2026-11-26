@@ -1646,10 +1646,10 @@ impl ExecutionContext {
     /// 'leaveframe', w_exitvalue)`, which is where `setprofile`'s `return`
     /// event comes from.  `return_trace` carries only the `gettrace()` one.
     ///
-    /// Split out of [`Self::leave`] because the JIT portal owes this event
-    /// without the `topframeref` and vref surgery `leave` wraps it in: the
-    /// arms that run a frame compiled never reach `leave` at all
-    /// (`eval::eval_with_jit_inner`).
+    /// Split out of [`Self::leave`] because residual `portal_activation_*`
+    /// entries owe this event without the `topframeref` and vref surgery
+    /// `leave` wraps it in. Native compiled frames reach `execute_frame`'s
+    /// `leave`; those residual entries do not.
     ///
     /// Returns the exit value at its live address — the callback is
     /// application-level Python and can move it.
@@ -2560,7 +2560,7 @@ impl ExecutionContext {
             // executioncontext.py:392-395 — re-raise the callback's
             // exception after restoring trace bookkeeping. Caller chain
             // (call_trace/return_trace/bytecode_trace/exception_trace
-            // → eval_frame_plain) propagates the error up so the
+            // → eval_frame_plain_with_resume) propagates the error up so the
             // tracefunc behaves like an inline raise from the executing
             // frame.
             call_result?;

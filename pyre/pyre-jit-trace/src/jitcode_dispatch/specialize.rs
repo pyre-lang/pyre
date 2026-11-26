@@ -15743,6 +15743,9 @@ pub(crate) fn try_walker_specialize_format_with_spec_int<Sym: WalkSym>(
     if !unsafe { pyre_object::is_exact_type(concrete_spec, &pyre_object::STR_TYPE) } {
         return Ok(None);
     }
+    if walker_promote_of_virtual(ctx, r_args[1]) {
+        return Ok(None);
+    }
     let Some(spec_text) = (unsafe { pyre_object::w_str_get_value_opt(concrete_spec) }) else {
         return Ok(None);
     };
@@ -19300,6 +19303,18 @@ pub(crate) fn try_walker_lower_exc_info_residual<Sym: WalkSym>(
         &[ec, store_op],
         crate::descr::ec_sys_exc_value_descr(),
     );
+    // The `None` check's guard numbers its resume data, and recording can grow
+    // the trace pool; both allocate and can collect.  `exc_concrete` is a copy
+    // taken before them, so read the stored value off the operand register
+    // again, as `pyjitpl.py` reads a box's `getref_base` at its use.
+    let store_concrete = if store_concrete.is_null() {
+        store_concrete
+    } else {
+        match read_ref_var_list_concrete(code, op, 1, ctx).first() {
+            Some(ConcreteValue::Ref(p)) => *p,
+            other => unreachable!("exc_info operand register changed kind: {other:?}"),
+        }
+    };
     // The walk is authoritative: apply the concrete store the residual
     // executor would have performed, so the live EC tracks the symbolic
     // SETFIELD in lock-step (a following `get_current_exception` /
